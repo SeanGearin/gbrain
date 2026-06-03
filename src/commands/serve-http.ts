@@ -25,6 +25,7 @@ import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middlew
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
+import { resolveIngestSourceId } from '../core/ingest-source-seal.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
@@ -1679,7 +1680,28 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
+      // B2 write-seal: source_id is the token's write authority
+      // (authInfo.sourceId), NEVER the client-supplied x-gbrain-source-id
+      // header. A header that differs is a cross-source write attempt → deny
+      // + audit-log (acceptance: identity comes from the token alone; denials
+      // are audit-logged). Pre-fix this line read the header directly, the
+      // likeliest cross-tenant bleed on the write side.
+      const sourceDecision = resolveIngestSourceId(authInfo, req.header('x-gbrain-source-id'));
+      if (!sourceDecision.ok) {
+        console.error(
+          `[INGEST-DENY] cross-source write blocked client_id=${authInfo.clientId} ` +
+          `attempted_source=${JSON.stringify(sourceDecision.attempted)} ` +
+          `authorized_source=${JSON.stringify(sourceDecision.authorized)}`,
+        );
+        res.status(403).json({
+          error: 'source_forbidden',
+          message:
+            'x-gbrain-source-id does not match the source this token is authorized to write. ' +
+            'Omit the header — ingestion is scoped to your token’s source.',
+        });
+        return;
+      }
+      const sourceId = sourceDecision.sourceId;
       const callerSlug = req.header('x-gbrain-slug');
 
       const event: IngestionEvent = {

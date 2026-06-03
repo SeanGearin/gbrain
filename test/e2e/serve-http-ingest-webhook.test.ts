@@ -332,15 +332,36 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     // test/ingestion/ingest-capture.test.ts).
   });
 
-  test('X-Gbrain-Source-Id header is accepted', async () => {
+  // B2 write-seal: source_id is the token's write authority, never the
+  // client-supplied header. The e2e client is registered without --source, so
+  // its authority defaults to 'default' (auth.ts register-client default).
+  test('X-Gbrain-Source-Id matching the token source (default) → accepted', async () => {
     const token = await mintToken('read write');
     const res = await postIngest(
       token,
       'text/markdown',
-      '# source-id header test',
-      { 'X-Gbrain-Source-Id': 'zapier-webhook' },
+      `# source-id matches token ${Date.now()}`,
+      { 'X-Gbrain-Source-Id': 'default' },
     );
     expect([200, 202]).toContain(res.status);
+    const body = (await res.json()) as { job_id?: number | string };
+    expect(body.job_id).toBeDefined();
+  });
+
+  test('X-Gbrain-Source-Id NOT matching the token source → 403 source_forbidden (B2 write-seal)', async () => {
+    const token = await mintToken('read write');
+    const res = await postIngest(
+      token,
+      'text/markdown',
+      '# cross-source write attempt',
+      { 'X-Gbrain-Source-Id': `foreign-tenant-${Date.now()}` },
+    );
+    // The seal denies a write to a source the token is not authorized for.
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error?: string; job_id?: number | string };
+    expect(body.error).toBe('source_forbidden');
+    // A denied write must NOT have been queued.
+    expect(body.job_id).toBeUndefined();
   });
 
   test('X-Gbrain-Source-Uri header is accepted', async () => {
