@@ -364,6 +364,55 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect(body.job_id).toBeUndefined();
   });
 
+  // Acceptance bar: "denials are audit-logged." The seal mirrors the codebase's
+  // canonical denial-audit pattern (the /mcp scope_denied / unknown_op paths):
+  // a persisted mcp_request_log row with status='error', operation='webhook_ingest',
+  // and a source_forbidden error_message — and the params carry ONLY the source
+  // decision, never the rejected (untrusted) payload. Mirrors the postgres probe
+  // shape from serve-http-oauth.test.ts.
+  test('cross-source denial is audit-logged to mcp_request_log (status=error, no payload)', async () => {
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    try {
+      const foreignSource = `foreign-tenant-audit-${Date.now()}`;
+      const token = await mintToken('read write');
+      const res = await postIngest(
+        token,
+        'text/markdown',
+        '# audited cross-source write attempt',
+        { 'X-Gbrain-Source-Id': foreignSource },
+      );
+      expect(res.status).toBe(403);
+
+      // Best-effort INSERT is fire-and-forget on the server; allow it to flush.
+      await new Promise(r => setTimeout(r, 250));
+
+      const rows = await sql`
+        SELECT operation, status, error_message, params
+        FROM mcp_request_log
+        WHERE token_name = ${clientId!}
+          AND operation = 'webhook_ingest'
+          AND status = 'error'
+          AND error_message LIKE 'source_forbidden%'
+        ORDER BY created_at DESC
+        LIMIT 5
+      ` as unknown as Array<Record<string, unknown>>;
+
+      const denialRow = rows.find(
+        r => typeof r.error_message === 'string' && (r.error_message as string).includes(foreignSource),
+      );
+      expect(denialRow).toBeDefined();
+      // The persisted params carry the source decision, NOT the body content.
+      const params = denialRow!.params as { attempted_source?: string; authorized_source?: string };
+      expect(params.attempted_source).toBe(foreignSource);
+      expect(params.authorized_source).toBe('default');
+      const serialized = JSON.stringify(denialRow!.params);
+      expect(serialized).not.toContain('audited cross-source write attempt');
+    } finally {
+      await sql.end();
+    }
+  }, 30_000);
+
   test('X-Gbrain-Source-Uri header is accepted', async () => {
     const token = await mintToken('read write');
     const res = await postIngest(

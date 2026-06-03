@@ -1688,6 +1688,38 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // likeliest cross-tenant bleed on the write side.
       const sourceDecision = resolveIngestSourceId(authInfo, req.header('x-gbrain-source-id'));
       if (!sourceDecision.ok) {
+        // Audit the denial through the same surfaces as every other /ingest
+        // and /mcp rejection: a persisted mcp_request_log row (status 'error',
+        // so the admin error-rate query at the /admin/api/health-indicators
+        // route counts it) + the live SSE feed + a stderr line. The persisted
+        // params carry ONLY the source decision, never the rejected body — the
+        // write never happened and the payload is untrusted network input.
+        const latency = Date.now() - startTime;
+        try {
+          await executeRawJsonb(
+            engine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [
+              authInfo.clientId,
+              agentName,
+              'webhook_ingest',
+              latency,
+              'error',
+              `source_forbidden: attempted ${JSON.stringify(sourceDecision.attempted)} authorized ${JSON.stringify(sourceDecision.authorized)}`,
+            ],
+            [{ attempted_source: sourceDecision.attempted, authorized_source: sourceDecision.authorized }],
+          );
+        } catch { /* best effort */ }
+        broadcastEvent({
+          agent: agentName,
+          operation: 'webhook_ingest',
+          scopes: authInfo.scopes.join(','),
+          latency_ms: latency,
+          status: 'error',
+          error: { code: 'source_forbidden', message: 'cross-source write blocked' },
+          timestamp: new Date().toISOString(),
+        });
         console.error(
           `[INGEST-DENY] cross-source write blocked client_id=${authInfo.clientId} ` +
           `attempted_source=${JSON.stringify(sourceDecision.attempted)} ` +
