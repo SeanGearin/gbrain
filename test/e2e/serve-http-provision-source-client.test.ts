@@ -123,6 +123,17 @@ describeE2E('serve-http /admin/provision-source-client E2E', () => {
     });
   }
 
+  async function revoke(token: string | null, body: unknown): Promise<Response> {
+    return fetch(`${BASE}/admin/revoke-source-client`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
   test('no bearer → 401 (requireBearerAuth middleware)', async () => {
     const res = await provision(null, { source_id: SRC_OK });
     expect(res.status).toBe(401);
@@ -177,4 +188,61 @@ describeE2E('serve-http /admin/provision-source-client E2E', () => {
     expect(typeof body.client_id).toBe('string');
     expect('client_secret' in body).toBe(false);
   });
+
+  // -- revoke-source-client --------------------------------------------------
+
+  test('revoke: no bearer → 401', async () => {
+    const res = await revoke(null, { source_id: SRC_OK, client_id: 'gbrain_cl_x' });
+    expect(res.status).toBe(401);
+  });
+
+  test('revoke: read-only bearer → 403 insufficient_scope', async () => {
+    const token = await mintToken('read');
+    const res = await revoke(token, { source_id: SRC_OK, client_id: 'gbrain_cl_x' });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe('insufficient_scope');
+  });
+
+  test('revoke: HARD REFUSE the default source → 403 forbidden_default', async () => {
+    const token = await mintToken('sources_admin');
+    const res = await revoke(token, { source_id: 'default', client_id: 'gbrain_cl_x' });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe('forbidden_default');
+  });
+
+  test('rotation over HTTP: provision → revoke → provision yields a fresh secret', async () => {
+    const token = await mintToken('sources_admin');
+    const SRC_ROT = `t-e2e${RUN}r`;
+
+    const first = await provision(token, { source_id: SRC_ROT });
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { client_id: string; client_secret: string };
+    mintedTenantClientIds.push(firstBody.client_id);
+
+    // Mint-once until revoked.
+    expect((await provision(token, { source_id: SRC_ROT })).status).toBe(409);
+
+    const rev = await revoke(token, { source_id: SRC_ROT, client_id: firstBody.client_id });
+    expect(rev.status).toBe(200);
+    expect(((await rev.json()) as { revoked: boolean }).revoked).toBe(true);
+
+    // Second revoke is idempotent → 404.
+    expect((await revoke(token, { source_id: SRC_ROT, client_id: firstBody.client_id })).status).toBe(404);
+
+    // Provision again → a fresh client + secret (rotation composed).
+    const second = await provision(token, { source_id: SRC_ROT });
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as { client_id: string; client_secret: string };
+    mintedTenantClientIds.push(secondBody.client_id);
+    expect(secondBody.client_id).not.toBe(firstBody.client_id);
+    expect(secondBody.client_secret).not.toBe(firstBody.client_secret);
+
+    // The fresh creds complete a real client_credentials grant.
+    const grant = await fetch(`${BASE}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `grant_type=client_credentials&client_id=${secondBody.client_id}&client_secret=${encodeURIComponent(secondBody.client_secret)}&scope=read`,
+    });
+    expect(grant.ok).toBe(true);
+  }, 20_000);
 });

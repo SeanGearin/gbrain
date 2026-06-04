@@ -21,7 +21,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { sqlQueryForEngine } from '../src/core/sql-query.ts';
 import { GBrainOAuthProvider } from '../src/core/oauth-provider.ts';
-import { provisionSourceClient, recordProvisionAudit } from '../src/commands/serve-http.ts';
+import { provisionSourceClient, revokeSourceClient, recordProvisionAudit } from '../src/commands/serve-http.ts';
 import { hashToken } from '../src/core/utils.ts';
 
 let engine: PGLiteEngine;
@@ -324,5 +324,122 @@ describe('recordProvisionAudit — persists row + broadcasts, never leaks the se
       recordProvisionAudit(engine, { authInfo, sourceId: 't-audit-nb', result, latencyMs: 1 }),
     ).resolves.toBeUndefined();
     expect((await auditRow('gbrain_cl_caller_nobroadcast')).status).toBe('success');
+  });
+
+  test('revoke operation label + explicit clientId audited even on a 404', async () => {
+    const authInfo = { clientId: 'gbrain_cl_caller_revoke', clientName: 'rev', scopes: ['sources_admin'] };
+    const result = { status: 404, body: { error: 'not_found_or_already_revoked', source_id: 't-audit-rev', client_id: 'gbrain_cl_target' } };
+    const events: Record<string, unknown>[] = [];
+    await recordProvisionAudit(engine, {
+      authInfo, operation: 'revoke-source-client', sourceId: 't-audit-rev', clientId: 'gbrain_cl_target',
+      result, latencyMs: 2, broadcast: e => events.push(e),
+    });
+    const rows = await engine.executeRaw<{ operation: string; status: string; params_text: string }>(
+      `SELECT operation, status, params::text AS params_text FROM mcp_request_log
+        WHERE token_name = $1 ORDER BY id DESC LIMIT 1`,
+      ['gbrain_cl_caller_revoke'],
+    );
+    expect(rows[0].operation).toBe('revoke-source-client');
+    expect(rows[0].status).toBe('error');
+    expect(rows[0].params_text).toContain('gbrain_cl_target'); // attempted client_id logged
+    expect(events[0].operation).toBe('revoke-source-client');
+    expect(events[0].client_id).toBe('gbrain_cl_target');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// revokeSourceClient
+// ---------------------------------------------------------------------------
+
+async function liveTokenCount(clientId: string) {
+  const rows = await engine.executeRaw<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM oauth_tokens WHERE client_id = $1`,
+    [clientId],
+  );
+  return Number(rows[0].n);
+}
+
+describe('revokeSourceClient', () => {
+  test('bound client → revoke → 200, client soft-deleted, live tokens purged', async () => {
+    const prov = await provisionSourceClient(engine, provider, { source_id: 't-rev-ok' });
+    const clientId = (prov.body as any).client_id;
+    // Seed a live token row for the client (revoke must delete it).
+    await engine.executeRaw(
+      `INSERT INTO oauth_tokens (token_hash, token_type, client_id) VALUES ($1, $2, $3)`,
+      ['hash-' + clientId, 'access', clientId],
+    );
+    expect(await liveTokenCount(clientId)).toBe(1);
+
+    const result = await revokeSourceClient(engine, { source_id: 't-rev-ok', client_id: clientId });
+    expect(result.status).toBe(200);
+    expect((result.body as any).revoked).toBe(true);
+    expect((result.body as any).client_id).toBe(clientId);
+
+    // Client is soft-deleted (no longer a live bound client).
+    expect((await clientsForSource('t-rev-ok')).length).toBe(0);
+    // Tokens purged.
+    expect(await liveTokenCount(clientId)).toBe(0);
+  });
+
+  test('HARD REFUSE source_id === default → 403 forbidden_default', async () => {
+    const result = await revokeSourceClient(engine, { source_id: 'default', client_id: 'gbrain_cl_whatever' });
+    expect(result.status).toBe(403);
+    expect((result.body as any).error).toBe('forbidden_default');
+  });
+
+  test('client bound to a different source → 404 (no cross-source revoke)', async () => {
+    const prov = await provisionSourceClient(engine, provider, { source_id: 't-rev-mm' });
+    const clientId = (prov.body as any).client_id;
+    // Correct client_id but a different source_id → must not revoke.
+    const result = await revokeSourceClient(engine, { source_id: 't-rev-other', client_id: clientId });
+    expect(result.status).toBe(404);
+    expect((result.body as any).error).toBe('not_found_or_already_revoked');
+    // The client is still live on its real source.
+    expect((await clientsForSource('t-rev-mm')).length).toBe(1);
+  });
+
+  test('unknown client_id on a real source → 404', async () => {
+    await provisionSourceClient(engine, provider, { source_id: 't-rev-unk' });
+    const result = await revokeSourceClient(engine, { source_id: 't-rev-unk', client_id: 'gbrain_cl_does_not_exist' });
+    expect(result.status).toBe(404);
+  });
+
+  test('already-revoked → second revoke is 404 (idempotent)', async () => {
+    const prov = await provisionSourceClient(engine, provider, { source_id: 't-rev-idem' });
+    const clientId = (prov.body as any).client_id;
+    expect((await revokeSourceClient(engine, { source_id: 't-rev-idem', client_id: clientId })).status).toBe(200);
+    expect((await revokeSourceClient(engine, { source_id: 't-rev-idem', client_id: clientId })).status).toBe(404);
+  });
+
+  test('invalid input → 400 (bad source_id / empty client_id)', async () => {
+    expect((await revokeSourceClient(engine, { source_id: 'bad_id', client_id: 'gbrain_cl_x' })).status).toBe(400);
+    expect(((await revokeSourceClient(engine, { source_id: 'bad_id', client_id: 'gbrain_cl_x' })).body as any).error).toBe('invalid_source_id');
+    expect((await revokeSourceClient(engine, { source_id: 't-rev-bad', client_id: '' })).status).toBe(400);
+    expect(((await revokeSourceClient(engine, { source_id: 't-rev-bad', client_id: '' })).body as any).error).toBe('invalid_client_id');
+    expect((await revokeSourceClient(engine, { source_id: 't-rev-bad', client_id: 42 })).status).toBe(400);
+  });
+
+  test('rotation composition: provision → revoke → provision = a fresh client+secret', async () => {
+    const first = await provisionSourceClient(engine, provider, { source_id: 't-rotate' });
+    expect(first.status).toBe(200);
+    const id1 = (first.body as any).client_id;
+    const secret1 = (first.body as any).client_secret;
+
+    // Before revoke, a re-provision is mint-once (409).
+    expect((await provisionSourceClient(engine, provider, { source_id: 't-rotate' })).status).toBe(409);
+
+    expect((await revokeSourceClient(engine, { source_id: 't-rotate', client_id: id1 })).status).toBe(200);
+
+    // After revoke, provision mints a fresh client + secret (the source row is
+    // reused, not duplicated).
+    const second = await provisionSourceClient(engine, provider, { source_id: 't-rotate' });
+    expect(second.status).toBe(200);
+    const id2 = (second.body as any).client_id;
+    const secret2 = (second.body as any).client_secret;
+    expect(id2).not.toBe(id1);
+    expect(secret2).not.toBe(secret1);
+    expect((await sourceRows('t-rotate')).length).toBe(1);
+    // Exactly one live client now bound to the source.
+    expect((await clientsForSource('t-rotate')).length).toBe(1);
   });
 });

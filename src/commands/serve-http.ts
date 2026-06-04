@@ -469,6 +469,94 @@ export async function provisionSourceClient(
 }
 
 // ---------------------------------------------------------------------------
+// B4 provisioning — revoke a source-bound client (rotation / rollback seam)
+// ---------------------------------------------------------------------------
+//
+// POST /admin/revoke-source-client (wired below) gives the worker's provisioning
+// saga a bearer-reachable way to disable a tenant's gbrain client — the
+// capability the existing /admin/api/revoke-client lacks for machines (it is
+// cookie/SPA-gated). It is the rollback half of the reconciler and the rotation
+// primitive: revoke flips deleted_at, so the next provisionSourceClient call
+// (whose mint-once gate filters `deleted_at IS NULL`) sees no live client and
+// mints a fresh secret. Revoke + re-provision == rotate; no rotate-specific
+// logic.
+//
+// Same auth shape as provisionSourceClient (sources_admin bearer, enforced at
+// the route). Extracted for in-process PGLite unit testing.
+//
+// Hard refusals / guards:
+//   - source_id must be charset-valid (400) and client_id a non-empty string (400).
+//   - source_id === 'default' is HARD-REFUSED (403). The default source holds
+//     Sean's own claude.ai / CLI clients; the provisioning bearer must never be
+//     able to disable them.
+//   - The client must be bound to that source AND not already deleted, else 404
+//     (idempotent: a second revoke, or a source/client mismatch, both land here).
+//   - Revoke reuses the /admin/api/revoke-client SQL pattern verbatim (soft-
+//     delete the client + delete its live tokens), additionally source-scoped on
+//     the UPDATE for TOCTOU safety. Not reimplemented.
+export type RevokeSourceClientResult =
+  | { status: 200; body: { source_id: string; client_id: string; revoked: true } }
+  | { status: 403; body: { error: 'forbidden_default'; message: string } }
+  | { status: 404; body: { error: 'not_found_or_already_revoked'; source_id: string; client_id: string } }
+  | { status: 400; body: { error: string; message: string } }
+  | { status: 500; body: { error: string; message: string } };
+
+export async function revokeSourceClient(engine: BrainEngine, input: unknown): Promise<RevokeSourceClientResult> {
+  const body = (input ?? {}) as Record<string, unknown>;
+  const sourceId = body.source_id;
+  const clientId = body.client_id;
+
+  if (!isValidSourceId(sourceId)) {
+    return {
+      status: 400,
+      body: {
+        error: 'invalid_source_id',
+        message:
+          `source_id must be 1-32 lowercase alphanumeric chars with optional ` +
+          `interior hyphens (matches ${SOURCE_ID_RE}). Got: ${JSON.stringify(sourceId)}.`,
+      },
+    };
+  }
+  if (typeof clientId !== 'string' || clientId.length === 0) {
+    return { status: 400, body: { error: 'invalid_client_id', message: 'client_id must be a non-empty string.' } };
+  }
+
+  // HARD REFUSE the default source — Sean's own clients live there.
+  if (sourceId === 'default') {
+    return { status: 403, body: { error: 'forbidden_default', message: 'Revoking clients on the default source is not permitted.' } };
+  }
+
+  const sql = sqlQueryForEngine(engine);
+
+  // Verify the binding: the client must be bound to this source and live.
+  try {
+    const bound = await sql`
+      SELECT client_id FROM oauth_clients
+       WHERE client_id = ${clientId} AND source_id = ${sourceId} AND deleted_at IS NULL
+       LIMIT 1
+    `;
+    if (bound.length === 0) {
+      // Idempotent: already-revoked, or a source/client mismatch, both land here.
+      return { status: 404, body: { error: 'not_found_or_already_revoked', source_id: sourceId, client_id: clientId } };
+    }
+  } catch (e) {
+    return { status: 500, body: { error: 'lookup_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+
+  // Revoke — same SQL pattern as /admin/api/revoke-client (soft-delete the
+  // client + kill its live tokens), source-scoped on the UPDATE for TOCTOU
+  // safety. Not reimplemented.
+  try {
+    await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId} AND source_id = ${sourceId} AND deleted_at IS NULL`;
+    await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
+  } catch (e) {
+    return { status: 500, body: { error: 'revoke_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+
+  return { status: 200, body: { source_id: sourceId, client_id: clientId, revoked: true } };
+}
+
+// ---------------------------------------------------------------------------
 // B4 provisioning — audit trail
 // ---------------------------------------------------------------------------
 //
@@ -492,26 +580,43 @@ export interface ProvisionAuditInput {
   /** Raw source_id from the request body — logged even when invalid. */
   sourceId: unknown;
   /** The outcome to audit. Accepts the route-level 403 deny as well as any
-   *  ProvisionSourceClientResult. */
+   *  ProvisionSourceClientResult / RevokeSourceClientResult. */
   result: { status: number; body: Record<string, unknown> };
   latencyMs: number;
   broadcast?: (event: Record<string, unknown>) => void;
+  /** Audit operation label. Defaults to 'provision-source-client'. The revoke
+   *  endpoint passes 'revoke-source-client'. */
+  operation?: string;
+  /** Explicit client_id to audit (the revoke endpoint passes the inbound
+   *  client_id so it is logged even on a deny/404, where result.body carries
+   *  no client_id). When omitted, falls back to result.body.client_id (the
+   *  provision endpoint's minted id). */
+  clientId?: unknown;
 }
 
 export async function recordProvisionAudit(engine: BrainEngine, input: ProvisionAuditInput): Promise<void> {
   try {
     const { authInfo, sourceId, result, latencyMs, broadcast } = input;
+    const operation = input.operation ?? 'provision-source-client';
     const agentName = authInfo.clientName ?? authInfo.clientId;
     const status = result.status === 200 ? 'success' : 'error';
 
     // Build params from audit-safe identifiers ONLY. result.body is never
-    // spread — client_secret (present on the 200 body) must not be persisted.
+    // spread — client_secret (present on the provision 200 body) must not be
+    // persisted. The explicit input.clientId wins (revoke audits the inbound id
+    // on every outcome); otherwise fall back to the result's client_id.
+    const clientId =
+      typeof input.clientId === 'string' && input.clientId.length > 0
+        ? input.clientId
+        : typeof result.body.client_id === 'string'
+          ? result.body.client_id
+          : undefined;
+
     const params: Record<string, unknown> = {};
     if (typeof sourceId === 'string') params.source_id = sourceId;
     else params.invalid_input = true;
-    const clientId = result.body.client_id;
-    if (typeof clientId === 'string') params.client_id = clientId;
-    params.outcome = typeof result.body.error === 'string' ? result.body.error : 'provisioned';
+    if (clientId !== undefined) params.client_id = clientId;
+    params.outcome = typeof result.body.error === 'string' ? result.body.error : 'success';
 
     const errorMessage =
       result.status === 200
@@ -523,7 +628,7 @@ export async function recordProvisionAudit(engine: BrainEngine, input: Provision
         engine,
         `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-        [authInfo.clientId, agentName, 'provision-source-client', latencyMs, status, errorMessage],
+        [authInfo.clientId, agentName, operation, latencyMs, status, errorMessage],
         [params],
       );
     } catch {
@@ -533,14 +638,14 @@ export async function recordProvisionAudit(engine: BrainEngine, input: Provision
     if (broadcast) {
       const event: Record<string, unknown> = {
         agent: agentName,
-        operation: 'provision-source-client',
+        operation,
         scopes: authInfo.scopes.join(','),
         latency_ms: latencyMs,
         status,
         timestamp: new Date().toISOString(),
       };
       if (typeof sourceId === 'string') event.source_id = sourceId;
-      if (typeof clientId === 'string') event.client_id = clientId;
+      if (clientId !== undefined) event.client_id = clientId;
       if (status === 'error') {
         event.error = { code: result.body.error, message: result.body.message };
       }
@@ -1445,6 +1550,47 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // from audit-safe identifiers only.
       await recordProvisionAudit(engine, {
         authInfo, sourceId: reqSourceId, result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+      });
+      res.status(result.status).json(result.body);
+    },
+  );
+
+  // POST /admin/revoke-source-client — B4 rotation / rollback seam.
+  //
+  // Disables a tenant's source-bound gbrain client (soft-delete + token purge)
+  // so the worker's reconciler can roll back a half-provisioned tenant and so
+  // rotation composes (revoke → next provision mints a fresh secret). Same auth
+  // shape as provision-source-client: requireBearerAuth + hasScope sources_admin.
+  // Hard-refuses the default source so the provisioning bearer can never disable
+  // Sean's own clients.
+  app.post(
+    '/admin/revoke-source-client',
+    requireBearerAuth({ verifier: oauthProvider }),
+    express.json(),
+    async (req: Request, res: Response) => {
+      const startTime = Date.now();
+      const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
+      const reqBody = req.body as Record<string, unknown> | undefined;
+      const reqSourceId = reqBody?.source_id;
+      const reqClientId = reqBody?.client_id;
+      if (!hasScope(authInfo.scopes, 'sources_admin')) {
+        const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
+        await recordProvisionAudit(engine, {
+          authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
+          result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+        });
+        res.status(403).json(denied.body);
+        return;
+      }
+      let result: { status: number; body: Record<string, unknown> };
+      try {
+        result = await revokeSourceClient(engine, req.body);
+      } catch (e) {
+        result = { status: 500, body: { error: 'revoke_failed', message: e instanceof Error ? e.message : String(e) } };
+      }
+      await recordProvisionAudit(engine, {
+        authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
+        result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
       });
       res.status(result.status).json(result.body);
     },
