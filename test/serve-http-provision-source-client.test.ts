@@ -21,7 +21,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { sqlQueryForEngine } from '../src/core/sql-query.ts';
 import { GBrainOAuthProvider } from '../src/core/oauth-provider.ts';
-import { provisionSourceClient } from '../src/commands/serve-http.ts';
+import { provisionSourceClient, recordProvisionAudit } from '../src/commands/serve-http.ts';
 import { hashToken } from '../src/core/utils.ts';
 
 let engine: PGLiteEngine;
@@ -225,5 +225,104 @@ describe('provisionSourceClient — isolation', () => {
     expect(aId).not.toBe(bId);
     expect((await clientRow(aId)).source_id).toBe('t-isoa');
     expect((await clientRow(bId)).source_id).toBe('t-isob');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordProvisionAudit — mcp_request_log row + SSE broadcast, secret-free
+// ---------------------------------------------------------------------------
+
+async function auditRow(tokenName: string) {
+  const rows = await engine.executeRaw<{
+    token_name: string;
+    agent_name: string;
+    operation: string;
+    status: string;
+    error_message: string | null;
+    params_text: string;
+  }>(
+    `SELECT token_name, agent_name, operation, status, error_message, params::text AS params_text
+       FROM mcp_request_log
+      WHERE operation = 'provision-source-client' AND token_name = $1
+      ORDER BY id DESC LIMIT 1`,
+    [tokenName],
+  );
+  return rows[0];
+}
+
+describe('recordProvisionAudit — persists row + broadcasts, never leaks the secret', () => {
+  test('success: row + broadcast carry source_id/client_id, NEVER the secret', async () => {
+    const SECRET = 'gbrain_cs_SUPERSECRET_must_not_persist_0001';
+    const authInfo = { clientId: 'gbrain_cl_caller_ok', clientName: 'audit-caller', scopes: ['sources_admin'] };
+    const result = {
+      status: 200,
+      body: { source_id: 't-audit-ok', client_id: 'gbrain_cl_minted_ok', client_secret: SECRET },
+    };
+    const events: Record<string, unknown>[] = [];
+    await recordProvisionAudit(engine, {
+      authInfo, sourceId: 't-audit-ok', result, latencyMs: 7, broadcast: e => events.push(e),
+    });
+
+    // Persisted row.
+    const row = await auditRow('gbrain_cl_caller_ok');
+    expect(row).toBeDefined();
+    expect(row.operation).toBe('provision-source-client');
+    expect(row.status).toBe('success');
+    expect(row.agent_name).toBe('audit-caller');
+    expect(row.error_message).toBeNull();
+    expect(row.params_text).toContain('t-audit-ok'); // source_id present
+    expect(row.params_text).toContain('gbrain_cl_minted_ok'); // client_id present
+    // SECRET ABSENT from the entire persisted row.
+    expect(JSON.stringify(row)).not.toContain(SECRET);
+    expect(row.params_text).not.toContain('SUPERSECRET');
+
+    // Broadcast event.
+    expect(events.length).toBe(1);
+    expect(events[0].status).toBe('success');
+    expect(events[0].source_id).toBe('t-audit-ok');
+    expect(events[0].client_id).toBe('gbrain_cl_minted_ok');
+    expect(events[0].operation).toBe('provision-source-client');
+    // SECRET ABSENT from the broadcast payload.
+    expect(JSON.stringify(events[0])).not.toContain(SECRET);
+  });
+
+  test('authorization deny (403): row + broadcast with status error', async () => {
+    const authInfo = { clientId: 'gbrain_cl_caller_deny', clientName: 'denied-caller', scopes: ['read'] };
+    const result = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
+    const events: Record<string, unknown>[] = [];
+    await recordProvisionAudit(engine, {
+      authInfo, sourceId: 't-audit-deny', result, latencyMs: 1, broadcast: e => events.push(e),
+    });
+
+    const row = await auditRow('gbrain_cl_caller_deny');
+    expect(row.status).toBe('error');
+    expect(row.error_message).toContain('insufficient_scope');
+    expect(row.params_text).toContain('t-audit-deny');
+
+    expect(events.length).toBe(1);
+    expect(events[0].status).toBe('error');
+    expect((events[0].error as { code?: string }).code).toBe('insufficient_scope');
+  });
+
+  test('invalid input (non-string source_id): row marks invalid_input, no client_id', async () => {
+    const authInfo = { clientId: 'gbrain_cl_caller_bad', clientName: 'bad-caller', scopes: ['sources_admin'] };
+    const result = { status: 400, body: { error: 'invalid_source_id', message: 'bad charset' } };
+    await recordProvisionAudit(engine, {
+      authInfo, sourceId: 42, result, latencyMs: 1,
+    });
+
+    const row = await auditRow('gbrain_cl_caller_bad');
+    expect(row.status).toBe('error');
+    expect(row.params_text).toContain('invalid_input');
+    expect(row.error_message).toContain('invalid_source_id');
+  });
+
+  test('never throws and writes the row even without a broadcast callback', async () => {
+    const authInfo = { clientId: 'gbrain_cl_caller_nobroadcast', clientName: 'nb', scopes: ['sources_admin'] };
+    const result = { status: 200, body: { source_id: 't-audit-nb', client_id: 'gbrain_cl_nb', client_secret: 'gbrain_cs_x' } };
+    await expect(
+      recordProvisionAudit(engine, { authInfo, sourceId: 't-audit-nb', result, latencyMs: 1 }),
+    ).resolves.toBeUndefined();
+    expect((await auditRow('gbrain_cl_caller_nobroadcast')).status).toBe('success');
   });
 });

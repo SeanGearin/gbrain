@@ -468,6 +468,89 @@ export async function provisionSourceClient(
   }
 }
 
+// ---------------------------------------------------------------------------
+// B4 provisioning — audit trail
+// ---------------------------------------------------------------------------
+//
+// Provisioning is the most security-sensitive admin action on this surface (it
+// mints a credential), so every call is persisted to mcp_request_log AND
+// broadcast to the admin SSE feed via the same executeRawJsonb + broadcastEvent
+// pattern B2 used for /ingest denials. Both the success (200) and the
+// authorization-deny (403) paths produce a row.
+//
+// THE SECRET NEVER APPEARS. The audit params are built explicitly from
+// audit-safe identifiers (source_id, client_id, outcome) — result.body is never
+// spread, so the client_secret present on the 200 body cannot leak into a
+// persisted row or a broadcast payload. The test pins this.
+//
+// Extracted (not inlined in the route closure) so the audit write + secret
+// absence are unit-testable against in-process PGLite, with a `broadcast`
+// callback the test can spy on. This function NEVER throws — audit failure must
+// not turn a successful provision into a 500.
+export interface ProvisionAuditInput {
+  authInfo: Pick<AuthInfo, 'clientId' | 'clientName' | 'scopes'>;
+  /** Raw source_id from the request body — logged even when invalid. */
+  sourceId: unknown;
+  /** The outcome to audit. Accepts the route-level 403 deny as well as any
+   *  ProvisionSourceClientResult. */
+  result: { status: number; body: Record<string, unknown> };
+  latencyMs: number;
+  broadcast?: (event: Record<string, unknown>) => void;
+}
+
+export async function recordProvisionAudit(engine: BrainEngine, input: ProvisionAuditInput): Promise<void> {
+  try {
+    const { authInfo, sourceId, result, latencyMs, broadcast } = input;
+    const agentName = authInfo.clientName ?? authInfo.clientId;
+    const status = result.status === 200 ? 'success' : 'error';
+
+    // Build params from audit-safe identifiers ONLY. result.body is never
+    // spread — client_secret (present on the 200 body) must not be persisted.
+    const params: Record<string, unknown> = {};
+    if (typeof sourceId === 'string') params.source_id = sourceId;
+    else params.invalid_input = true;
+    const clientId = result.body.client_id;
+    if (typeof clientId === 'string') params.client_id = clientId;
+    params.outcome = typeof result.body.error === 'string' ? result.body.error : 'provisioned';
+
+    const errorMessage =
+      result.status === 200
+        ? null
+        : `${result.body.error ?? 'error'}: ${result.body.message ?? ''}`.trim();
+
+    try {
+      await executeRawJsonb(
+        engine,
+        `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [authInfo.clientId, agentName, 'provision-source-client', latencyMs, status, errorMessage],
+        [params],
+      );
+    } catch {
+      /* best effort — audit must never break the response */
+    }
+
+    if (broadcast) {
+      const event: Record<string, unknown> = {
+        agent: agentName,
+        operation: 'provision-source-client',
+        scopes: authInfo.scopes.join(','),
+        latency_ms: latencyMs,
+        status,
+        timestamp: new Date().toISOString(),
+      };
+      if (typeof sourceId === 'string') event.source_id = sourceId;
+      if (typeof clientId === 'string') event.client_id = clientId;
+      if (status === 'error') {
+        event.error = { code: result.body.error, message: result.body.message };
+      }
+      broadcast(event);
+    }
+  } catch {
+    /* recordProvisionAudit never throws into the request path */
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -1336,20 +1419,34 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     requireBearerAuth({ verifier: oauthProvider }),
     express.json(),
     async (req: Request, res: Response) => {
+      const startTime = Date.now();
       const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
+      const reqSourceId = (req.body as Record<string, unknown> | undefined)?.source_id;
+      // Authorization deny is itself a security-relevant audit event.
       if (!hasScope(authInfo.scopes, 'sources_admin')) {
-        res.status(403).json({ error: 'insufficient_scope', message: "requires 'sources_admin'" });
+        const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
+        await recordProvisionAudit(engine, {
+          authInfo, sourceId: reqSourceId, result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+        });
+        res.status(403).json(denied.body);
         return;
       }
+      let result: { status: number; body: Record<string, unknown> };
       try {
-        const result = await provisionSourceClient(engine, oauthProvider, req.body);
-        res.status(result.status).json(result.body);
+        result = await provisionSourceClient(engine, oauthProvider, req.body);
       } catch (e) {
         // provisionSourceClient maps its own failures to {status, body}; an
         // escape here is unexpected. Return a JSON envelope, never Express's
         // default HTML error page (mirrors the /ingest F14 guard).
-        res.status(500).json({ error: 'provision_failed', message: e instanceof Error ? e.message : String(e) });
+        result = { status: 500, body: { error: 'provision_failed', message: e instanceof Error ? e.message : String(e) } };
       }
+      // Audit every outcome (success + the in-function 400/409/500). The secret
+      // on the 200 body is never persisted — recordProvisionAudit builds params
+      // from audit-safe identifiers only.
+      await recordProvisionAudit(engine, {
+        authInfo, sourceId: reqSourceId, result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+      });
+      res.status(result.status).json(result.body);
     },
   );
 
