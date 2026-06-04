@@ -57,7 +57,14 @@ function tenantUrl(adminUrl: string): string {
 /**
  * Apply a shipped .sql file the SAME way production does: hand it to psql.
  *
- *   sudo -u postgres psql -v ON_ERROR_STOP=1 -d <db> [-v tenant_password=...] -f <file>
+ *   sudo -u postgres psql -v ON_ERROR_STOP=1 -d <db> [-v tenant_password=...] < <file>
+ *
+ * The file is fed via STDIN, not `-f <file>`. With `-f`, psql itself opens the
+ * path — and psql runs as the postgres OS user under sudo, which cannot
+ * traverse a mode-750 /home/<user> (Ubuntu 24.04 default), so it gets
+ * "Permission denied" on a file under the invoking user's home. The `<` redirect
+ * is opened by the invoking shell (which owns the file); psql consumes stdin
+ * identically — \if/\echo/\endif meta-commands and -v vars all apply.
  *
  * Running through real psql as the cluster superuser is what makes this test's
  * apply path byte-identical to production's. psql parses the shipped files
@@ -77,7 +84,7 @@ function applyFile(file: string, opts?: { tenantPassword?: string }): void {
     : '';
   const cmd =
     `sudo -u postgres psql -v ON_ERROR_STOP=1 -d ${DB_NAME}` +
-    `${varFlag} -f ${join(SQL_DIR, file)}`;
+    `${varFlag} < ${join(SQL_DIR, file)}`;
   try {
     execSync(cmd, { stdio: 'pipe', encoding: 'utf8' });
   } catch (err) {
