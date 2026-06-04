@@ -225,12 +225,24 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
       expect(r.n).toBe(0);
     });
     // D4: a tenant cannot author an edge whose to_page_id lives in another source.
-    await expect(
-      asTenant(A, (tx) => tx`INSERT INTO links (from_page_id, to_page_id) VALUES (${aPageId}, ${bPageId})`),
-    ).rejects.toThrow(); // WITH CHECK requires BOTH endpoints in-source
-    // The same edge with both endpoints in A is allowed.
+    // A distinct link_type means this (from,to,type,source,origin) tuple is never
+    // seeded, so the unique constraint cannot fire — the ONLY possible rejection
+    // is the RLS WITH CHECK policy. Assert that specifically (42501 / row-level
+    // security), not a bare "throws" that a 23505 duplicate could satisfy.
+    let xEdgeErr: { code?: string; message?: string } | undefined;
+    try {
+      await asTenant(A, (tx) => tx`INSERT INTO links (from_page_id, to_page_id, link_type)
+        VALUES (${aPageId}, ${bPageId}, ${'b7_xsource_forbidden'})`);
+    } catch (e) {
+      xEdgeErr = e as { code?: string; message?: string };
+    }
+    expect(xEdgeErr?.code).toBe('42501'); // RLS WITH CHECK, not 23505 unique
+    expect(xEdgeErr?.message).toMatch(/row-level security/i);
+    // The same shape with both endpoints in A is allowed. Distinct link_type so
+    // it can't collide with the seeded (aPageId,aPageId,'') edge on the unique key.
     await asTenant(A, async (tx) => {
-      const ins = await tx`INSERT INTO links (from_page_id, to_page_id) VALUES (${aPageId}, ${aPageId})`;
+      const ins = await tx`INSERT INTO links (from_page_id, to_page_id, link_type)
+        VALUES (${aPageId}, ${aPageId}, ${'b7_intra_ok'})`;
       expect(ins.count).toBe(1);
     });
   });
