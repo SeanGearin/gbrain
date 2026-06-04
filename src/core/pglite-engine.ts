@@ -711,6 +711,17 @@ export class PGLiteEngine implements BrainEngine {
     });
   }
 
+  async withSourceScope<T>(_sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // B7 RLS backstop is a Postgres-only, customer-plane construct. PGLite is
+    // the embedded single-principal engine (Sean's laptop / CLI / tests): no
+    // pooling, no RLS engine, exactly one source's data per database. There is
+    // no cross-tenant surface to confine, so withSourceScope is a pass-through —
+    // it runs `fn` against `this` unchanged. The Postgres engine sets the
+    // app.current_source_id GUC + pins a transaction; doing that here would be a
+    // no-op against a backend that ignores RLS, so we skip it entirely.
+    return fn(this);
+  }
+
   // Pages CRUD
   async getPage(slug: string, opts?: { sourceId?: string; includeDeleted?: boolean }): Promise<Page | null> {
     // v0.26.5: hide soft-deleted by default; opt-in via opts.includeDeleted.

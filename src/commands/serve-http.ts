@@ -657,6 +657,35 @@ export async function recordProvisionAudit(engine: BrainEngine, input: Provision
   }
 }
 
+/**
+ * B7 two-DSN split (design D6). Resolve the PRIVILEGED connection the
+ * customer-plane serve-http uses for exactly two surfaces — the /admin/*
+ * handlers and the mcp_request_log audit writes — both of which touch tables
+ * the NOBYPASSRLS tenant role is denied (sources / oauth_clients writes,
+ * mcp_request_log).
+ *
+ * When GBRAIN_ADMIN_DATABASE_URL is unset (or points at the same DB, or the
+ * primary engine is not Postgres), this returns the primary engine itself — so
+ * single-plane deploys (Sean's box: one BYPASSRLS role, no admin DSN) are
+ * byte-identical to before B7. `owned: true` means a second pool was connected
+ * and the caller disconnects it on shutdown.
+ */
+export async function resolvePrivilegedEngine(
+  primary: BrainEngine,
+  primaryUrl: string | undefined,
+): Promise<{ engine: BrainEngine; owned: boolean }> {
+  const adminUrl = process.env.GBRAIN_ADMIN_DATABASE_URL?.trim();
+  if (!adminUrl || adminUrl === primaryUrl || primary.kind !== 'postgres') {
+    return { engine: primary, owned: false };
+  }
+  // Dynamic import keeps PostgresEngine out of the eager load on the common
+  // fallback path and sidesteps any import cycle through the command layer.
+  const { PostgresEngine } = await import('../core/postgres-engine.ts');
+  const adminEngine = new PostgresEngine();
+  await adminEngine.connect({ engine: 'postgres', database_url: adminUrl });
+  return { engine: adminEngine, owned: true };
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -686,14 +715,35 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // a postgres.js singleton, so `gbrain serve --http` works against PGLite
   // brains too. The narrow SqlQuery contract is scalar-binds-only; JSONB
   // writes use executeRawJsonb (see mcp_request_log INSERT sites below).
-  const sql = sqlQueryForEngine(engine);
+  // B7 two-DSN split (D6). `privilegedEngine` is the ADMIN/incumbent connection
+  // (GBRAIN_ADMIN_DATABASE_URL), used by EXACTLY the /admin/* handlers and the
+  // mcp_request_log audit writes. `engine` stays the TENANT pool that op
+  // dispatch runs through (wrapped in engine.withSourceScope). When no admin
+  // DSN is set, privilegedEngine === engine — single-plane deploys unchanged.
+  const { engine: privilegedEngine, owned: ownsPrivilegedEngine } =
+    await resolvePrivilegedEngine(engine, (config as { database_url?: string }).database_url);
+  if (ownsPrivilegedEngine) {
+    const closeAdmin = () => { void privilegedEngine.disconnect().catch(() => {}); };
+    process.once('SIGTERM', closeAdmin);
+    process.once('SIGINT', closeAdmin);
+  }
+
+  // `sql` is the PRIVILEGED handle — it serves the /admin/* dashboard + token
+  // CRUD routes and the startup banner (all admin-surface reads/writes against
+  // mcp_request_log / oauth_clients / access_tokens). The OAuth provider, by
+  // contrast, is the request-path AUTH BOOTSTRAP (it reads oauth_*/access_tokens
+  // to resolve a bearer -> source before any scope exists), so it runs on the
+  // TENANT engine via `oauthSql`. On a single-plane deploy privilegedEngine ===
+  // engine, so the two handles are identical and nothing changes.
+  const sql = sqlQueryForEngine(privilegedEngine);
+  const oauthSql = sqlQueryForEngine(engine);
 
   // Initialize OAuth provider. F12 cleanup: DCR-disable now flips a
   // constructor option instead of monkey-patching `_clientsStore` after
   // construction. Same outcome (no /register endpoint when --enable-dcr
   // is not passed); cleaner shape for tests and future maintainers.
   const oauthProvider = new GBrainOAuthProvider({
-    sql,
+    sql: oauthSql,
     tokenTtl,
     dcrDisabled: !enableDcr,
   });
@@ -1143,7 +1193,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // exists but agent dispatch hasn't recorded anything.
   app.get('/admin/api/agents/spend', requireAdmin, async (_req: Request, res: Response) => {
     try {
-      const rows = await queryAgentClientSpend(engine);
+      const rows = await queryAgentClientSpend(privilegedEngine);
       res.json(rows);
     } catch (e) {
       // Pre-v0.38 brains: tables may not exist yet. Return empty so the UI
@@ -1531,7 +1581,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // Authorization deny is itself a security-relevant audit event.
       if (!hasScope(authInfo.scopes, 'sources_admin')) {
         const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
-        await recordProvisionAudit(engine, {
+        await recordProvisionAudit(privilegedEngine, {
           authInfo, sourceId: reqSourceId, result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
         });
         res.status(403).json(denied.body);
@@ -1539,7 +1589,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
       let result: { status: number; body: Record<string, unknown> };
       try {
-        result = await provisionSourceClient(engine, oauthProvider, req.body);
+        result = await provisionSourceClient(privilegedEngine, oauthProvider, req.body);
       } catch (e) {
         // provisionSourceClient maps its own failures to {status, body}; an
         // escape here is unexpected. Return a JSON envelope, never Express's
@@ -1549,7 +1599,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // Audit every outcome (success + the in-function 400/409/500). The secret
       // on the 200 body is never persisted — recordProvisionAudit builds params
       // from audit-safe identifiers only.
-      await recordProvisionAudit(engine, {
+      await recordProvisionAudit(privilegedEngine, {
         authInfo, sourceId: reqSourceId, result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
       });
       res.status(result.status).json(result.body);
@@ -1576,7 +1626,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const reqClientId = reqBody?.client_id;
       if (!hasScope(authInfo.scopes, 'sources_admin')) {
         const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
-        await recordProvisionAudit(engine, {
+        await recordProvisionAudit(privilegedEngine, {
           authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
           result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
         });
@@ -1585,11 +1635,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
       let result: { status: number; body: Record<string, unknown> };
       try {
-        result = await revokeSourceClient(engine, req.body);
+        result = await revokeSourceClient(privilegedEngine, req.body);
       } catch (e) {
         result = { status: 500, body: { error: 'revoke_failed', message: e instanceof Error ? e.message : String(e) } };
       }
-      await recordProvisionAudit(engine, {
+      await recordProvisionAudit(privilegedEngine, {
         authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
         result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
       });
@@ -1711,7 +1761,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const latency = Date.now() - startTime;
       try {
         await executeRawJsonb(
-          engine,
+          privilegedEngine,
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
@@ -1751,7 +1801,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
@@ -1783,7 +1833,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
@@ -1852,7 +1902,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       let toolResult: Awaited<ReturnType<typeof dispatchToolCall>>;
       try {
-        toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
+        // B7 chokepoint (design §B). Run op dispatch inside withSourceScope so
+        // every source-scoped read/write the op performs is confined to the
+        // token's source by the RLS policies (sql/b7-policies.sql): one
+        // transaction with app.current_source_id = tokenSourceId set
+        // transaction-locally. On the BYPASSRLS incumbent / single-plane role
+        // the GUC is inert (policies never evaluated), so behavior is unchanged.
+        toolResult = await engine.withSourceScope(tokenSourceId, (scopedEngine) =>
+          dispatchToolCall(scopedEngine, name, params as Record<string, unknown> | undefined, {
           remote: true,
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
@@ -1868,7 +1925,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             warn: (msg: string) => console.error(`[WARN] ${msg}`),
             error: (msg: string) => console.error(`[ERROR] ${msg}`),
           },
-        });
+        }));
       } catch (e) {
         // dispatchToolCall absorbs OperationError + Error and returns
         // isError:true; only an unexpected throw lands here. Treat as the
@@ -1879,7 +1936,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const errorPayload = serializeError(e);
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
@@ -1911,7 +1968,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         } catch { /* ignore */ }
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', errMsg],
@@ -1933,7 +1990,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       try {
         await executeRawJsonb(
-          engine,
+          privilegedEngine,
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, name, latency, 'success'],
@@ -2135,7 +2192,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [
@@ -2202,7 +2259,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
-        const job = await ingestQueue.add(
+        // B7 (design §B). The /ingest request-path DB write is the minion_jobs
+        // ENQUEUE — the actual page write is deferred to the ingest_capture
+        // worker, which runs on the background / BYPASSRLS plane, so RLS does
+        // not bite there. Source authority is already sealed into
+        // event.source_id by the B2 write-seal (resolveIngestSourceId above).
+        // We still run the enqueue inside withSourceScope for symmetry with the
+        // /mcp chokepoint and so app.current_source_id is set transaction-locally
+        // around the write (MinionQueue.add nests its own transaction as a
+        // savepoint under this scope — safe).
+        //
+        // INTEGRATION FLAG (review): minion_jobs is a CAT-6 infra table with NO
+        // gbrain_tenant grant (sql/b7-role.sql, design D2). On the customer
+        // plane this enqueue therefore needs either a privileged connection
+        // (like the mcp_request_log audit writes — D6) or an explicit
+        // minion_jobs grant under the D3 banked condition. That is a
+        // worker↔endpoint integration decision, outside B7's named content
+        // scope; surfaced here, not silently papered over.
+        const job = await engine.withSourceScope(sourceId, (scopedEngine) =>
+          new MinionQueue(scopedEngine).add(
           'ingest_capture',
           {
             event,
@@ -2218,12 +2293,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             // can't fill the queue.
             maxWaiting: 50,
           },
-        );
+        ));
 
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
              VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
             [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],

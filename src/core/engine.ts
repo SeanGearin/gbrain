@@ -606,6 +606,23 @@ export interface BrainEngine {
    */
   withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T>;
 
+  /**
+   * B7 RLS backstop (Model B multi-tenant). Run `fn` against an engine pinned
+   * to a single transaction that has the Postgres session GUC
+   * `app.current_source_id` set to `sourceId` — transaction-LOCAL, so it
+   * evaporates at COMMIT/ROLLBACK and can never leak to the next request on a
+   * pooled connection. The scoped engine's read/write methods all route onto
+   * that transaction, so the RLS policies in sql/b7-policies.sql confine every
+   * row they touch to `sourceId`.
+   *
+   * This is the chokepoint the customer-plane serve-http wraps op dispatch in
+   * (design §B). On the BYPASSRLS incumbent role the GUC is harmless (policies
+   * are never evaluated), so single-plane / CLI behavior is unchanged.
+   *
+   * PGLite: pass-through (single-principal embedded engine; no RLS, no pooling).
+   */
+  withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+
   // Pages CRUD
   /**
    * Fetch a page by slug.

@@ -766,6 +766,27 @@ export class PostgresEngine implements BrainEngine {
     }) as Promise<T>;
   }
 
+  async withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // B7 RLS backstop (design §B). Same connection-pin trick as transaction(),
+    // plus a transaction-LOCAL set_config so the RLS policies in
+    // sql/b7-policies.sql see this request's source and nothing else.
+    //
+    // set_config(..., true) — the third arg `true` scopes the GUC to THIS
+    // transaction; Postgres resets it at COMMIT/ROLLBACK. That is the whole
+    // pooler-safety story (design §D): the var cannot survive into the next
+    // request on the same backend. Never use set_config(..., false) or a bare
+    // `SET app.current_source_id` here — those persist on the pooled connection
+    // and would leak across tenants.
+    const conn = this._sql || db.getConnection();
+    return conn.begin(async (tx) => {
+      await tx`SELECT set_config('app.current_source_id', ${sourceId}, true)`;
+      const scoped = Object.create(this) as PostgresEngine;
+      Object.defineProperty(scoped, 'sql', { get: () => tx });
+      Object.defineProperty(scoped, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      return fn(scoped);
+    }) as Promise<T>;
+  }
+
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
     const pool = this._sql || db.getConnection();
     const reserved = await pool.reserve();
