@@ -50,14 +50,28 @@ function tenantUrl(adminUrl: string): string {
   return u.toString();
 }
 
-/** Apply a shipped .sql file, stripping psql client meta-commands (\if, \echo ...). */
+/**
+ * Apply a shipped .sql file through the pooled client. Strips two line classes
+ * the shipped files carry for the production `psql -f` path but that a pooled
+ * postgres.js client cannot take raw:
+ *   - psql client meta-commands (\if, \echo, \endif ...)
+ *   - standalone transaction-control lines (BEGIN; / COMMIT; / ROLLBACK;) -
+ *     porsager/postgres refuses a raw BEGIN on a pooled connection by design
+ *     (UNSAFE_TRANSACTION: "Only use sql.begin, sql.reserved or max: 1").
+ * The remaining body runs as ONE atomic batch inside sql.begin (so the apply
+ * stays transactional AND satisfies the client guard). No semicolon splitting:
+ * b7-role.sql contains DO $$...$$ blocks with internal semicolons, so the whole
+ * body must go inside a single managed transaction. The shipped .sql files are
+ * unchanged - the production path is `psql -f`, which wants the BEGIN/COMMIT.
+ */
 async function applyFile(admin: postgres.Sql, file: string): Promise<void> {
   const raw = readFileSync(join(SQL_DIR, file), 'utf8');
-  const noMeta = raw
+  const body = raw
     .split('\n')
     .filter((l) => !/^\s*\\/.test(l)) // drop psql backslash meta-commands
+    .filter((l) => !/^\s*(begin|commit|rollback)\s*;\s*$/i.test(l)) // drop raw txn-control
     .join('\n');
-  await admin.unsafe(noMeta);
+  await admin.begin((tx) => tx.unsafe(body));
 }
 
 describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
