@@ -29,6 +29,10 @@ import postgres from 'postgres';
 import { execSync } from 'child_process';
 import { join } from 'path';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { MinionQueue } from '../../src/core/minions/queue.ts';
+import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
+import type { MinionJobContext } from '../../src/core/minions/types.ts';
+import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
 
 const DB = process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL;
 const describeE2E = DB ? describe : describe.skip;
@@ -98,8 +102,10 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
   let admin: postgres.Sql;          // incumbent / superuser (BYPASSRLS)
   let tenant: postgres.Sql;         // raw gbrain_tenant connection (Layer 1)
   let tenantEngine: PostgresEngine; // real engine as gbrain_tenant (Layer 2)
+  let adminEngine: PostgresEngine;  // real engine as incumbent/BYPASSRLS (Layer 3 — D-INT-1/-2)
   let aPageId = 0;
   let bPageId = 0;
+  let enqueuedJobId = 0;            // the ingest_capture row T-INT-1 enqueues (cleaned in afterAll)
 
   beforeAll(async () => {
     admin = postgres(DB as string, { prepare: false, max: 4 });
@@ -134,14 +140,28 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
     tenant = postgres(tenantUrl(DB as string), { prepare: false, max: 4 });
     tenantEngine = new PostgresEngine();
     await tenantEngine.connect({ engine: 'postgres', database_url: tenantUrl(DB as string) });
+
+    // Layer 3 (D-INT-1/-2) uses a real engine on the INCUMBENT/BYPASSRLS DSN —
+    // the "privileged" plane: serve-http's privilegedEngine for the /ingest
+    // enqueue (D-INT-1) and the `gbrain jobs work` consumer that runs the
+    // ingest_capture handler (D-INT-4 places it on this role precisely because
+    // it must write any tenant's pages without RLS confinement).
+    adminEngine = new PostgresEngine();
+    await adminEngine.connect({ engine: 'postgres', database_url: DB as string });
   });
 
   afterAll(async () => {
     try { await tenantEngine?.disconnect(); } catch { /* noop */ }
+    try { await adminEngine?.disconnect(); } catch { /* noop */ }
     try { await tenant?.end({ timeout: 5 }); } catch { /* noop */ }
     if (admin) {
       // Remove only our seed rows (cascade clears chunks/facts/links), then the
       // role + policies via the shipped rollback. Order: data -> rollback.
+      // minion_jobs has no source FK, so the ingest_capture row T-INT-1
+      // enqueued won't cascade with the sources delete — drop it explicitly.
+      if (enqueuedJobId) {
+        try { await admin`DELETE FROM minion_jobs WHERE id = ${enqueuedJobId}`; } catch { /* noop */ }
+      }
       try {
         await admin`DELETE FROM sources WHERE id IN (${A}, ${B})`;
       } catch { /* noop */ }
@@ -289,5 +309,67 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
     expect(a.n).toBe(1); // A untouched
     // re-seed B so afterAll cleanup is symmetric (idempotent DELETE handles it)
     await admin`INSERT INTO sources (id, name) VALUES (${B}, ${'B7 Test B'}) ON CONFLICT (id) DO NOTHING`;
+  });
+
+  // ===================== Layer 3 — integration fixes (D-INT-1/-2) ============
+  //
+  // These pin the two gbrain-fork code changes the worker↔endpoint integration
+  // needs against the SAME real-Postgres + gbrain_tenant rig. They are the
+  // teeth for the flip: D-INT-1 keeps /ingest from 500ing the moment the tenant
+  // pool is wired; D-INT-2 keeps a tenant's ingested page off Sean's brain.
+
+  /**
+   * A valid IngestionEvent sealed to `sourceId` — the shape the B2 write-seal
+   * produces at POST /ingest from the token's authorized source.
+   */
+  function syntheticEvent(sourceId: string): IngestionEvent {
+    return {
+      source_id: sourceId,
+      source_kind: 'webhook',
+      source_uri: 'test://b7/int',
+      received_at: new Date().toISOString(),
+      content_type: 'text/markdown',
+      content: '# Tenant Capture\n\nSealed-source ingest body for the D-INT-2 proof.',
+      content_hash: 'a'.repeat(64),
+      untrusted_payload: true,
+    };
+  }
+
+  test('T-INT-1 (D-INT-1) privileged enqueue lands a minion_jobs row; tenant role is permission-denied', async () => {
+    // Privileged plane (incumbent/BYPASSRLS) enqueues via MinionQueue — exactly
+    // what serve-http /ingest now does (the shared ingestQueue is bound to
+    // privilegedEngine). The row lands.
+    const job = await new MinionQueue(adminEngine).add(
+      'ingest_capture',
+      { event: syntheticEvent(A) },
+      { idempotency_key: 'b7test:enqueue-seam', maxWaiting: 50 },
+    );
+    enqueuedJobId = Number(job.id);
+    expect(enqueuedJobId).toBeGreaterThan(0);
+    const [row] = await admin`SELECT name FROM minion_jobs WHERE id = ${enqueuedJobId}`;
+    expect(row?.name).toBe('ingest_capture');
+
+    // The same write through the tenant (NOBYPASSRLS) role is denied at the
+    // GRANT layer — minion_jobs is CAT-6 with no gbrain_tenant grant. This is
+    // the exact failure D-INT-1 routes around by enqueuing on privilegedEngine.
+    await expect(
+      asTenant(A, (tx) => tx`INSERT INTO minion_jobs (name) VALUES ('ingest_capture')`),
+    ).rejects.toThrow(/permission denied/i);
+  });
+
+  test('T-INT-2 (D-INT-2) ingest_capture writes the sealed source, not default', async () => {
+    // The consumer runs on the incumbent/BYPASSRLS engine (D-INT-4 places it
+    // there so it can write any tenant's pages). With the D-INT-2 fix it threads
+    // event.source_id into importFromContent, so the deferred page write lands
+    // on the SEALED source — not 'default' (Sean's brain), which is where every
+    // tenant's page landed before the fix.
+    const handler = makeIngestCaptureHandler(adminEngine);
+    const job = { data: { event: syntheticEvent(A) } } as unknown as MinionJobContext;
+    const result = await handler(job);
+    expect(result.status).toBe('imported');
+
+    const [page] = await admin`SELECT source_id FROM pages WHERE slug = ${result.slug}`;
+    expect(page?.source_id).toBe(A);
+    expect(page?.source_id).not.toBe('default');
   });
 });

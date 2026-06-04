@@ -113,7 +113,19 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
     // by passing { noEmbed: false } in job.data.
     const noEmbed = (data as { noEmbed?: unknown }).noEmbed !== false;
 
-    const result = await importFromContent(engine, slug, event.content, { noEmbed });
+    // D-INT-2 (thread the seal, approved 2026-06-04): the source authority
+    // sealed into event.source_id by the B2 write-seal at POST /ingest must
+    // reach the deferred page write. Without it, importFromContent falls back
+    // to the 'default' source, so every tenant's ingested page would land on
+    // Sean's brain. This is a write-correctness fix independent of RLS — the
+    // consumer runs BYPASSRLS, so it writes wherever it's told; RLS cannot
+    // catch a write that targets the wrong source. The conditional spread
+    // preserves single-plane behavior: an absent/empty source_id falls through
+    // to importFromContent's own default ('default').
+    const result = await importFromContent(engine, slug, event.content, {
+      noEmbed,
+      ...(event.source_id ? { sourceId: event.source_id } : {}),
+    });
 
     return {
       slug,

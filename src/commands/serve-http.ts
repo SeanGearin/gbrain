@@ -2079,10 +2079,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     'application/json',
   ]);
 
-  // Single MinionQueue instance shared across POST /ingest invocations
-  // (the queue is stateless beyond the engine handle; reusing avoids
-  // per-request construction).
-  const ingestQueue = new MinionQueue(engine);
+  // Single MinionQueue instance shared across POST /ingest invocations.
+  // D-INT-1 (privileged enqueue, approved 2026-06-04): bound to
+  // privilegedEngine, NOT the tenant `engine`. The enqueue writes minion_jobs,
+  // a CAT-6 infra table with no gbrain_tenant grant (sql/b7-role.sql, design
+  // D2), so on the customer plane a tenant-pool INSERT is permission-denied;
+  // it must run on the privileged/incumbent connection, mirroring the
+  // mcp_request_log audit write. The queue is stateless beyond the engine
+  // handle; reusing the instance avoids per-request construction.
+  const ingestQueue = new MinionQueue(privilegedEngine);
 
   app.post(
     '/ingest',
@@ -2259,25 +2264,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
-        // B7 (design §B). The /ingest request-path DB write is the minion_jobs
-        // ENQUEUE — the actual page write is deferred to the ingest_capture
-        // worker, which runs on the background / BYPASSRLS plane, so RLS does
-        // not bite there. Source authority is already sealed into
-        // event.source_id by the B2 write-seal (resolveIngestSourceId above).
-        // We still run the enqueue inside withSourceScope for symmetry with the
-        // /mcp chokepoint and so app.current_source_id is set transaction-locally
-        // around the write (MinionQueue.add nests its own transaction as a
-        // savepoint under this scope — safe).
+        // B7 (design §B) + D-INT-1 (privileged enqueue, approved 2026-06-04).
+        // The /ingest request-path DB write is the minion_jobs ENQUEUE — the
+        // actual page write is deferred to the ingest_capture worker, which
+        // runs on the background / BYPASSRLS plane, so RLS does not bite there.
+        // Source authority is already sealed into event.source_id by the B2
+        // write-seal (resolveIngestSourceId above), so the enqueue itself is
+        // infra plumbing, not tenant content — RLS confinement of it buys
+        // nothing.
         //
-        // INTEGRATION FLAG (review): minion_jobs is a CAT-6 infra table with NO
-        // gbrain_tenant grant (sql/b7-role.sql, design D2). On the customer
-        // plane this enqueue therefore needs either a privileged connection
-        // (like the mcp_request_log audit writes — D6) or an explicit
-        // minion_jobs grant under the D3 banked condition. That is a
-        // worker↔endpoint integration decision, outside B7's named content
-        // scope; surfaced here, not silently papered over.
-        const job = await engine.withSourceScope(sourceId, (scopedEngine) =>
-          new MinionQueue(scopedEngine).add(
+        // DECISION D-INT-1: the enqueue runs on privilegedEngine (the shared
+        // ingestQueue is bound to it), exactly like the mcp_request_log audit
+        // write three lines below. minion_jobs is a CAT-6 infra table with NO
+        // gbrain_tenant grant (sql/b7-role.sql, design D2); on the customer
+        // plane a tenant-pool INSERT would be permission-denied. This keeps
+        // minion_jobs CAT-6-excluded — no new policy, no schema change. The
+        // prior withSourceScope wrap is dropped: the privileged role bypasses
+        // RLS, so setting app.current_source_id around the write was symbolic.
+        const job = await ingestQueue.add(
           'ingest_capture',
           {
             event,
@@ -2293,7 +2297,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             // can't fill the queue.
             maxWaiting: 50,
           },
-        ));
+        );
 
         const latency = Date.now() - startTime;
         try {
