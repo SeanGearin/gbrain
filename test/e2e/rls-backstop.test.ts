@@ -26,7 +26,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from 'postgres';
-import { readFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { join } from 'path';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 
@@ -41,6 +41,10 @@ const A = 'b7test_a';
 const B = 'b7test_b';
 const TENANT_PW = 'b7_test_tenant_pw_do_not_use_in_prod';
 const SQL_DIR = join(import.meta.dir, '..', '..', 'sql');
+// The database to apply the shipped .sql into — the path component of the admin
+// DSN (e.g. .../gbrain_e2e_scratch -> gbrain_e2e_scratch). Empty when DB unset
+// (the whole suite skips in that case, so applyFile is never reached).
+const DB_NAME = DB ? new URL(DB).pathname.replace(/^\//, '') : '';
 
 /** Derive the gbrain_tenant connection URL from the admin DB URL (swap userinfo). */
 function tenantUrl(adminUrl: string): string {
@@ -51,27 +55,36 @@ function tenantUrl(adminUrl: string): string {
 }
 
 /**
- * Apply a shipped .sql file through the pooled client. Strips two line classes
- * the shipped files carry for the production `psql -f` path but that a pooled
- * postgres.js client cannot take raw:
- *   - psql client meta-commands (\if, \echo, \endif ...)
- *   - standalone transaction-control lines (BEGIN; / COMMIT; / ROLLBACK;) -
- *     porsager/postgres refuses a raw BEGIN on a pooled connection by design
- *     (UNSAFE_TRANSACTION: "Only use sql.begin, sql.reserved or max: 1").
- * The remaining body runs as ONE atomic batch inside sql.begin (so the apply
- * stays transactional AND satisfies the client guard). No semicolon splitting:
- * b7-role.sql contains DO $$...$$ blocks with internal semicolons, so the whole
- * body must go inside a single managed transaction. The shipped .sql files are
- * unchanged - the production path is `psql -f`, which wants the BEGIN/COMMIT.
+ * Apply a shipped .sql file the SAME way production does: hand it to psql.
+ *
+ *   sudo -u postgres psql -v ON_ERROR_STOP=1 -d <db> [-v tenant_password=...] -f <file>
+ *
+ * Running through real psql as the cluster superuser is what makes this test's
+ * apply path byte-identical to production's. psql parses the shipped files
+ * natively — the \if/\echo/\endif meta-commands, the DO $$...$$ blocks, the
+ * BEGIN/COMMIT framing, and the :'tenant_password' variable interpolation all
+ * execute as written. No client-side reimplementation, no line stripping, no
+ * dependency on the gbrain role's privileges (CREATE ROLE / ALTER ROLE run as
+ * the superuser, not over the admin TCP connection). The tenant_password var
+ * is supplied only for b7-role.sql; the other files don't reference it.
+ *
+ * On non-zero exit, psql's stderr is folded into the thrown error so a failing
+ * apply names the offending statement instead of a bare exit code.
  */
-async function applyFile(admin: postgres.Sql, file: string): Promise<void> {
-  const raw = readFileSync(join(SQL_DIR, file), 'utf8');
-  const body = raw
-    .split('\n')
-    .filter((l) => !/^\s*\\/.test(l)) // drop psql backslash meta-commands
-    .filter((l) => !/^\s*(begin|commit|rollback)\s*;\s*$/i.test(l)) // drop raw txn-control
-    .join('\n');
-  await admin.begin((tx) => tx.unsafe(body));
+function applyFile(file: string, opts?: { tenantPassword?: string }): void {
+  const varFlag = opts?.tenantPassword
+    ? ` -v tenant_password=${opts.tenantPassword}`
+    : '';
+  const cmd =
+    `sudo -u postgres psql -v ON_ERROR_STOP=1 -d ${DB_NAME}` +
+    `${varFlag} -f ${join(SQL_DIR, file)}`;
+  try {
+    execSync(cmd, { stdio: 'pipe', encoding: 'utf8' });
+  } catch (err) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const detail = (e.stderr || e.stdout || e.message || '').toString().trim();
+    throw new Error(`applyFile(${file}) failed: ${detail}`);
+  }
 }
 
 describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
@@ -85,12 +98,12 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
     admin = postgres(DB as string, { prepare: false, max: 4 });
 
     // Step 1 — policies (dormant under the BYPASSRLS admin role).
-    await applyFile(admin, 'b7-policies.sql');
+    applyFile('b7-policies.sql');
 
-    // Step 2 — role + grants. The shipped file's LOGIN line is a psql \if block
-    // (stripped above); set the login password explicitly here.
-    await applyFile(admin, 'b7-role.sql');
-    await admin.unsafe(`ALTER ROLE gbrain_tenant WITH LOGIN PASSWORD '${TENANT_PW}'`);
+    // Step 2 — role + grants. The shipped file's final step is
+    //   ALTER ROLE gbrain_tenant WITH LOGIN PASSWORD :'tenant_password'
+    // guarded by \if :{?tenant_password}; psql sets LOGIN from the var we pass.
+    applyFile('b7-role.sql', { tenantPassword: TENANT_PW });
 
     // Seed two sources with brain content on each axis a policy covers.
     await admin`INSERT INTO sources (id, name) VALUES (${A}, ${'B7 Test A'}), (${B}, ${'B7 Test B'})
@@ -125,7 +138,7 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
       try {
         await admin`DELETE FROM sources WHERE id IN (${A}, ${B})`;
       } catch { /* noop */ }
-      try { await applyFile(admin, 'b7-rollback.sql'); } catch { /* noop */ }
+      try { applyFile('b7-rollback.sql'); } catch { /* noop */ }
       try { await admin.end({ timeout: 5 }); } catch { /* noop */ }
     }
   });
