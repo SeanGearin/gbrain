@@ -146,22 +146,35 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
     // enqueue (D-INT-1) and the `gbrain jobs work` consumer that runs the
     // ingest_capture handler (D-INT-4 places it on this role precisely because
     // it must write any tenant's pages without RLS confinement).
+    //
+    // poolSize forces PostgresEngine.connect down the INSTANCE-pool path
+    // (postgres-engine.ts:127 — its own postgres() client) instead of the
+    // process-wide module singleton. tenantEngine above took the singleton
+    // (tenant URL); without poolSize this connect() would see that singleton
+    // already open and silently REUSE the tenant-role connection, so the
+    // "admin" engine would be RLS-confined and admin work (config read in
+    // MinionQueue.ensureSchema, putPage in importFromContent) would be denied.
+    // The instance pool is owned by this engine, on the scratch GBRAIN_DATABASE_URL
+    // the test received — never a prod DSN — and disconnect() tears it down
+    // without touching the module singleton (postgres-engine.ts:196).
     adminEngine = new PostgresEngine();
-    await adminEngine.connect({ engine: 'postgres', database_url: DB as string });
+    await adminEngine.connect({ engine: 'postgres', database_url: DB as string, poolSize: 2 });
   });
 
   afterAll(async () => {
     try { await tenantEngine?.disconnect(); } catch { /* noop */ }
+    // minion_jobs has no source FK, so the ingest_capture row T-INT-1 enqueued
+    // won't cascade with the sources delete — drop it explicitly through the
+    // admin ENGINE (the same incumbent-role instance pool that enqueued it),
+    // while it is still connected and before we disconnect it.
+    if (adminEngine && enqueuedJobId) {
+      try { await adminEngine.executeRaw('DELETE FROM minion_jobs WHERE id = $1', [enqueuedJobId]); } catch { /* noop */ }
+    }
     try { await adminEngine?.disconnect(); } catch { /* noop */ }
     try { await tenant?.end({ timeout: 5 }); } catch { /* noop */ }
     if (admin) {
       // Remove only our seed rows (cascade clears chunks/facts/links), then the
       // role + policies via the shipped rollback. Order: data -> rollback.
-      // minion_jobs has no source FK, so the ingest_capture row T-INT-1
-      // enqueued won't cascade with the sources delete — drop it explicitly.
-      if (enqueuedJobId) {
-        try { await admin`DELETE FROM minion_jobs WHERE id = ${enqueuedJobId}`; } catch { /* noop */ }
-      }
       try {
         await admin`DELETE FROM sources WHERE id IN (${A}, ${B})`;
       } catch { /* noop */ }
