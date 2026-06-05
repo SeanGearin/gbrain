@@ -33,6 +33,9 @@ import { MinionQueue } from '../../src/core/minions/queue.ts';
 import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
 import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
+import { resolvePrivilegedEngine } from '../../src/commands/serve-http.ts';
+import { GBrainOAuthProvider } from '../../src/core/oauth-provider.ts';
+import { sqlQueryForEngine } from '../../src/core/sql-query.ts';
 
 const DB = process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL;
 const describeE2E = DB ? describe : describe.skip;
@@ -384,5 +387,56 @@ describeE2E('B7 RLS backstop (real Postgres + gbrain_tenant)', () => {
     const [page] = await admin`SELECT source_id FROM pages WHERE slug = ${result.slug}`;
     expect(page?.source_id).toBe(A);
     expect(page?.source_id).not.toBe('default');
+  });
+
+  // ===================== Layer 3b — engine-auth dual-DSN (2026-06-05) =========
+  //
+  // The 2026-06-04 T-INT harness fix (commit 44e5748a) gave the Layer-3
+  // adminEngine ABOVE its own pool by passing poolSize directly — but it never
+  // exercised the PRODUCTION resolvePrivilegedEngine(), which connected with NO
+  // poolSize and so silently reused the tenant module singleton (the privileged
+  // engine was really the RLS/permission-confined tenant role). That is why
+  // first-light 401'd every bearer and the boot sweep logged "permission denied
+  // for table oauth_tokens". These two tests pin the production path.
+
+  test('T-INT-5 resolvePrivilegedEngine returns a real incumbent pool, not the tenant singleton', async () => {
+    // tenantEngine (beforeAll, no poolSize) owns the process module singleton on
+    // the TENANT url — exactly the production ordering (primary connects first).
+    const prev = process.env.GBRAIN_ADMIN_DATABASE_URL;
+    process.env.GBRAIN_ADMIN_DATABASE_URL = DB as string; // incumbent/BYPASSRLS DSN
+    let privileged: PostgresEngine | undefined;
+    let owned = false;
+    try {
+      const res = await resolvePrivilegedEngine(tenantEngine, tenantUrl(DB as string));
+      privileged = res.engine as PostgresEngine;
+      owned = res.owned;
+      expect(owned).toBe(true); // a second pool was actually connected
+      // The teeth: mcp_request_log is CAT-6 — the tenant role is permission-denied
+      // (T-SQL-4). If resolvePrivilegedEngine had reused the tenant singleton this
+      // read throws 42501; on the real incumbent pool it succeeds.
+      const rows = await privileged.executeRaw<{ n: number }>(
+        'SELECT count(*)::int AS n FROM mcp_request_log');
+      expect(typeof rows[0].n).toBe('number');
+    } finally {
+      if (owned && privileged) { try { await privileged.disconnect(); } catch { /* noop */ } }
+      if (prev === undefined) delete process.env.GBRAIN_ADMIN_DATABASE_URL;
+      else process.env.GBRAIN_ADMIN_DATABASE_URL = prev;
+    }
+  });
+
+  test('T-INT-6 OAuth provider sweep runs on the privileged engine, is denied on the tenant engine', async () => {
+    // Post-fix serve-http builds the provider with sql = privilegedEngine. The
+    // sweep DELETEs expired oauth_tokens/oauth_codes — a WRITE the NOBYPASSRLS
+    // tenant role cannot do (SELECT-only grants per b7-role.sql). adminEngine is
+    // the incumbent instance pool (what privilegedEngine resolves to in prod).
+    const privilegedProvider = new GBrainOAuthProvider({ sql: sqlQueryForEngine(adminEngine), tokenTtl: 3600, dcrDisabled: true });
+    const swept = await privilegedProvider.sweepExpiredTokens();
+    expect(typeof swept).toBe('number'); // resolves, no permission error
+
+    // The pre-fix wiring (provider on the tenant engine) is exactly what logged
+    // "permission denied for table oauth_tokens" at boot — assert that failure so
+    // a regression that re-routes the provider to the tenant pool is caught.
+    const tenantProvider = new GBrainOAuthProvider({ sql: sqlQueryForEngine(tenantEngine), tokenTtl: 3600, dcrDisabled: true });
+    await expect(tenantProvider.sweepExpiredTokens()).rejects.toThrow(/permission denied/i);
   });
 });

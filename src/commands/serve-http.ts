@@ -681,8 +681,20 @@ export async function resolvePrivilegedEngine(
   // Dynamic import keeps PostgresEngine out of the eager load on the common
   // fallback path and sidesteps any import cycle through the command layer.
   const { PostgresEngine } = await import('../core/postgres-engine.ts');
+  const { resolvePoolSize } = await import('../core/db.ts');
   const adminEngine = new PostgresEngine();
-  await adminEngine.connect({ engine: 'postgres', database_url: adminUrl });
+  // poolSize forces PostgresEngine.connect down the INSTANCE-pool path (its own
+  // postgres() client on adminUrl) instead of the process-wide module singleton.
+  // The PRIMARY engine connected first and already owns that singleton on the
+  // TENANT url; without poolSize this connect() would see it open and silently
+  // REUSE the tenant connection ("connect() called with a different database_url
+  // ... Using existing connection"), leaving the "privileged" engine RLS/
+  // permission-confined to the tenant role — the production twin of the
+  // 2026-06-04 T-INT harness bug (commit 44e5748a fixed only the test). Size it
+  // like the main pool (resolvePoolSize honors GBRAIN_POOL_SIZE) because this
+  // pool now serves per-request verifyAccessToken. disconnect() tears down the
+  // instance pool without touching the module singleton.
+  await adminEngine.connect({ engine: 'postgres', database_url: adminUrl, poolSize: resolvePoolSize() });
   return { engine: adminEngine, owned: true };
 }
 
@@ -730,13 +742,24 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // `sql` is the PRIVILEGED handle — it serves the /admin/* dashboard + token
   // CRUD routes and the startup banner (all admin-surface reads/writes against
-  // mcp_request_log / oauth_clients / access_tokens). The OAuth provider, by
-  // contrast, is the request-path AUTH BOOTSTRAP (it reads oauth_*/access_tokens
-  // to resolve a bearer -> source before any scope exists), so it runs on the
-  // TENANT engine via `oauthSql`. On a single-plane deploy privilegedEngine ===
-  // engine, so the two handles are identical and nothing changes.
+  // mcp_request_log / oauth_clients / access_tokens).
+  //
+  // The OAuth provider ALSO runs on the privileged handle. It is not a pure
+  // bearer-read: alongside resolving a bearer -> source (verifyAccessToken
+  // SELECT) it performs WRITES the NOBYPASSRLS tenant role is denied — the
+  // startup sweepExpiredTokens DELETE on oauth_tokens/oauth_codes, the legacy
+  // access_tokens last_used_at UPDATE inside verifyAccessToken, and token
+  // issuance / client registration / code consumption. b7-role.sql grants the
+  // tenant role SELECT-only on the oauth_* tables (design D6: "WRITES ride the
+  // privileged connection, never this role"), so running the provider on the
+  // tenant engine made the boot sweep log "permission denied for table
+  // oauth_tokens" and 401'd every legacy admin bearer on the last_used_at
+  // UPDATE. Routing the whole provider through privilegedEngine honors D6 and
+  // keeps its reads+writes on one role. On a single-plane deploy
+  // privilegedEngine === engine, so this is byte-identical to before for Sean's
+  // box; op dispatch still runs on `engine` (tenant) via engine.withSourceScope.
   const sql = sqlQueryForEngine(privilegedEngine);
-  const oauthSql = sqlQueryForEngine(engine);
+  const oauthSql = sql;
 
   // Initialize OAuth provider. F12 cleanup: DCR-disable now flips a
   // constructor option instead of monkey-patching `_clientsStore` after
