@@ -102,6 +102,20 @@ export class PostgresEngine implements BrainEngine {
   private _connectionStyle: 'instance' | 'module' | null = null;
 
   /**
+   * B7 first-light fix #3: whether the connected role can SELECT the `config`
+   * table. The customer-plane `gbrain_tenant` role is GRANT-EXCLUDED from config
+   * (CAT-6; b7-role.sql; D3 banked — never grant), so a `getConfig` SELECT under
+   * it throws "permission denied for table config", which ABORTS the surrounding
+   * withSourceScope transaction and fails the whole op (the first-light
+   * get_page/query/extract_facts brain_unavailable class). Probed ONCE at
+   * connect() via has_table_privilege (constant per role) and cached here so
+   * getConfig can short-circuit to null on the tenant plane — every caller
+   * already treats a missing key as its default. null = not yet probed / assume
+   * readable (operator/incumbent default).
+   */
+  private _canReadConfig: boolean | null = null;
+
+  /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
    * - INSTANCE-owned: each PostgresEngine constructs its own.
    * - Worker engines (cycle, sync) inherit via opts.parentConnectionManager.
@@ -181,6 +195,20 @@ export class PostgresEngine implements BrainEngine {
         });
         this.connectionManager.setReadPool(db.getConnection());
       }
+    }
+
+    // B7 first-light fix #3: probe once whether this role may read `config`.
+    // Decoupled from RLS (a future NOBYPASSRLS role granted config would still
+    // read it). On the customer-plane tenant role this is false; getConfig then
+    // short-circuits to null instead of issuing a tx-aborting denied SELECT.
+    // Best-effort: any probe failure (e.g. config table absent on a fresh brain
+    // mid-init) leaves it readable — only a definitive `false` gates reads off.
+    try {
+      const rows = await this.sql<{ can: boolean }[]>`
+        SELECT has_table_privilege(current_user, 'config', 'SELECT') AS can`;
+      this._canReadConfig = rows.length > 0 ? rows[0].can : true;
+    } catch {
+      this._canReadConfig = true;
     }
   }
 
@@ -4101,6 +4129,15 @@ export class PostgresEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
+    // B7 first-light fix #3: the customer-plane tenant role cannot SELECT
+    // `config` (CAT-6 GRANT EXCLUSION; D3 banked — never grant). Issuing the
+    // read would throw "permission denied for table config" and ABORT the
+    // surrounding withSourceScope tx, failing the op (get_page/query/
+    // extract_facts brain_unavailable). The tenant plane has no operator config
+    // to read, so return null — callers default safely (kill-switches → on,
+    // model resolution → tier default, search mode → defaults). Operator /
+    // incumbent (BYPASSRLS, holds the grant) is unaffected. See _canReadConfig.
+    if (this._canReadConfig === false) return null;
     const sql = this.sql;
     const rows = await sql`SELECT value FROM config WHERE key = ${key}`;
     return rows.length > 0 ? (rows[0].value as string) : null;
@@ -4121,6 +4158,8 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async listConfigKeys(prefix: string): Promise<string[]> {
+    // B7 first-light fix #3: tenant role cannot read `config` (see getConfig).
+    if (this._canReadConfig === false) return [];
     const sql = this.sql;
     // LIKE-escape literal % and _ so a config key with those chars resolves correctly.
     const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
