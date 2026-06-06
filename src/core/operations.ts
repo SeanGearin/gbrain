@@ -707,7 +707,22 @@ const put_page: Operation = {
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    // Hosted-tenant plane is DB-only (B7 first-light fix #2). A remote caller
+    // confined to a provisioned, non-default source runs as the NOBYPASSRLS
+    // gbrain_tenant role inside serve-http's withSourceScope tx. That role is
+    // denied SELECT on `config` (CAT-6, GRANT EXCLUSION in b7-role.sql; D3
+    // banked — must NOT grant). The three operator-plane post-write side effects
+    // below each read `config` (sync.repo_path / facts.extraction_enabled /
+    // writer.lint_on_put_page); under the tenant role each SELECT throws
+    // "permission denied for table config", which ABORTS the outer transaction —
+    // their catch blocks LOOK non-fatal but the page INSERT then rolls back at
+    // commit and the op fails closed (brain_unavailable). Tenants have no repo,
+    // no operator kill-switches, and no lint soak, so skip all three. Operator
+    // ('default' source) + local CLI (remote===false) are unaffected — the
+    // ingestion cathedral keeps write-through. Discriminator is the
+    // withSourceScope tokenSourceId, NOT `remote` alone (operator MCP is remote).
+    const tenantScoped = ctx.remote !== false && ctx.sourceId !== 'default';
+    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent && !tenantScoped) {
       try {
         const repoPath = await ctx.engine.getConfig('sync.repo_path');
         if (!repoPath) {
@@ -740,6 +755,8 @@ const put_page: Operation = {
         ctx.logger.warn(`[put_page] write-through failed for ${result.slug}: ${msg}`);
         writeThrough = { written: false, error: msg };
       }
+    } else if (tenantScoped) {
+      writeThrough = { written: false, skipped: 'tenant_db_only' };
     } else if (isSandboxSubagent) {
       writeThrough = { written: false, skipped: 'subagent_sandbox' };
     } else if (ctx.dryRun) {
@@ -823,7 +840,13 @@ const put_page: Operation = {
     // (MEDIUM facts wait for the dream cycle but DO land via put_page,
     // matching the pre-fix behavior on this surface).
     let factsQueued: { queued: boolean } | { skipped: string } | undefined;
-    try {
+    // Skip on the hosted-tenant plane (B7 first-light fix #2): the kill-switch
+    // read isFactsExtractionEnabled → getConfig('facts.extraction_enabled') is a
+    // SELECT on the tenant-denied `config` table and would abort the tx before
+    // any enqueue. Tenant facts auto-extraction is deferred (separate work).
+    if (tenantScoped) {
+      factsQueued = { skipped: 'tenant_db_only' };
+    } else try {
       const { runFactsBackstop } = await import('./facts/backstop.ts');
       const r = await runFactsBackstop(
         {
@@ -862,7 +885,12 @@ const put_page: Operation = {
     // ingest_log + ~/.gbrain/validator-lint.jsonl. Does NOT reject the
     // write — that's the deferred strict-mode flip after the 7-day soak.
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
-    try {
+    // Skip on the hosted-tenant plane (B7 first-light fix #2): the feature-flag
+    // read getConfig('writer.lint_on_put_page') is a SELECT on the tenant-denied
+    // `config` table and would abort the tx.
+    if (tenantScoped) {
+      writerLint = { skipped: 'tenant_db_only' };
+    } else try {
       const { runPostWriteLint } = await import('./output/post-write.ts');
       const lint = await runPostWriteLint(ctx.engine, result.slug);
       if (lint.ran) {

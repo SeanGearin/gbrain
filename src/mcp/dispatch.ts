@@ -258,7 +258,18 @@ export async function dispatchToolCall(
     // tool call to error.
     if (opts.metaHook) {
       try {
-        const meta = await opts.metaHook(name, ctx);
+        // B7 first-light fix #2 (savepoint containment). The handler may have
+        // run inside serve-http's withSourceScope transaction; a DB error in the
+        // meta hook would otherwise abort THAT outer tx, so the JS try/catch
+        // below looks non-fatal but the op's commit then fails with "current
+        // transaction is aborted". Run the hook's reads inside engine.transaction
+        // — re-entrant (1a11447e): a SAVEPOINT when already in a tx, a plain
+        // BEGIN/COMMIT otherwise — so a hook failure rolls back to the savepoint
+        // and the outer tx stays committable. This is the structural guard for
+        // the whole class of best-effort post-op DB hooks at the dispatch
+        // chokepoint, not just brain_hot_memory.
+        const meta = await ctx.engine.transaction((txEngine) =>
+          opts.metaHook!(name, { ...ctx, engine: txEngine }));
         if (meta && Object.keys(meta).length > 0) out._meta = meta;
       } catch (metaErr) {
         const msg = metaErr instanceof Error ? metaErr.message : String(metaErr);
