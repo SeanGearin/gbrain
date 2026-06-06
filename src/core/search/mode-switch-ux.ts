@@ -343,10 +343,12 @@ async function resolveDefaultSourceId(engine: BrainEngine): Promise<string> {
 
 async function resolveChunkerVersion(engine: BrainEngine): Promise<number> {
   try {
-    const rows = await engine.executeRaw<{ v: string | null }>(
-      `SELECT value AS v FROM config WHERE key = 'chunker_version'`,
-    );
-    const v = Number(rows[0]?.v ?? 0);
+    // B7 first-light fix #4 (close-the-class): route through the guarded
+    // engine.getConfig chokepoint, not a raw `SELECT … FROM config`. On the
+    // tenant role config is CAT-6 (denied); a raw read aborts the withSourceScope
+    // dispatch tx (the catch doesn't save it). getConfig returns null → 0.
+    const raw = await engine.getConfig('chunker_version');
+    const v = Number(raw ?? 0);
     return Number.isFinite(v) ? v : 0;
   } catch {
     return 0;

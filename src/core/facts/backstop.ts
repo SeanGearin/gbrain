@@ -302,6 +302,15 @@ async function runPipelineWithBody(
     model: ctx.model,
   });
 
+  // B7 first-light fix #4 (observability): extraction yielded nothing — log it
+  // with provenance so an op-level `inserted: 0` is never a silent dead-end.
+  // extractFactsFromTurn already logged the specific reason (provider error,
+  // parse failure, availability, empty turn); this records the pipeline-level
+  // outcome so the two correlate in one journal scan.
+  if (facts.length === 0) {
+    console.warn(`[facts:pipeline] 0 facts extracted (source=${ctx.source}, sourceId=${ctx.sourceId}) — see preceding [facts:extract] line for the reason`);
+  }
+
   const filter = ctx.notabilityFilter ?? 'all';
   const visibility = ctx.visibility ?? 'private';
 
@@ -453,6 +462,10 @@ async function runPipelineWithBody(
       // every fact in this entity group as not-inserted (no fact_id
       // returned). Do NOT fall through to legacy DB-only — that
       // would write rows to a DB index whose fence is broken.
+      // B7 first-light fix #4 (observability): also surface to the journal so a
+      // fence failure (e.g. a tenant source whose clone dir doesn't exist on
+      // the customer-plane box) isn't a silent zero visible only in the JSONL.
+      console.warn(`[facts:pipeline] fence write failed (source=${ctx.source}, sourceId=${ctx.sourceId}, slug=${slug}): ${group.length} fact(s) NOT inserted — see write-failures JSONL for detail`);
       continue;
     }
     if (result.stubGuardBlocked) {

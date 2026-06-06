@@ -363,31 +363,34 @@ function safeJsonParse<T>(value: unknown, fallback: T): T {
  * three keys have sensible defaults; missing rows fall back to those.
  */
 export async function loadCacheConfig(engine: BrainEngine): Promise<QueryCacheConfig> {
-  const keys = [
-    'search.cache.enabled',
-    'search.cache.similarity_threshold',
-    'search.cache.ttl_seconds',
-  ];
   const config: QueryCacheConfig = {
     enabled: true,
     similarityThreshold: DEFAULT_SIMILARITY_THRESHOLD,
     ttlSeconds: DEFAULT_TTL_SECONDS,
   };
   try {
-    const rows = await engine.executeRaw<{ key: string; value: string }>(
-      `SELECT key, value FROM config WHERE key = ANY($1)`,
-      [keys],
-    );
-    for (const row of rows) {
-      if (row.key === 'search.cache.enabled') {
-        config.enabled = row.value === '1' || row.value.toLowerCase() === 'true';
-      } else if (row.key === 'search.cache.similarity_threshold') {
-        const v = parseFloat(row.value);
-        if (Number.isFinite(v)) config.similarityThreshold = clampThreshold(v);
-      } else if (row.key === 'search.cache.ttl_seconds') {
-        const v = parseInt(row.value, 10);
-        if (Number.isFinite(v)) config.ttlSeconds = clampTtl(v);
-      }
+    // B7 first-light fix #4 (close-the-class): route through the guarded
+    // engine.getConfig chokepoint instead of a raw `SELECT … FROM config`.
+    // On the customer-plane tenant role config is CAT-6 (GRANT-EXCLUDED), so a
+    // raw read throws "permission denied for table config" and ABORTS the
+    // withSourceScope dispatch tx — the try/catch here does NOT save it (the
+    // Postgres abort outlives the swallowed JS error). getConfig returns null
+    // for that role; semantics are identical (missing key → default).
+    const [enabled, threshold, ttl] = await Promise.all([
+      engine.getConfig('search.cache.enabled'),
+      engine.getConfig('search.cache.similarity_threshold'),
+      engine.getConfig('search.cache.ttl_seconds'),
+    ]);
+    if (enabled !== null) {
+      config.enabled = enabled === '1' || enabled.toLowerCase() === 'true';
+    }
+    if (threshold !== null) {
+      const v = parseFloat(threshold);
+      if (Number.isFinite(v)) config.similarityThreshold = clampThreshold(v);
+    }
+    if (ttl !== null) {
+      const v = parseInt(ttl, 10);
+      if (Number.isFinite(v)) config.ttlSeconds = clampTtl(v);
     }
   } catch {
     // Use defaults.
