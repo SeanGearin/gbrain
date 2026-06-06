@@ -757,13 +757,39 @@ export class PostgresEngine implements BrainEngine {
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
     const conn = this._sql || db.getConnection();
-    return conn.begin(async (tx) => {
-      // Create a scoped engine with tx as its connection, no shared state mutation
+    // Create a scoped engine with tx as its connection, no shared state mutation.
+    // Redefining the `sql` getter transparently re-routes every `this.sql` read
+    // onto the pinned (savepoint or transaction) handle. Shared by both paths.
+    const run = (tx: postgres.TransactionSql<Record<string, never>>) => {
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
       return fn(txEngine);
-    }) as Promise<T>;
+    };
+    // Re-entrancy (B7 first-light fix). When this engine is ALREADY pinned to an
+    // open postgres.js transaction — e.g. serve-http wrapped the op in
+    // `withSourceScope`, so `_sql` is a tx handle, not a pool — that handle
+    // exposes `.savepoint()` but NOT `.begin()` (postgres.js 3.x attaches
+    // `.begin` only to the top-level client; the transaction-scoped sql gets
+    // `.savepoint`). Calling `.begin` there throws
+    // "(this._sql || db.getConnection()).begin is not a function" — the exact
+    // tenant put_page failure, because put_page's auto-link reconciliation
+    // (operations.ts `runAutoLink`) opens a nested `engine.transaction()`.
+    // Nest via SAVEPOINT instead: inner rollback stays scoped to the savepoint
+    // (so runAutoLink's caught, non-fatal errors don't poison the outer page
+    // write) and the transaction-local `app.current_source_id` GUC that
+    // withSourceScope set survives (same physical transaction → RLS still sees
+    // the caller's source). The `.begin` discriminator is runtime, not `_sql`-
+    // presence: instance-pool engines (the privileged engine) also set `_sql`
+    // but to a real pool that DOES have `.begin`, so they take the begin path.
+    const reentrant = conn as unknown as {
+      begin?: (f: typeof run) => Promise<T>;
+      savepoint?: (f: typeof run) => Promise<T>;
+    };
+    if (typeof reentrant.begin !== 'function' && typeof reentrant.savepoint === 'function') {
+      return reentrant.savepoint(run);
+    }
+    return conn.begin(run) as Promise<T>;
   }
 
   async withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {

@@ -1873,7 +1873,16 @@ const get_stats: Operation = {
   handler: async (ctx) => {
     return ctx.engine.getStats();
   },
-  scope: 'admin',
+  // read, not admin (B7 first-light fix). get_stats is the tenant isolation
+  // verdict surface — a tenant must see its own page_count (≈1) to confirm the
+  // RLS wall holds. Every table getStats() reads (pages, content_chunks, links,
+  // tags, timeline_entries) carries the b7_tenant_isolation RLS policy, so under
+  // serve-http's withSourceScope wrap the NOBYPASSRLS tenant role sees ONLY its
+  // own source's rows — get_stats leaks nothing cross-tenant. The same counts
+  // are already exposed at read scope via get_brain_identity, which calls the
+  // identical getStats(). Operators are unaffected (admin implies read). Do NOT
+  // mint tenants admin scope to reach this; the tool is the read-scope surface.
+  scope: 'read',
   cliHints: { name: 'stats' },
 };
 
