@@ -3327,8 +3327,18 @@ export class PGLiteEngine implements BrainEngine {
       params.kinds = opts.kinds;
     }
     if (opts.visibility && opts.visibility.length > 0) {
-      whereParts.push(`visibility = ANY($visibility)`);
-      params.visibility = opts.visibility;
+      // B7 recall owner-visibility (pass 3): widen to
+      // (visibility = ANY(...) OR source_id = ownerSourceId) when an owner
+      // scope is supplied, so a source's owner reads their own facts back.
+      const ownerSourceId = opts.ownerSourceId ?? null;
+      if (ownerSourceId) {
+        whereParts.push(`(visibility = ANY($visibility) OR source_id = $ownerSourceId)`);
+        params.visibility = opts.visibility;
+        params.ownerSourceId = ownerSourceId;
+      } else {
+        whereParts.push(`visibility = ANY($visibility)`);
+        params.visibility = opts.visibility;
+      }
     }
     for (const c of opts.whereClauses ?? []) whereParts.push(c);
     Object.assign(params, opts.whereParams ?? {});

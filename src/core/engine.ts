@@ -497,6 +497,21 @@ export interface FactListOpts {
    * are returned. Remote (untrusted) callers must supply ['world'].
    */
   visibility?: FactVisibility[];
+  /**
+   * B7 recall owner-visibility (pass 3). When set ALONGSIDE a `visibility`
+   * filter, the predicate widens to
+   *   (visibility = ANY(visibility) OR source_id = ownerSourceId)
+   * so the OWNER of a source reads their own facts back regardless of
+   * visibility, while world-only stays world-only for everyone else. The
+   * list queries are already `WHERE source_id = <source>`, so for a caller
+   * reading their own scoped source this is the full carve-out; it can never
+   * widen the result beyond rows that source_id-filter already admits.
+   *
+   * Left undefined → behavior is byte-identical to before (visibility filter
+   * applies verbatim). Only the recall op sets it, and only for remote callers
+   * with a resolved source scope.
+   */
+  ownerSourceId?: string | null;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */

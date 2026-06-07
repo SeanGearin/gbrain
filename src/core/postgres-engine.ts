@@ -3176,13 +3176,18 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND entity_slug = ${entitySlug}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -3200,6 +3205,7 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const entitySlug = opts?.entitySlug ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
@@ -3208,7 +3214,11 @@ export class PostgresEngine implements BrainEngine {
         ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -3226,13 +3236,18 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;

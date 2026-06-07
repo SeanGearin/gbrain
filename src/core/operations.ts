@@ -3371,6 +3371,31 @@ const recall: Operation = {
         ? undefined
         : ['world'] as ('private' | 'world')[];
 
+    // R-2 owner-visibility (pass 3): a remote caller reads their OWN source's
+    // facts back regardless of visibility. The engine predicate widens to
+    // (visibility = world OR source_id = ownerSourceId); because every list
+    // query below is already `WHERE source_id = sourceId`, this only ever
+    // surfaces the caller's own source — never a third party's private facts.
+    //
+    // The owner signal is the AUTHENTICATED write-authority source
+    // (ctx.auth.sourceId — "the source the calling OAuth client is scoped to",
+    // i.e. the source it OWNS), NOT the request-derived ctx.sourceId. The two
+    // are equal for a scoped caller, but ctx.sourceId is coerced to 'default'
+    // for an unscoped/legacy/public caller — keying the carve-out on it would
+    // leak the default brain's private facts to a world reader. Keying on
+    // ctx.auth.sourceId means: a token scoped to a source owns it (tenant sees
+    // own private); an unauthenticated/unscoped caller gets no carve-out and
+    // stays world-only, verbatim. No config read (CAT-6/FLAG-C zone): the scope
+    // rides on the auth context set by the dispatch.
+    const ownerSourceId =
+      ctx.remote === false
+        ? null
+        : (typeof ctx.auth?.sourceId === 'string' && ctx.auth.sourceId.length > 0
+            ? ctx.auth.sourceId
+            : null);
+
+    const listOpts = { activeOnly: !includeExpired, limit, visibility, ownerSourceId };
+
     let rows: Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>> = [];
 
     if (p.supersessions === true) {
@@ -3379,33 +3404,17 @@ const recall: Operation = {
     } else if (typeof p.entity === 'string' && p.entity.length > 0) {
       const { resolveEntitySlug } = await import('./entities/resolve.ts');
       const slug = (await resolveEntitySlug(ctx.engine, sourceId, p.entity)) ?? p.entity;
-      rows = await ctx.engine.listFactsByEntity(sourceId, slug, {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsByEntity(sourceId, slug, listOpts);
     } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
-      rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, listOpts);
     } else if (p.since !== undefined) {
       const since = parseSinceParam(p.since);
       if (since) {
-        rows = await ctx.engine.listFactsSince(sourceId, since, {
-          activeOnly: !includeExpired,
-          limit,
-          visibility,
-        });
+        rows = await ctx.engine.listFactsSince(sourceId, since, listOpts);
       }
     } else {
       // No filter: return recent across the source.
-      rows = await ctx.engine.listFactsSince(sourceId, new Date(0), {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsSince(sourceId, new Date(0), listOpts);
     }
 
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
