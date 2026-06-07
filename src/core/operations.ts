@@ -1427,6 +1427,16 @@ const query: Operation = {
       nearSymbol: (p.near_symbol as string) || undefined,
       walkDepth: typeof p.walk_depth === 'number' ? (p.walk_depth as number) : undefined,
       ...querySourceScope,
+      // v0.40.6 (B7 tenant query_cache fix): the semantic cache row is OWNED
+      // by the dispatch scope, not the read allow-list. querySourceScope above
+      // resolves a federated tenant to `sourceIds` (read scope), leaving scalar
+      // sourceId undefined — so the cache write fell back to 'default' and the
+      // RLS WITH CHECK on query_cache aborted the whole dispatch tx. Thread
+      // ctx.sourceId (== withSourceScope's app.current_source_id) as the cache
+      // owner. Cache-only; does not affect read scope. Explicit per-call
+      // source_id ('__all__' → {}) leaves this unset → store falls back to
+      // sourceId (local/CLI unchanged).
+      cacheSourceId: ctx.sourceId,
       // v0.29.1 — agent-explicit recency + salience. Omitted = heuristic defaults.
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,

@@ -768,6 +768,22 @@ export interface SearchOpts {
    */
   sourceIds?: string[];
   /**
+   * v0.40.6 (B7 tenant query_cache fix): the single OWNING source for the
+   * semantic-cache row, independent of the read scope above. The query op
+   * threads `ctx.sourceId` here — the same value `withSourceScope` sets as
+   * `app.current_source_id`, which the `query_cache` RLS WITH CHECK policy
+   * (b7_tenant_isolation) validates the INSERT against.
+   *
+   * Why distinct from `sourceId`/`sourceIds`: a federated tenant resolves to
+   * `sourceIds` (the read allow-list), leaving scalar `sourceId` undefined, so
+   * the cache fell back to `'default'` and the INSERT violated WITH CHECK —
+   * aborting the dispatch tx (25P02 → brain_unavailable). The read allow-list
+   * is NOT the right cache owner either (it may span multiple sources); only
+   * the dispatch scope is. When unset, the cache falls back to `sourceId`
+   * (preserves CLI/local behavior). Cache-only: never widens/narrows reads.
+   */
+  cacheSourceId?: string;
+  /**
    * v0.27.1 / v0.36 (D11): target column for vector search. Two shapes:
    *
    * 1. String name (legacy + user-facing). Engine and hybridSearch convert

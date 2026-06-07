@@ -234,7 +234,21 @@ export class SemanticQueryCache {
       // sent as a JSON.stringify and cast to JSONB inside the SQL; pre-v91
       // brains store an empty `{}` + zero bookmark (legacy compat per
       // the v0.40.3.0 IRON-RULE).
-      await this.engine.executeRaw(
+      //
+      // v0.40.6 (B7 tenant query_cache fix): wrap the INSERT in
+      // engine.transaction() so a failed cache write cannot abort the
+      // request. On the customer plane this write runs inside serve-http's
+      // withSourceScope dispatch tx; a raw INSERT that trips the query_cache
+      // RLS WITH CHECK (or any other error) raises 25P02 and POISONS that
+      // outer tx — every later statement dies and the op returns
+      // brain_unavailable (the try/catch below does NOT save it; the Postgres
+      // abort outlives the swallowed JS error — same mechanism documented in
+      // loadCacheConfig's B7 fix #4 chokepoint comment). engine.transaction()
+      // is re-entrant: a real tx at top level (CLI/eval), a SAVEPOINT when
+      // already inside the dispatch tx — so the failure rolls back to the
+      // savepoint and the outer tx survives. Best-effort is now real.
+      await this.engine.transaction((tx) =>
+        tx.executeRaw(
         `INSERT INTO query_cache (id, query_text, source_id, knobs_hash, embedding, results, meta, ttl_seconds, page_generations, max_generation_at_store, created_at)
          VALUES ($1, $2, $3, $4, $5::vector, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10, now())
          ON CONFLICT (id) DO UPDATE SET
@@ -259,9 +273,12 @@ export class SemanticQueryCache {
           JSON.stringify(snapshot.page_generations),
           snapshot.max_generation_at_store,
         ],
-      );
+      ));
     } catch {
       // swallow \u2014 cache write must never break the search hot path.
+      // With the engine.transaction() wrapper above, a nested failure has
+      // already rolled back to its SAVEPOINT, so the caller's (dispatch) tx
+      // is intact; this catch just absorbs the re-thrown error.
     }
   }
 
