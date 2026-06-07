@@ -3026,6 +3026,10 @@ export class PostgresEngine implements BrainEngine {
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
+    // B7 save_facts (v93) — client-authored provenance stamps. Null/false for
+    // every non-save_facts caller (server-authored).
+    const provenance     = input.provenance ?? null;
+    const clientAuthored = input.client_authored ?? false;
 
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
@@ -3039,12 +3043,14 @@ export class PostgresEngine implements BrainEngine {
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
             embedding, embedded_at,
-            claim_metric, claim_value, claim_unit, claim_period
+            claim_metric, claim_value, claim_unit, claim_period,
+            provenance, client_authored
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
-            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
+            ${provenance}, ${clientAuthored}
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
@@ -3065,12 +3071,14 @@ export class PostgresEngine implements BrainEngine {
           source_id, entity_slug, fact, kind, visibility, notability, context,
           valid_from, valid_until, source, source_session, confidence,
           embedding, embedded_at,
-          claim_metric, claim_value, claim_unit, claim_period
+          claim_metric, claim_value, claim_unit, claim_period,
+          provenance, client_authored
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
           ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
-          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
+          ${provenance}, ${clientAuthored}
         ) RETURNING id
       `;
       return Number(ins[0].id);
@@ -3288,6 +3296,67 @@ export class PostgresEngine implements BrainEngine {
         AND entity_slug = ${entitySlug}
         AND expired_at IS NULL
       ORDER BY created_at DESC, id DESC
+      LIMIT ${k}
+    `;
+    return rows.map(rowToFactPg);
+  }
+
+  // B7 save_facts — Layer-1 (always-on) text dedup. Source-scoped, no entity
+  // prefilter. Matches normalized-exact OR pg_trgm similarity >= threshold.
+  // Runs inside the tenant withSourceScope tx; the explicit source_id filter
+  // is belt-and-suspenders alongside the RLS policy.
+  async findFactTextDuplicates(
+    source_id: string,
+    factText: string,
+    opts?: { threshold?: number; limit?: number },
+  ): Promise<Array<{ id: number; fact: string; score: number }>> {
+    const sql = this.sql;
+    const threshold = Math.min(Math.max(opts?.threshold ?? 0.85, 0), 1);
+    const limit = Math.min(Math.max(opts?.limit ?? 5, 1), 20);
+    // Normalized form for the exact-match arm: lower + trim + whitespace
+    // collapse. The trgm arm (pg_trgm lowercases internally) catches near-dups.
+    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    const rows = await sql<Array<{ id: number; fact: string; score: number }>>`
+      SELECT id, fact,
+             GREATEST(
+               similarity(fact, ${factText}),
+               CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+                    THEN 1.0 ELSE 0 END
+             )::real AS score
+      FROM facts
+      WHERE source_id = ${source_id}
+        AND expired_at IS NULL
+        AND (
+          fact % ${factText}
+          OR lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+        )
+        AND GREATEST(
+              similarity(fact, ${factText}),
+              CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+                   THEN 1.0 ELSE 0 END
+            ) >= ${threshold}
+      ORDER BY score DESC, id DESC
+      LIMIT ${limit}
+    `;
+    return rows.map(r => ({ id: Number(r.id), fact: r.fact, score: Number(r.score) }));
+  }
+
+  // B7 save_facts — Layer-2 (conditional) embedding-neighbor search.
+  // Source-scoped embedding KNN; NO entity prefilter (cf. findCandidateDuplicates).
+  async findFactEmbeddingNeighbors(
+    source_id: string,
+    embedding: Float32Array,
+    opts?: { k?: number },
+  ): Promise<FactRow[]> {
+    const sql = this.sql;
+    const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
+    const lit = toPgVectorLiteral(embedding);
+    const rows = await sql<FactRowSqlShape[]>`
+      SELECT * FROM facts
+      WHERE source_id = ${source_id}
+        AND expired_at IS NULL
+        AND embedding IS NOT NULL
+      ORDER BY embedding <=> ${sql.unsafe(`'${lit}'::vector`)}
       LIMIT ${k}
     `;
     return rows.map(rowToFactPg);

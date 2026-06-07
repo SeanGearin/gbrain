@@ -711,6 +711,15 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // brains is invisible to them). Migration is column-only, no FK,
   // no index — bootstrap probe would be pure overhead.
   'facts.event_type',
+  // B7 save_facts (migration v93) — provenance + client_authored columns for
+  // the deterministic structured-facts intake path. Same precedent as
+  // facts.event_type: column-only, no FK, no index in PGLITE_SCHEMA_SQL
+  // references them, ADD COLUMN IF NOT EXISTS handles fresh + pre-existing
+  // brains. provenance is NULL and client_authored FALSE on every old row +
+  // every extract_facts row, which is the correct semantics, so no downstream
+  // filter breaks on old brains — bootstrap probe would be pure overhead.
+  'facts.provenance',
+  'facts.client_authored',
   // v0.39.1.0 (migration v88) — schema-pack provenance per-source captured as
   // inline canonical closure snapshot on every eval_candidates row. NULL by
   // default; no index in PGLITE_SCHEMA_SQL references it. Migration handles

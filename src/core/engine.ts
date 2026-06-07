@@ -471,6 +471,17 @@ export interface NewFact {
    * set this — leaving it undefined preserves pre-v0.40 behavior.
    */
   event_type?: string | null;
+  /**
+   * B7 save_facts (migration v93) — client-authored structured-intake stamps.
+   * Set ONLY by the deterministic `save_facts` tenant path. Every other
+   * caller (extract_facts, put_page, cli:think, fence reconcile) leaves them
+   * undefined → persisted as provenance=NULL, client_authored=FALSE, i.e.
+   * server-authored. `provenance` records whether the customer's client model
+   * said the user stated the claim ('user_stated') or conservatively inferred
+   * it ('model_inferred'); downstream grading/consolidation weight on it.
+   */
+  provenance?: 'user_stated' | 'model_inferred' | null;
+  client_authored?: boolean;
 }
 
 /** Options shared by list-facts methods. */
@@ -1428,6 +1439,40 @@ export interface BrainEngine {
     entitySlug: string,
     factText: string,
     opts?: { k?: number; embedding?: Float32Array },
+  ): Promise<FactRow[]>;
+
+  /**
+   * B7 save_facts — Layer-1 (always-on, zero external dependency) text dedup.
+   *
+   * Source-scoped, NOT entity-prefiltered — the deterministic `save_facts`
+   * path does not resolve entities, so dedup runs across the whole source's
+   * active facts. Matches on EITHER:
+   *   - normalized exact text (lower / trim / whitespace-collapse), or
+   *   - pg_trgm trigram `similarity(fact, factText) >= threshold` (default
+   *     0.85; pg_trgm is created in both PGLITE_SCHEMA_SQL and schema.sql).
+   * Returns matches ordered by score (exact match scores 1.0), capped at
+   * `limit` (default 5). Empty array means "no duplicate" → caller inserts.
+   */
+  findFactTextDuplicates(
+    source_id: string,
+    factText: string,
+    opts?: { threshold?: number; limit?: number },
+  ): Promise<Array<{ id: number; fact: string; score: number }>>;
+
+  /**
+   * B7 save_facts — Layer-2 (conditional) embedding-neighbor search.
+   *
+   * Source-scoped embedding KNN over the source's active facts that have
+   * embeddings. Like findCandidateDuplicates' embedding branch but WITHOUT
+   * the entity_slug prefilter. The caller (save.ts) computes cosineSimilarity
+   * against the returned rows and treats >= 0.95 as a duplicate. Called only
+   * when isAvailable('embedding') is true and the new claim embedded cleanly;
+   * never reached on a keyless box.
+   */
+  findFactEmbeddingNeighbors(
+    source_id: string,
+    embedding: Float32Array,
+    opts?: { k?: number },
   ): Promise<FactRow[]>;
 
   /**

@@ -4257,6 +4257,40 @@ export const MIGRATIONS: Migration[] = [
         WHERE config ? 'github_repo';
     `,
   },
+  {
+    version: 93,
+    name: 'facts_provenance_columns',
+    // B7 save_facts (pass 1) — structured-facts intake provenance stamps.
+    //
+    // Two additive nullable/defaulted columns on facts so the deterministic
+    // `save_facts` tool (client-authored, zero-LLM tenant capture path) can
+    // persist per-row trust metadata that the downstream graph layers
+    // (grading, consolidation, quarantine) weight on:
+    //
+    //   provenance       — 'user_stated' | 'model_inferred'. NULL for every
+    //                      pre-existing row and for server-extracted facts
+    //                      (extract_facts), which carry no client provenance.
+    //                      No CHECK constraint: the save_facts handler is the
+    //                      sole writer and validates the enum before insert;
+    //                      a DB CHECK would force a validating table scan on
+    //                      ALTER for zero added safety over the handler gate.
+    //   client_authored  — TRUE only for rows written by save_facts (the
+    //                      claim text was authored by the customer's client
+    //                      model, not server-extracted). DEFAULT FALSE so
+    //                      every existing row + every extract_facts row reads
+    //                      correctly as server-authored without a backfill.
+    //
+    // Both ADD COLUMN forms are metadata-only on Postgres 11+ and PGLite
+    // (TEXT with no default; BOOLEAN with a constant default) — instant on
+    // a table of any size, no index, no FK. Exempted from the schema-
+    // bootstrap forward-reference probe in test/schema-bootstrap-coverage
+    // (COLUMN_EXEMPTIONS) exactly as facts.event_type / facts.claim_* are.
+    idempotent: true,
+    sql: `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS provenance TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS client_authored BOOLEAN NOT NULL DEFAULT FALSE;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

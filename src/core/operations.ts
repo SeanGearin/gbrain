@@ -3314,6 +3314,34 @@ const extract_facts: Operation = {
   },
 };
 
+const save_facts: Operation = {
+  name: 'save_facts',
+  description:
+    'B7: insert PRE-EXTRACTED structured facts into per-source hot memory with ZERO server LLM. The deterministic sibling of extract_facts: the CALLER (the customer\'s own model) decides what is worth remembering and structures it; the server only validates, sanitizes (INJECTION_PATTERNS + 500-char cap), dedups, and inserts. Use this on the tenant plane where the chat gateway is intentionally unavailable. Each claim carries a REQUIRED provenance ("user_stated" for what the user actually said; "model_inferred" only for conservative, clearly-flagged inferences — never speculation). Dedup is two-layer and degrades gracefully: always-on pg_trgm / normalized-text, plus cosine when an embedding provider is configured. Rows are stamped source=mcp:save_facts, client_authored=true, provenance + confidence per row. Returns {inserted, duplicate, fact_ids, dedup_mode}. A malformed claim rejects the WHOLE batch and names the failing index.',
+  params: {
+    claims: {
+      type: 'array',
+      required: true,
+      description:
+        'Non-empty array of claim objects. Each object (strict — unknown keys rejected): claim (string, required, plain text, <=500 chars); provenance ("user_stated" | "model_inferred", REQUIRED, no default); kind ("fact" | "event" | "commitment" | "preference" | "belief", default "fact"); people (string[], surface forms as spoken, NOT slugs); entities (string[], non-person surface forms); date_context (string — resolve relative dates like "next Saturday" to a concrete date before sending); confidence (number 0-1; default 1.0 for user_stated, hard-capped at 0.7 for model_inferred).',
+      items: { type: 'object' },
+    },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'save_facts' };
+    // Deterministic, config-free intake. No kill-switch config read here: the
+    // tenant withSourceScope tx runs under the NOBYPASSRLS gbrain_tenant role,
+    // which is GRANT-excluded from the config table (a raw config read aborts
+    // the tx — the FLAG-C class). The whole point of this path is to need no
+    // gateway/config gate.
+    const { runSaveFacts } = await import('./facts/save.ts');
+    const sourceId = ctx.sourceId ?? 'default';
+    return runSaveFacts(p.claims, { engine: ctx.engine, sourceId });
+  },
+};
+
 const recall: Operation = {
   name: 'recall',
   description:
@@ -3886,6 +3914,8 @@ export const operations: Operation[] = [
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)
   extract_facts, recall, forget_fact,
+  // B7: deterministic structured-facts intake (tenant plane, zero server LLM)
+  save_facts,
   // v0.32.6: contradiction probe MCP surface (M3)
   find_contradictions,
   // v0.33: expertise + relationship-proximity routing
