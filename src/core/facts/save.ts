@@ -134,7 +134,12 @@ export async function runSaveFacts(
   if (rawClaims.length === 0) {
     return { error: 'invalid_batch', failed_index: -1, detail: 'claims must be a non-empty array' };
   }
-  const claims: ValidClaim[] = [];
+  // Validate AND sanitize in one pass, BEFORE any insert. A claim that
+  // sanitizes to empty (whitespace/control-only) is rejected here exactly like
+  // a schema failure, so a malformed item can never leak partial writes ahead
+  // of itself. Each surviving claim carries its sanitized `cleaned` text
+  // forward; the insert loop never re-sanitizes.
+  const claims: Array<{ claim: ValidClaim; cleaned: string }> = [];
   for (let i = 0; i < rawClaims.length; i++) {
     const parsed = ClaimSchema.safeParse(rawClaims[i]);
     if (!parsed.success) {
@@ -146,7 +151,16 @@ export async function runSaveFacts(
         detail: `claim[${i}].${path}: ${first?.message ?? 'invalid'}`,
       };
     }
-    claims.push(parsed.data);
+    const { text } = sanitizeTakeForPrompt(parsed.data.claim);
+    const cleaned = text.trim();
+    if (!cleaned) {
+      return {
+        error: 'invalid_claim',
+        failed_index: i,
+        detail: `claim[${i}].claim: empty after sanitization`,
+      };
+    }
+    claims.push({ claim: parsed.data, cleaned });
   }
 
   // --- 2. batch-level capability: is the embedding lane configured? -------
@@ -159,22 +173,11 @@ export async function runSaveFacts(
   let duplicate = 0;
   const fact_ids: number[] = [];
 
-  for (const c of claims) {
-    // --- 3. sanitize (trust boundary) -------------------------------------
-    const { text: factText } = sanitizeTakeForPrompt(c.claim);
-    const cleaned = factText.trim();
-    if (!cleaned) {
-      // Sanitized to nothing (claim was whitespace/control-only) — treat as a
-      // malformed item, reject the whole batch. No writes have happened: a
-      // sanitize-to-empty can only occur before any insert for THIS claim, but
-      // earlier claims in the batch may already be committed in the tx. We
-      // still surface the index so the client can fix and resend; the tx-level
-      // atomicity of the dispatch wrap decides commit/rollback.
-      const idx = claims.indexOf(c);
-      return { error: 'invalid_claim', failed_index: idx, detail: `claim[${idx}].claim: empty after sanitization` };
-    }
+  for (const { claim: c, cleaned } of claims) {
+    // Claims were sanitized + emptiness-checked in the validation pass above;
+    // `cleaned` is the trust-boundary-safe text. No re-sanitization here.
 
-    // --- 4. dedup --------------------------------------------------------
+    // --- dedup -----------------------------------------------------------
     // Layer 1 (always on): normalized-exact OR pg_trgm near-dup.
     let matchedId: number | null = null;
     const textDups = await ctx.engine.findFactTextDuplicates(ctx.sourceId, cleaned, {
@@ -221,7 +224,7 @@ export async function runSaveFacts(
       continue;
     }
 
-    // --- 5. insert (stamped) ---------------------------------------------
+    // --- insert (stamped) ------------------------------------------------
     const newFact: NewFact = {
       fact: cleaned,
       kind: (c.kind ?? 'fact') as FactKind,

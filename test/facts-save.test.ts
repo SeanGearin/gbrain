@@ -229,7 +229,7 @@ describe('save_facts — validation rejects whole batch with index (B-SF4 c)', (
     expect(notArray.error).toBe('invalid_batch');
   });
 
-  test('rejected batch writes nothing', async () => {
+  test('rejected batch writes nothing (schema failure)', async () => {
     const before = await countFacts('tenant-atomic');
     await runSaveFacts(
       [{ claim: 'leading good', provenance: 'user_stated' }, { claim: 'bad' /* no provenance */ }],
@@ -237,6 +237,25 @@ describe('save_facts — validation rejects whole batch with index (B-SF4 c)', (
     );
     const after = await countFacts('tenant-atomic');
     // Validation runs fully BEFORE any insert, so a malformed batch writes zero.
+    expect(after).toBe(before);
+  });
+
+  test('rejected batch writes nothing (sanitize-to-empty, AFTER a valid claim)', async () => {
+    const before = await countFacts('tenant-atomic');
+    // claim[0] is valid; claim[1] passes zod (3 chars) but sanitizes to empty.
+    // The sanitize check now lives in the validation pass, so the whole batch
+    // is rejected BEFORE claim[0] is ever inserted → zero rows written.
+    const res = await runSaveFacts(
+      [
+        { claim: 'a perfectly good leading claim', provenance: 'user_stated' },
+        { claim: '   ', provenance: 'user_stated' },
+      ],
+      { engine, sourceId: 'tenant-atomic' },
+    );
+    if (!('error' in res)) throw new Error('expected rejection');
+    expect(res.error).toBe('invalid_claim');
+    expect(res.failed_index).toBe(1);
+    const after = await countFacts('tenant-atomic');
     expect(after).toBe(before);
   });
 });
