@@ -1176,6 +1176,7 @@ const list_pages: Operation = {
     type: { type: 'string', description: 'Filter by page type' },
     tag: { type: 'string', description: 'Filter by tag' },
     limit: { type: 'number', description: 'Max results (default 50)' },
+    offset: { type: 'number', description: 'Skip the first N pages (for pagination). Default 0. Page by offset under a stable sort to enumerate every page beyond the limit.' },
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
@@ -1202,10 +1203,14 @@ const list_pages: Operation = {
     // were ignored at this op handler and the engine returned every source's
     // pages indiscriminately.
     const scope = sourceScopeOpts(ctx);
+    const offset = typeof p.offset === 'number' && Number.isFinite(p.offset)
+      ? Math.max(0, Math.floor(p.offset))
+      : 0;
     const pages = await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
       limit: clampSearchLimit(p.limit as number | undefined, 50, 100),
+      offset,
       includeDeleted: (p.include_deleted as boolean) === true,
       updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
       sort,
@@ -3363,6 +3368,7 @@ const recall: Operation = {
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (expired_at + superseded_by both set).' },
     limit: { type: 'number', description: 'Max rows to return. Default 50, cap 100.' },
+    offset: { type: 'number', description: 'Skip the first N rows (for pagination over the >100-row case). Default 0. Stable order is created_at DESC, id DESC, so paging by offset until a short page walks the full set with no gaps or dupes.' },
     grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
@@ -3370,6 +3376,12 @@ const recall: Operation = {
   handler: async (ctx, p) => {
     const sourceId = ctx.sourceId ?? 'default';
     const limit = typeof p.limit === 'number' ? p.limit : 50;
+    // Pagination offset (additive, default 0). Engine list methods clamp limit
+    // to MAX_SEARCH_LIMIT and apply offset against a stable created_at DESC,
+    // id DESC order, so a caller can page until a short page to exhaust >100 rows.
+    const offset = typeof p.offset === 'number' && Number.isFinite(p.offset)
+      ? Math.max(0, Math.floor(p.offset))
+      : 0;
     const includeExpired = p.include_expired === true;
     const grep = typeof p.grep === 'string' ? p.grep.toLowerCase() : null;
 
@@ -3404,7 +3416,7 @@ const recall: Operation = {
             ? ctx.auth.sourceId
             : null);
 
-    const listOpts = { activeOnly: !includeExpired, limit, visibility, ownerSourceId };
+    const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId };
 
     let rows: Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>> = [];
 
