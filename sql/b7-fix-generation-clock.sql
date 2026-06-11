@@ -25,11 +25,38 @@
 --   quietly break query-cache invalidation for tenant writes — worse than the
 --   loud 42501).
 --
--- WHEN TO APPLY: with (or any time before) the engine upgrade that brings
---   migration v107 to a database serving a NOBYPASSRLS tenant role. Harmless
---   to apply earlier — the DO block no-ops when the function doesn't exist
---   yet, and re-applying is idempotent. Single-role (BYPASSRLS-only) deploys
---   never hit the bug; the fix is still safe for them.
+-- THE DURABLE FIX IS IN ENGINE SOURCE, NOT THIS SCRIPT. The SECURITY DEFINER
+--   + pinned search_path now live on the function DEFINITION at every site
+--   (src/schema.sql -> src/core/schema-embedded.ts, src/core/migrate.ts v107,
+--   src/core/pglite-schema.ts), pinned by P-13a/b in
+--   test/e2e/b8-rls-proof.test.ts. That matters because
+--   PostgresEngine.initSchema() replays the full embedded schema blob at
+--   EVERY engine startup, and CREATE OR REPLACE resets function attributes —
+--   so an ALTER-only fix is structurally incapable of sticking.
+--
+-- WHEN TO APPLY (and what this script can and cannot do):
+--   (a) PRE-v107 databases: this script is a LITERAL NO-OP. The DO block only
+--       fires if the function already exists, so applying it "ahead of" the
+--       upgrade provides ZERO protection. The first startup of an upgraded
+--       binary replays SCHEMA_SQL — which creates the function BEFORE
+--       migration v107 formally runs — so only the binary's own definition
+--       decides whether the function is safe at that moment.
+--   (b) On an UNPATCHED engine binary (one whose SCHEMA_SQL still carries the
+--       non-SECURITY-DEFINER form): this script's effect is CLOBBERED at the
+--       next engine restart — deploy, reboot, crash-recovery — when initSchema
+--       replays the blob. Emergency triage only, knowing it dies at the next
+--       restart.
+--   (c) Its only DURABLE role: post-upgrade belt-and-suspenders on a binary
+--       that already carries the source-definition patch (idempotent over the
+--       already-safe function), e.g. immediately after an upgrade, before the
+--       first tenant write, without waiting to verify which definition the
+--       replay applied.
+--   Single-role (BYPASSRLS-only) deploys never hit the bug; the script is
+--   still safe for them.
+--
+-- VERIFY (any time): expect prosecdef = t and the pinned search_path:
+--     SELECT prosecdef, proconfig FROM pg_proc
+--     WHERE proname = 'bump_page_generation_clock_fn';
 --
 -- HOW TO APPLY (same rail as the other B7 files — by hand via psql, never
 --   apply-migrations):

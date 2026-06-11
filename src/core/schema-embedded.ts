@@ -227,12 +227,19 @@ INSERT INTO page_generation_clock (id, value)
   VALUES (1, COALESCE((SELECT MAX(generation) FROM pages), 0))
   ON CONFLICT (id) DO NOTHING;
 
+-- SECURITY DEFINER + pinned search_path: tenant roles have no GRANT on
+-- page_generation_clock, so the trigger must run as the function owner or
+-- every tenant DML statement on pages dies with 42501. Must stay on the
+-- definition at EVERY site (this file, migrate.ts v107, pglite-schema.ts):
+-- initSchema replays this blob on every engine restart and CREATE OR
+-- REPLACE resets function attributes, silently stripping any out-of-band
+-- ALTER FUNCTION fix. Pinned by P-13a in test/e2e/b8-rls-proof.test.ts.
 CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger AS \$func\$
 BEGIN
   UPDATE page_generation_clock SET value = value + 1 WHERE id = 1;
   RETURN NULL;
 END;
-\$func\$ LANGUAGE plpgsql;
+\$func\$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 DROP TRIGGER IF EXISTS bump_page_generation_clock_trg ON pages;
 CREATE TRIGGER bump_page_generation_clock_trg

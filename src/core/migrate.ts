@@ -4911,7 +4911,7 @@ export const MIGRATIONS: Migration[] = [
         UPDATE page_generation_clock SET value = value + 1 WHERE id = 1;
         RETURN NULL;
       END;
-      $func$ LANGUAGE plpgsql;
+      $func$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
       DROP TRIGGER IF EXISTS bump_page_generation_clock_trg ON pages;
       CREATE TRIGGER bump_page_generation_clock_trg

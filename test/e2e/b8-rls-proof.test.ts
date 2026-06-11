@@ -45,11 +45,21 @@
  *        oauth_clients/access_tokens returns 0 rows, NOT an error (the tables
  *        are RLS-enabled with no policy; reads ride the privileged pool in
  *        production — pins the vestigial-grant finding)
+ *   P-12b same-source write availability across ALL 17 tenant-DML tables
+ *        (pins the whole trigger/grant time-bomb class, not just pages)
+ *   P-13a SOURCE PIN (runs everywhere, no DB needed): every CREATE OR REPLACE
+ *        of bump_page_generation_clock_fn in src/ carries SECURITY DEFINER +
+ *        pinned search_path — fails at test time, not prod-restart time, if an
+ *        upstream merge reintroduces the unsafe form
+ *   P-13b replay durability: initSchema replay over an already-fixed DB keeps
+ *        prosecdef + search_path; tenant writes survive (the restart-clobber
+ *        mechanism, simulated twice)
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from 'postgres';
 import { execSync } from 'child_process';
 import { join } from 'path';
+import { readdirSync, readFileSync, statSync } from 'fs';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 
 const DB = process.env.GBRAIN_B8_DATABASE_URL;
@@ -130,10 +140,12 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
     // Step 1 then Step 2, the shipped order (policies-complete-before-role-reachable).
     applyFile('b7-policies.sql');
     applyFile('b7-role.sql', { tenantPassword: TENANT_PW });
-    // Forward-compat fix for the v107 statement-level generation-clock trigger
-    // (see sql/b7-fix-generation-clock.sql — found by this suite). No-op on
-    // pre-v107 schemas. Without it, every tenant pages write 42501s inside the
-    // trigger and P-2/P-7/P-12 fail.
+    // Belt-and-suspenders re-apply of the generation-clock ALTER script. The
+    // DURABLE fix lives in the function definition in engine source (schema.sql
+    // / schema-embedded.ts / migrate.ts v107 / pglite-schema.ts) — initSchema
+    // above already created the function SECURITY DEFINER. Applying the script
+    // here keeps the shipped triage artifact exercised (idempotent over an
+    // already-fixed function) so it can't rot. See P-13a/b.
     applyFile('b7-fix-generation-clock.sql');
 
     // Seed two sources with at least one row in every seedable policied table.
@@ -376,6 +388,213 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
     for (const tbl of ['oauth_clients', 'oauth_tokens', 'oauth_codes', 'access_tokens']) {
       const rows = await asTenant(A, (tx) => tx.unsafe(`SELECT count(*)::int AS n FROM ${tbl}`));
       expect(Number(rows[0].n)).toBe(0);
+    }
+  });
+
+  test('P-12b availability: same-source INSERT succeeds on ALL 17 tenant-DML tables', async () => {
+    // P-12 proves pages; this pins the rest of the grant surface. One INSERT
+    // per table (no 42501, no policy denial), UPDATE/DELETE smoke where cheap,
+    // everything cleaned up inside the same transaction so the suite stays
+    // re-runnable. A future trigger/grant time bomb on ANY of these tables
+    // fails here instead of at first-light.
+    await asTenant(A, async (tx) => {
+      const step = async <T>(label: string, q: PromiseLike<T>): Promise<T> => {
+        try {
+          return await q;
+        } catch (e) {
+          throw new Error(`P-12b ${label}: ${(e as Error).message}`);
+        }
+      };
+
+      // -- CAT-1: direct source_id column ----------------------------------
+      const facts = await step('facts INSERT', tx`INSERT INTO facts (source_id, fact, source)
+        VALUES (${A}, 'p12b fact', 'b8')`);
+      expect(facts.count).toBe(1);
+      const factsUpd = await step('facts UPDATE', tx`UPDATE facts SET fact = 'p12b fact v2'
+        WHERE source_id = ${A} AND fact = 'p12b fact'`);
+      expect(factsUpd.count).toBe(1);
+
+      await step('files pre-clean', tx`DELETE FROM files WHERE storage_path = 'b8/p12b.txt'`);
+      const files = await step('files INSERT', tx`INSERT INTO files (source_id, filename, storage_path, content_hash)
+        VALUES (${A}, 'p12b.txt', 'b8/p12b.txt', 'p12b-hash')`);
+      expect(files.count).toBe(1);
+
+      const ingest = await step('ingest_log INSERT', tx`INSERT INTO ingest_log (source_id, source_type, source_ref)
+        VALUES (${A}, 'b8', 'p12b')`);
+      expect(ingest.count).toBe(1);
+
+      await step('query_cache pre-clean', tx`DELETE FROM query_cache WHERE id = 'b8-p12b'`);
+      const qc = await step('query_cache INSERT', tx`INSERT INTO query_cache (id, query_text, source_id)
+        VALUES ('b8-p12b', 'p12b query', ${A})`);
+      expect(qc.count).toBe(1);
+
+      const calib = await step('calibration_profiles INSERT', tx`INSERT INTO calibration_profiles
+        (source_id, holder, total_resolved, domain_scorecards, pattern_statements,
+         voice_gate_passed, voice_gate_attempts, active_bias_tags, model_id)
+        VALUES (${A}, 'b8', 0, '{}', '{}', true, 0, '{}', 'p12b-test')`);
+      expect(calib.count).toBe(1);
+
+      const prop = await step('take_proposals INSERT', tx`INSERT INTO take_proposals
+        (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+         claim_text, kind, holder, weight, model_id)
+        VALUES (${A}, 'people/a-one', 'p12b-hash', 'v1', 'p12b-run',
+                'p12b claim', 'prediction', 'b8', 0.5, 'p12b-test')
+        RETURNING id`);
+      expect(prop.length).toBe(1);
+
+      const nudge = await step('take_nudge_log INSERT', tx`INSERT INTO take_nudge_log
+        (source_id, proposal_id, nudge_pattern)
+        VALUES (${A}, ${prop[0].id}, 'b8_p12b')`);
+      expect(nudge.count).toBe(1);
+
+      const ab = await step('think_ab_results INSERT', tx`INSERT INTO think_ab_results
+        (source_id, question, baseline_answer, with_calibration_answer, preferred)
+        VALUES (${A}, 'p12b?', 'base', 'calib', 'tie')`);
+      expect(ab.count).toBe(1);
+
+      // -- CAT-4: source_ids array membership ------------------------------
+      const evalC = await step('eval_candidates INSERT', tx`INSERT INTO eval_candidates
+        (tool_name, query, source_ids, vector_enabled, expansion_applied, latency_ms, remote)
+        VALUES ('search', 'p12b-q', ARRAY[${A}], false, false, 1, true)`);
+      expect(evalC.count).toBe(1);
+
+      // -- CAT-2: derived through pages (seed page aPageId is in source A) --
+      const chunk = await step('content_chunks INSERT', tx`INSERT INTO content_chunks (page_id, chunk_index, chunk_text)
+        VALUES (${aPageId}, 99, 'p12b chunk')`);
+      expect(chunk.count).toBe(1);
+
+      const tag = await step('tags INSERT', tx`INSERT INTO tags (page_id, tag)
+        VALUES (${aPageId}, 'p12b-tag')`);
+      expect(tag.count).toBe(1);
+
+      const tl = await step('timeline_entries INSERT', tx`INSERT INTO timeline_entries (page_id, date, summary)
+        VALUES (${aPageId}, '2026-06-11', 'p12b event')`);
+      expect(tl.count).toBe(1);
+
+      const pv = await step('page_versions INSERT', tx`INSERT INTO page_versions (page_id, compiled_truth)
+        VALUES (${aPageId}, 'p12b truth')`);
+      expect(pv.count).toBe(1);
+
+      const raw = await step('raw_data INSERT', tx`INSERT INTO raw_data (page_id, source, data)
+        VALUES (${aPageId}, 'p12b', ${tx.json({ k: 'p12b' })})`);
+      expect(raw.count).toBe(1);
+
+      const take = await step('takes INSERT', tx`INSERT INTO takes (page_id, row_num, claim, kind, holder)
+        VALUES (${aPageId}, 999, 'p12b claim', 'prediction', 'b8')`);
+      expect(take.count).toBe(1);
+
+      // -- links: both-endpoint WITH CHECK, intra-source -------------------
+      const link = await step('links INSERT', tx`INSERT INTO links (from_page_id, to_page_id, link_type)
+        VALUES (${aPageId}, ${aPageId}, 'b8_p12b')`);
+      expect(link.count).toBe(1);
+
+      // -- pages (the 17th; full CRUD already pinned by P-12) --------------
+      const page = await step('pages INSERT', tx`INSERT INTO pages (source_id, slug, type, title)
+        VALUES (${A}, 'people/a-p12b', 'person', 'A P12b')`);
+      expect(page.count).toBe(1);
+
+      // -- DELETE smoke + cleanup (reverse FK order, same txn) -------------
+      const dels: Array<[string, PromiseLike<{ count: number }>]> = [
+        ['take_nudge_log', tx`DELETE FROM take_nudge_log WHERE nudge_pattern = 'b8_p12b'`],
+        ['take_proposals', tx`DELETE FROM take_proposals WHERE proposal_run_id = 'p12b-run'`],
+        ['takes', tx`DELETE FROM takes WHERE page_id = ${aPageId} AND row_num = 999`],
+        ['think_ab_results', tx`DELETE FROM think_ab_results WHERE question = 'p12b?'`],
+        ['calibration_profiles', tx`DELETE FROM calibration_profiles WHERE model_id = 'p12b-test'`],
+        ['query_cache', tx`DELETE FROM query_cache WHERE id = 'b8-p12b'`],
+        ['eval_candidates', tx`DELETE FROM eval_candidates WHERE query = 'p12b-q'`],
+        ['files', tx`DELETE FROM files WHERE storage_path = 'b8/p12b.txt'`],
+        ['ingest_log', tx`DELETE FROM ingest_log WHERE source_ref = 'p12b'`],
+        ['raw_data', tx`DELETE FROM raw_data WHERE source = 'p12b'`],
+        ['page_versions', tx`DELETE FROM page_versions WHERE compiled_truth = 'p12b truth'`],
+        ['timeline_entries', tx`DELETE FROM timeline_entries WHERE summary = 'p12b event'`],
+        ['tags', tx`DELETE FROM tags WHERE page_id = ${aPageId} AND tag = 'p12b-tag'`],
+        ['content_chunks', tx`DELETE FROM content_chunks WHERE page_id = ${aPageId} AND chunk_index = 99`],
+        ['links', tx`DELETE FROM links WHERE link_type = 'b8_p12b'`],
+        ['facts', tx`DELETE FROM facts WHERE fact = 'p12b fact v2'`],
+        ['pages', tx`DELETE FROM pages WHERE slug = 'people/a-p12b'`],
+      ];
+      for (const [label, q] of dels) {
+        const r = await step(`${label} DELETE`, q);
+        expect(r.count).toBe(1);
+      }
+    });
+  });
+
+  test('P-13b replay durability: initSchema replay keeps SECURITY DEFINER + tenant writes alive', async () => {
+    // The restart-clobber mechanism: PostgresEngine.initSchema() replays the
+    // full embedded schema blob on EVERY engine startup, and CREATE OR REPLACE
+    // resets function attributes. Before the source patch, that replay
+    // silently stripped any out-of-band ALTER FUNCTION ... SECURITY DEFINER
+    // and re-armed the 42501 write lockout. Simulate two restarts over the
+    // already-fixed database, then prove the fix survived.
+    for (let i = 0; i < 2; i++) {
+      const engine = new PostgresEngine();
+      await engine.connect({ engine: 'postgres', database_url: DB as string, poolSize: 2 });
+      await engine.initSchema();
+      await engine.disconnect();
+    }
+
+    const [fn] = await admin`
+      SELECT prosecdef, proconfig FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE p.proname = 'bump_page_generation_clock_fn' AND n.nspname = 'public'`;
+    expect(fn).toBeDefined();
+    expect(fn.prosecdef).toBe(true);
+    expect(fn.proconfig).toContain('search_path=public, pg_temp');
+
+    // The P-12 behavior, now proven durable across replay: tenant DML on its
+    // own source still works with the (replayed) statement trigger live.
+    await asTenant(A, async (tx) => {
+      const ins = await tx`INSERT INTO pages (source_id, slug, type, title)
+        VALUES (${A}, 'people/a-replay', 'person', 'A Replay')`;
+      expect(ins.count).toBe(1);
+      const upd = await tx`UPDATE pages SET title = 'A Replay Renamed' WHERE slug = 'people/a-replay'`;
+      expect(upd.count).toBe(1);
+      const del = await tx`DELETE FROM pages WHERE slug = 'people/a-replay'`;
+      expect(del.count).toBe(1);
+    });
+  });
+});
+
+/**
+ * P-13a — SOURCE-LEVEL PIN. Deliberately OUTSIDE the GBRAIN_B8_DATABASE_URL
+ * gate: it needs no database, so it runs on every `bun test`, everywhere. This
+ * is the tripwire that fires at test time — not prod-restart time — when a
+ * future upstream merge reintroduces the unsafe (non-SECURITY DEFINER) form of
+ * the generation-clock trigger function at any definition site.
+ */
+describe('P-13a source pin: every bump_page_generation_clock_fn definition is SECURITY DEFINER', () => {
+  test('all CREATE OR REPLACE sites in src/ carry SECURITY DEFINER + pinned search_path', () => {
+    const SRC = join(import.meta.dir, '..', '..', 'src');
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (/\.(ts|sql)$/.test(name)) files.push(p);
+      }
+    };
+    walk(SRC);
+
+    type Site = { file: string; tail: string };
+    const sites: Site[] = [];
+    // Matches both the plain form (schema.sql, migrate.ts, pglite-schema.ts)
+    // and the escaped-dollar-quoting form in the generated schema-embedded.ts.
+    const def = /CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn[\s\S]*?LANGUAGE plpgsql([^;]*);/g;
+    for (const file of files) {
+      const text = readFileSync(file, 'utf8');
+      for (const m of text.matchAll(def)) {
+        sites.push({ file: file.slice(SRC.length + 1), tail: m[1] });
+      }
+    }
+
+    // 4 known sites: schema.sql, core/schema-embedded.ts (generated),
+    // core/migrate.ts (v107), core/pglite-schema.ts. A drop below 4 means a
+    // definition site moved — re-point this pin, don't delete it.
+    expect(sites.length).toBeGreaterThanOrEqual(4);
+    for (const s of sites) {
+      expect(`${s.file}: ${s.tail}`).toMatch(/SECURITY DEFINER/);
+      expect(`${s.file}: ${s.tail}`).toMatch(/SET search_path = public, pg_temp/);
     }
   });
 });
