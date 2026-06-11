@@ -32,6 +32,7 @@ let engine: PGLiteEngine;
 const TEST_SOURCES = [
   'tenant-a', 'tenant-dedup', 'tenant-near', 'tenant-batchdup',
   'tenant-validate', 'tenant-atomic', 'tenant-x', 'tenant-y',
+  'tenant-entity', 'tenant-rel',
 ];
 
 beforeAll(async () => {
@@ -111,7 +112,11 @@ describe('save_facts — insert + stamping (B-SF4 a, d, e)', () => {
     expect(row.client_authored).toBe(true);
     expect(row.provenance).toBe('user_stated');
     expect(row.confidence).toBe(1.0);
-    expect(row.entity_slug).toBeNull();
+    // v1.1 recall-miss fix: a single-person claim gets its subject mapped to
+    // entity_slug at save time. tenant-a has no pages, so the resolver falls
+    // through to the deterministic slugify floor — same floor recall's entity
+    // branch resolves a query through, so the round-trip still matches.
+    expect(row.entity_slug).toBe('priya');
     expect(row.visibility).toBe('private');
     expect(row.context).toContain('Priya');
   });
@@ -315,6 +320,105 @@ describe('save_facts — MCP registration + dispatch (B-SF4 a, tenant-reachabili
     const payload = JSON.parse(r.content[0].text);
     expect(payload.error).toBe('invalid_claim');
     expect(payload.failed_index).toBe(1);
+  });
+});
+
+describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () => {
+  // The owner caller shape from facts-recall-owner-visibility.test.ts:
+  // ctx.auth.sourceId is the owner signal the recall carve-out keys on, so a
+  // remote owner reads back its own private rows (save_facts writes private).
+  function ownerCaller(sourceId: string) {
+    return {
+      remote: true,
+      sourceId,
+      auth: { token: 't', clientId: 'c', scopes: ['read'], sourceId },
+    };
+  }
+
+  async function recallByEntity(sourceId: string, entity: string): Promise<number[]> {
+    const r = await dispatchToolCall(engine, 'recall', { entity }, ownerCaller(sourceId));
+    expect(r.isError).toBeFalsy();
+    const payload = JSON.parse(r.content[0].text);
+    return (payload.facts as Array<{ id: number }>).map(f => f.id);
+  }
+
+  test('ACCEPTANCE: save a claim about a known subject → entity recall through the real dispatch path returns it', async () => {
+    // A canonical page exists for the subject — the resolver must land the
+    // fact on it (fuzzy title match), not on a slugified surface form.
+    await engine.putPage(
+      'people/priya-sharma',
+      { type: 'note', title: 'Priya Sharma', compiled_truth: 'Priya Sharma — test person.', frontmatter: {} },
+      { sourceId: 'tenant-entity' },
+    );
+
+    const saved = await runSaveFacts(
+      [{ claim: 'Priya Sharma is allergic to penicillin', provenance: 'user_stated', people: ['Priya Sharma'] }],
+      { engine, sourceId: 'tenant-entity' },
+    );
+    if ('error' in saved) throw new Error('unexpected validation error');
+    expect(saved.inserted).toBe(1);
+    const factId = saved.fact_ids[0];
+
+    const row = await readFactRaw(factId);
+    expect(row.entity_slug).toBe('people/priya-sharma');
+
+    // Round-trip BY ENTITY through dispatch — display name AND exact slug.
+    expect(await recallByEntity('tenant-entity', 'Priya Sharma')).toContain(factId);
+    expect(await recallByEntity('tenant-entity', 'people/priya-sharma')).toContain(factId);
+  });
+
+  test('no matching page: slugify floor still round-trips (write and read share the resolver)', async () => {
+    const saved = await runSaveFacts(
+      [{ claim: 'Zinnia moved to Lisbon in May', provenance: 'user_stated', people: ['Zinnia'] }],
+      { engine, sourceId: 'tenant-entity' },
+    );
+    if ('error' in saved) throw new Error('unexpected validation error');
+    const factId = saved.fact_ids[0];
+
+    const row = await readFactRaw(factId);
+    expect(row.entity_slug).toBe('zinnia');
+
+    expect(await recallByEntity('tenant-entity', 'Zinnia')).toContain(factId);
+  });
+
+  test('single person wins over co-mentioned entities; single entity resolves when no people', async () => {
+    const person = await runSaveFacts(
+      [{ claim: 'Carla joined Acme Corp as CTO', provenance: 'user_stated', people: ['Carla'], entities: ['Acme Corp'] }],
+      { engine, sourceId: 'tenant-entity' },
+    );
+    if ('error' in person) throw new Error('unexpected validation error');
+    expect((await readFactRaw(person.fact_ids[0])).entity_slug).toBe('carla');
+
+    const entity = await runSaveFacts(
+      [{ claim: 'Acme Corp raised a Series B', provenance: 'user_stated', entities: ['Acme Corp'] }],
+      { engine, sourceId: 'tenant-entity' },
+    );
+    if ('error' in entity) throw new Error('unexpected validation error');
+    expect((await readFactRaw(entity.fact_ids[0])).entity_slug).toBe('acme-corp');
+  });
+
+  test('relationship-class claim (two people) saves cleanly with NULL entity_slug — no crash, no false stamp', async () => {
+    const saved = await runSaveFacts(
+      [{ claim: 'Ann introduced Bob to the team', provenance: 'user_stated', people: ['Ann', 'Bob'] }],
+      { engine, sourceId: 'tenant-rel' },
+    );
+    if ('error' in saved) throw new Error('unexpected validation error');
+    expect(saved.inserted).toBe(1);
+
+    const row = await readFactRaw(saved.fact_ids[0]);
+    expect(row.entity_slug).toBeNull();
+    // Surface forms stay recoverable via context even when no single subject.
+    expect(row.context).toContain('Ann');
+    expect(row.context).toContain('Bob');
+  });
+
+  test('no subject at all stays NULL (unchanged baseline)', async () => {
+    const saved = await runSaveFacts(
+      [{ claim: 'The kitchen renovation budget is 40k', provenance: 'user_stated' }],
+      { engine, sourceId: 'tenant-rel' },
+    );
+    if ('error' in saved) throw new Error('unexpected validation error');
+    expect((await readFactRaw(saved.fact_ids[0])).entity_slug).toBeNull();
   });
 });
 

@@ -36,6 +36,7 @@ import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
+import { resolveEntitySlug } from '../entities/resolve.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -95,10 +96,10 @@ function resolveConfidence(c: ValidClaim): number {
 
 /**
  * Fold the structured surface forms into the `context` column so nothing the
- * client captured is lost, without resolving entities (which would need the
- * LLM/embedding entity resolver). entity_slug stays NULL — the claim text
- * itself carries the names as spoken, so pg_trgm dedup and grep/keyword recall
- * still work; entity-scoped recall is the deferred enhancement.
+ * client captured is lost. entity_slug is resolved separately (see
+ * primarySubject + resolveEntitySlug in the insert loop) — this fold keeps
+ * EVERY surface form recoverable even when the claim has no single primary
+ * subject and entity_slug stays NULL.
  *
  * Surface forms are untrusted, so the assembled string passes through the same
  * sanitizer as the claim.
@@ -111,6 +112,26 @@ function buildContext(c: ValidClaim): string | null {
   if (parts.length === 0) return null;
   const { text } = sanitizeTakeForPrompt(parts.join(' | '));
   return text || null;
+}
+
+/**
+ * A claim's primary subject for entity_slug, or null when there isn't a
+ * single one. Conservative by design: exactly one person → that person
+ * (a claim naming one person is about that person, even when companies are
+ * also mentioned); no people and exactly one entity → that entity. Multiple
+ * people or multiple entities is relationship-class — two endpoints, no
+ * single subject — and entity_slug NULL is the correct value there (the
+ * surface forms stay recoverable via `context`). A "subject" longer than
+ * 200 chars isn't a name; skip rather than resolve garbage.
+ */
+function primarySubject(c: ValidClaim): string | null {
+  const people = (c.people ?? []).map(s => s.trim()).filter(Boolean);
+  const entities = (c.entities ?? []).map(s => s.trim()).filter(Boolean);
+  let subject: string | null = null;
+  if (people.length === 1) subject = people[0];
+  else if (people.length === 0 && entities.length === 1) subject = entities[0];
+  if (subject !== null && subject.length > 200) return null;
+  return subject;
 }
 
 /**
@@ -224,11 +245,29 @@ export async function runSaveFacts(
       continue;
     }
 
+    // --- entity resolution (insert branch only — duplicates skip it) ------
+    // Map the claim's primary subject to entity_slug through the SAME
+    // deterministic resolver the read side uses (recall's entity branch,
+    // operations.ts) and the extract write path uses (backstop.ts). Same
+    // function on both sides of the seam means write format == query format
+    // by construction, including the slugify fallback when no page matches.
+    // The resolver is SQL-only (pages exact → pg_trgm fuzzy → prefix
+    // expansion → slugify) — no LLM, no embedding, no config read — and
+    // gbrain_tenant holds SELECT on all three tables it touches (pages,
+    // links, content_chunks; b7-role.sql), so it is safe inside the tenant
+    // withSourceScope tx. Subject strings are attacker-controlled but only
+    // ever travel as parameterized SQL values; the written slug is either an
+    // existing same-source page slug or slugify output ([a-z0-9-]).
+    const subject = primarySubject(c);
+    const entitySlug = subject
+      ? await resolveEntitySlug(ctx.engine, ctx.sourceId, subject)
+      : null;
+
     // --- insert (stamped) ------------------------------------------------
     const newFact: NewFact = {
       fact: cleaned,
       kind: (c.kind ?? 'fact') as FactKind,
-      entity_slug: null,
+      entity_slug: entitySlug,
       visibility: 'private',
       context: buildContext(c),
       source: 'mcp:save_facts',
