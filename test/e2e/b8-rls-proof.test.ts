@@ -41,10 +41,11 @@
  *        b7_tenant_isolation policy (D3 banked condition, executable)
  *   P-10 STRUCTURAL: every policy reads the GUC with missing_ok=true
  *        (the fail-closed form) — no policy can fail open on unset var
- *   P-11 auth-bootstrap grants are RLS-dead under the tenant role: SELECT on
- *        oauth_clients/access_tokens returns 0 rows, NOT an error (the tables
- *        are RLS-enabled with no policy; reads ride the privileged pool in
- *        production — pins the vestigial-grant finding)
+ *   P-11 oauth_clients/oauth_tokens/oauth_codes/access_tokens are deny-by-GRANT
+ *        under the tenant role: SELECT raises `permission denied`, NOT 0 rows.
+ *        The old vestigial SELECT grant (RLS-dead) was revoked on prod
+ *        2026-06-11 and removed from b7-role.sql; shipped == live at the 18-table
+ *        manifest. Distinct from P-4 so these four can't silently regrow.
  *   P-12b same-source write availability across ALL 17 tenant-DML tables
  *        (pins the whole trigger/grant time-bomb class, not just pages)
  *   P-13a SOURCE PIN (runs everywhere, no DB needed): every CREATE OR REPLACE
@@ -80,12 +81,17 @@ const CAT1 = ['pages', 'ingest_log', 'files', 'facts', 'calibration_profiles',
 const CAT2 = ['content_chunks', 'tags', 'timeline_entries', 'page_versions', 'raw_data', 'takes'];
 const POLICED = [...CAT1, ...CAT2, 'links', 'eval_candidates', 'sources'];
 
-/** CAT-6 infra: no grant to gbrain_tenant -> permission denied on first touch. */
+/** CAT-6 infra: no grant to gbrain_tenant -> permission denied on first touch.
+ *  oauth_clients/oauth_tokens/oauth_codes/access_tokens are now ALSO deny-by-
+ *  GRANT (vestigial SELECT revoked 2026-06-11) but stay pinned separately by
+ *  P-11, not here. */
 const CAT6_PROBE = ['minion_jobs', 'config', 'gbrain_cycle_locks', 'mcp_request_log',
-  'dream_verdicts', 'subagent_messages', 'access_tokens_is_select_only_see_P11'];
+  'dream_verdicts', 'subagent_messages'];
 
-/** Tables granted SELECT-only for auth bootstrap (b7-role.sql Step 2c). */
-const BOOTSTRAP_SELECT_ONLY = ['sources', 'oauth_clients', 'oauth_tokens', 'oauth_codes', 'access_tokens'];
+/** The only SELECT-only auth-bootstrap grant left to gbrain_tenant after the
+ *  2026-06-11 revoke (b7-role.sql Step 2c). The oauth and access_tokens grants
+ *  that used to sit here are gone — P-11 pins their deny-by-GRANT posture. */
+const BOOTSTRAP_SELECT_ONLY = ['sources'];
 
 function tenantUrl(adminUrl: string): string {
   const u = new URL(adminUrl);
@@ -380,14 +386,20 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
     });
   });
 
-  test('P-11 auth-bootstrap SELECT grants are RLS-dead under the tenant (0 rows, no error)', async () => {
-    // oauth_clients / access_tokens are RLS-ENABLED with NO policy. The tenant
-    // role holds a SELECT grant (b7-role.sql Step 2c) but default-deny RLS
-    // yields zero rows — the grant cannot leak; production auth reads ride the
-    // privileged pool. Pins the vestigial-grant audit finding.
+  test('P-11 oauth/access_tokens are deny-by-GRANT under the tenant (permission denied, not 0 rows)', async () => {
+    // The four auth tables used to carry a vestigial SELECT grant (the CAT-3
+    // bearer-bootstrap carve-out): RLS-dead, so a tenant SELECT returned 0 rows
+    // rather than erroring. That grant was REVOKEd from gbrain_tenant on prod
+    // 2026-06-11 (runbook R-2) and removed from sql/b7-role.sql Step 2c, so a
+    // scratch cluster built from shipped SQL now has NO grant here and live prod
+    // matches. The tenant gets `permission denied` outright (deny-by-GRANT,
+    // CAT-6 style) — the same posture P-4 pins for the infra tables. Kept as a
+    // DISTINCT probe (these four specifically) so the grant manifest can't
+    // silently regrow back to the 22-table shape without this test going red.
     for (const tbl of ['oauth_clients', 'oauth_tokens', 'oauth_codes', 'access_tokens']) {
-      const rows = await asTenant(A, (tx) => tx.unsafe(`SELECT count(*)::int AS n FROM ${tbl}`));
-      expect(Number(rows[0].n)).toBe(0);
+      await expect(
+        asTenant(A, (tx) => tx.unsafe(`SELECT count(*) FROM ${tbl}`)),
+      ).rejects.toThrow(/permission denied/i);
     }
   });
 

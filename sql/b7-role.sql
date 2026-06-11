@@ -91,18 +91,23 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 TO gbrain_tenant;
 
 -- ----------------------------------------------------------------------------
--- Step 2c — SELECT-only on auth-bootstrap + own-row registry reads.
---   oauth_*/access_tokens: read to resolve the bearer -> source (verifyAccessToken)
---     before any source scope exists. No row policy (design CAT-3); reads only.
+-- Step 2c — SELECT-only on the tenant's own-row source registry.
 --   sources: SELECT is row-confined to the tenant's own row by the CAT-5 policy.
--- WRITES to all of these ride the privileged connection (D6), never this role.
+--   WRITES ride the privileged connection (D6), never this role.
+--
+-- The oauth_clients / oauth_tokens / oauth_codes / access_tokens SELECT grants
+-- that used to live here (the CAT-3 bearer-bootstrap carve-out) were VESTIGIAL:
+-- the bearer -> source resolution (verifyAccessToken) runs on the privileged
+-- connection (D6), not the tenant pool, so the tenant role never read these in
+-- production. They were RLS-dead (no row policy → SELECT returned 0 rows, never
+-- a leak — proven by the old P-11) and were REVOKEd from gbrain_tenant on prod
+-- 2026-06-11 (runbook R-2). Removing them here brings shipped SQL back in line
+-- with the live 18-table grant manifest (17 DML + sources). The tenant now gets
+-- `permission denied` on these four tables (deny-by-GRANT, CAT-6 style), pinned
+-- by the rewritten P-11 in test/e2e/b8-rls-proof.test.ts.
 -- ----------------------------------------------------------------------------
 GRANT SELECT ON
-  sources,
-  oauth_clients,
-  oauth_tokens,
-  oauth_codes,
-  access_tokens
+  sources
 TO gbrain_tenant;
 
 -- ----------------------------------------------------------------------------

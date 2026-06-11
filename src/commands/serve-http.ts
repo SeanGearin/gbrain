@@ -796,6 +796,111 @@ export async function resolvePrivilegedEngine(
   return { engine: adminEngine, owned: true };
 }
 
+/**
+ * Default grace window for draining in-flight HTTP requests on SIGTERM/SIGINT.
+ * A few seconds is plenty for a personal/customer-plane brain: ordinary tool
+ * calls finish in well under a second, and the only thing that legitimately
+ * runs longer (ingest) is already off-loaded to the MinionQueue, so the HTTP
+ * request itself returns 202 quickly. If a wedged keep-alive socket or a stuck
+ * handler outlasts the window we force-close remaining connections and exit
+ * anyway — the alternative (the pre-fix behavior) was systemd escalating
+ * SIGTERM to SIGKILL after its own stop-timeout, killing mid-flight requests
+ * with no drain at all.
+ */
+export const HTTP_SHUTDOWN_GRACE_MS = 5_000;
+
+/**
+ * Minimal surface of `http.Server` the graceful-shutdown orchestrator needs.
+ * Declared structurally (not `import('http').Server`) so the unit test can
+ * drive shutdown with a hand-rolled fake — no real listener, no open port.
+ * `closeIdleConnections` / `closeAllConnections` are Node 18.2+ and optional
+ * (`?:`) so the helper degrades cleanly if they're ever absent.
+ */
+export interface ClosableHttpServer {
+  close(cb?: (err?: Error) => void): void;
+  closeIdleConnections?: () => void;
+  closeAllConnections?: () => void;
+}
+
+export interface HttpShutdownDeps {
+  /** The listening server (from `app.listen`). */
+  server: ClosableHttpServer;
+  /**
+   * Close every DB pool the server owns (tenant engine + any owned privileged
+   * engine). Awaited after the drain completes / the deadline fires. MUST NOT
+   * throw — the orchestrator logs and exits regardless, but a rejection here
+   * is swallowed so a flaky disconnect can't trap the process.
+   */
+  closePools: () => Promise<void>;
+  log: (msg: string) => void;
+  exit: (code?: number) => void;
+  /** Drain grace window; defaults to HTTP_SHUTDOWN_GRACE_MS. */
+  graceMs?: number;
+}
+
+/**
+ * Build the graceful-shutdown handler for the `serve --http` path.
+ *
+ * Lifecycle on the first signal (idempotent — later signals are no-ops):
+ *   1. Stop accepting new connections (`server.close`).
+ *   2. Close idle keep-alive sockets so the drain can complete promptly once
+ *      in-flight requests finish, instead of waiting for clients to hang up.
+ *   3. When the last in-flight request drains, close DB pools and exit 0.
+ *   4. If the grace window elapses first, force-close remaining sockets, close
+ *      pools, and exit 0 anyway — a bounded shutdown beats a SIGKILL.
+ *
+ * Returned as a `(reason) => void` so the caller wires it onto SIGTERM/SIGINT
+ * and the test can invoke it directly with injected `server`/`exit`/`log`.
+ */
+export function createHttpShutdown(deps: HttpShutdownDeps): (reason: string) => void {
+  const graceMs = deps.graceMs ?? HTTP_SHUTDOWN_GRACE_MS;
+  let shuttingDown = false;
+
+  return (reason: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    deps.log(
+      `GBrain HTTP server: graceful exit (${reason}) — no new connections, draining in-flight (grace ${graceMs}ms)`,
+    );
+
+    // Guard so the drain-complete callback and the deadline timer can't both
+    // close pools / exit. Whichever wins, the other becomes a no-op.
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(deadline);
+      Promise.resolve()
+        .then(() => deps.closePools())
+        .catch((err: unknown) => {
+          deps.log(
+            `GBrain HTTP server: pool close error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        })
+        .finally(() => deps.exit(0));
+    };
+
+    const deadline = setTimeout(() => {
+      deps.log(
+        `GBrain HTTP server: drain deadline (${graceMs}ms) exceeded — force-closing remaining connections`,
+      );
+      // Hard-close lingering keep-alive sockets so server.close's callback can
+      // fire; finish() is idempotent so this races safely with that callback.
+      deps.server.closeAllConnections?.();
+      finish();
+    }, graceMs);
+    deadline.unref?.();
+
+    // Stop accepting new connections; the callback fires once in-flight
+    // requests have drained (all sockets idle/closed).
+    deps.server.close(() => finish());
+    // Proactively retire idle keep-alive sockets so a client holding an open
+    // connection without an active request doesn't stall the drain.
+    deps.server.closeIdleConnections?.();
+  };
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -847,11 +952,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // DSN is set, privilegedEngine === engine — single-plane deploys unchanged.
   const { engine: privilegedEngine, owned: ownsPrivilegedEngine } =
     await resolvePrivilegedEngine(engine, (config as { database_url?: string }).database_url);
-  if (ownsPrivilegedEngine) {
-    const closeAdmin = () => { void privilegedEngine.disconnect().catch(() => {}); };
-    process.once('SIGTERM', closeAdmin);
-    process.once('SIGINT', closeAdmin);
-  }
+  // NOTE: the owned privileged engine is torn down by the graceful-shutdown
+  // handler installed at `app.listen` below (closePools), alongside the tenant
+  // engine and the in-flight request drain — not by a standalone once-handler
+  // here. Keeping all teardown on one SIGTERM/SIGINT path means the privileged
+  // pool closes AFTER the drain (the drain may still need it for audit writes),
+  // not concurrently with it.
 
   // `sql` is the PRIVILEGED handle — it serves the /admin/* dashboard + token
   // CRUD routes and the startup banner (all admin-surface reads/writes against
@@ -2696,7 +2802,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
 
-  app.listen(port, bind, () => {
+  const server = app.listen(port, bind, () => {
     console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║
@@ -2721,4 +2827,29 @@ ${suppressBootstrapPrint
     : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
+
+  // Graceful shutdown (D1, packet 2026-06-11): SIGTERM/SIGINT stop accepting
+  // new connections, drain in-flight requests within a bounded grace window,
+  // close every DB pool (tenant engine + any owned privileged engine), and
+  // exit 0. Before this, `serve --http` ignored SIGTERM entirely, so
+  // `systemctl stop` timed out and escalated to SIGKILL (status=9/KILL) —
+  // harmless on an idle plane, unacceptable once real tenant traffic needs
+  // draining. The stdio `serve` path has its own lifecycle in serve.ts and is
+  // intentionally NOT wired here.
+  const closePools = async (): Promise<void> => {
+    // Tenant pool first, then the owned privileged pool (the privileged pool
+    // may still service an audit write as the last requests drain, so it
+    // closes last). On a single-plane deploy privilegedEngine === engine and
+    // ownsPrivilegedEngine is false, so this is exactly one disconnect.
+    await engine.disconnect().catch(() => {});
+    if (ownsPrivilegedEngine) await privilegedEngine.disconnect().catch(() => {});
+  };
+  const shutdown = createHttpShutdown({
+    server,
+    closePools,
+    log: (msg) => console.error(msg),
+    exit: (code) => process.exit(code),
+  });
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
