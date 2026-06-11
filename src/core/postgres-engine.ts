@@ -120,6 +120,20 @@ export class PostgresEngine implements BrainEngine {
   private _connectionStyle: 'instance' | 'module' | null = null;
 
   /**
+   * B7 first-light fix #3: whether the connected role can SELECT the `config`
+   * table. The customer-plane `gbrain_tenant` role is GRANT-EXCLUDED from config
+   * (CAT-6; b7-role.sql; D3 banked — never grant), so a `getConfig` SELECT under
+   * it throws "permission denied for table config", which ABORTS the surrounding
+   * withSourceScope transaction and fails the whole op (the first-light
+   * get_page/query/extract_facts brain_unavailable class). Probed ONCE at
+   * connect() via has_table_privilege (constant per role) and cached here so
+   * getConfig can short-circuit to null on the tenant plane — every caller
+   * already treats a missing key as its default. null = not yet probed / assume
+   * readable (operator/incumbent default).
+   */
+  private _canReadConfig: boolean | null = null;
+
+  /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
    * - INSTANCE-owned: each PostgresEngine constructs its own.
    * - Worker engines (cycle, sync) inherit via opts.parentConnectionManager.
@@ -224,6 +238,20 @@ export class PostgresEngine implements BrainEngine {
         });
         this.connectionManager.setReadPool(db.getConnection());
       }
+    }
+
+    // B7 first-light fix #3: probe once whether this role may read `config`.
+    // Decoupled from RLS (a future NOBYPASSRLS role granted config would still
+    // read it). On the customer-plane tenant role this is false; getConfig then
+    // short-circuits to null instead of issuing a tx-aborting denied SELECT.
+    // Best-effort: any probe failure (e.g. config table absent on a fresh brain
+    // mid-init) leaves it readable — only a definitive `false` gates reads off.
+    try {
+      const rows = await this.sql<{ can: boolean }[]>`
+        SELECT has_table_privilege(current_user, 'config', 'SELECT') AS can`;
+      this._canReadConfig = rows.length > 0 ? rows[0].can : true;
+    } catch {
+      this._canReadConfig = true;
     }
   }
 
@@ -855,14 +883,126 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-    const conn = this.sql;
-    return conn.begin(async (tx) => {
-      // Create a scoped engine with tx as its connection, no shared state mutation
+    const conn = this._sql || db.getConnection();
+    // Create a scoped engine with tx as its connection, no shared state mutation.
+    // Redefining the `sql` getter transparently re-routes every `this.sql` read
+    // onto the pinned (savepoint or transaction) handle. Shared by both paths.
+    const run = (tx: postgres.TransactionSql<Record<string, never>>) => {
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
       return fn(txEngine);
+    };
+    // Re-entrancy (B7 first-light fix). When this engine is ALREADY pinned to an
+    // open postgres.js transaction — e.g. serve-http wrapped the op in
+    // `withSourceScope`, so `_sql` is a tx handle, not a pool — that handle
+    // exposes `.savepoint()` but NOT `.begin()` (postgres.js 3.x attaches
+    // `.begin` only to the top-level client; the transaction-scoped sql gets
+    // `.savepoint`). Calling `.begin` there throws
+    // "(this._sql || db.getConnection()).begin is not a function" — the exact
+    // tenant put_page failure, because put_page's auto-link reconciliation
+    // (operations.ts `runAutoLink`) opens a nested `engine.transaction()`.
+    // Nest via SAVEPOINT instead: inner rollback stays scoped to the savepoint
+    // (so runAutoLink's caught, non-fatal errors don't poison the outer page
+    // write) and the transaction-local `app.current_source_id` GUC that
+    // withSourceScope set survives (same physical transaction → RLS still sees
+    // the caller's source). The `.begin` discriminator is runtime, not `_sql`-
+    // presence: instance-pool engines (the privileged engine) also set `_sql`
+    // but to a real pool that DOES have `.begin`, so they take the begin path.
+    const reentrant = conn as unknown as {
+      begin?: (f: typeof run) => Promise<T>;
+      savepoint?: (f: typeof run) => Promise<T>;
+    };
+    if (typeof reentrant.begin !== 'function' && typeof reentrant.savepoint === 'function') {
+      return reentrant.savepoint(run);
+    }
+    return conn.begin(run) as Promise<T>;
+  }
+
+  async withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // B7 RLS backstop (design §B). Same connection-pin trick as transaction(),
+    // plus a transaction-LOCAL set_config so the RLS policies in
+    // sql/b7-policies.sql see this request's source and nothing else.
+    //
+    // set_config(..., true) — the third arg `true` scopes the GUC to THIS
+    // transaction; Postgres resets it at COMMIT/ROLLBACK. That is the whole
+    // pooler-safety story (design §D): the var cannot survive into the next
+    // request on the same backend. Never use set_config(..., false) or a bare
+    // `SET app.current_source_id` here — those persist on the pooled connection
+    // and would leak across tenants.
+    const conn = this._sql || db.getConnection();
+    return conn.begin(async (tx) => {
+      await tx`SELECT set_config('app.current_source_id', ${sourceId}, true)`;
+      const scoped = Object.create(this) as PostgresEngine;
+      Object.defineProperty(scoped, 'sql', { get: () => tx });
+      Object.defineProperty(scoped, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      return fn(scoped);
     }) as Promise<T>;
+  }
+
+  /**
+   * B7 first-light fix #4 (close-the-class). Re-entrant RAW-sql transaction.
+   * At top level opens a real transaction (conn.begin); when already inside
+   * withSourceScope's dispatch tx — the postgres.js tx handle exposes
+   * `.savepoint()` but NOT `.begin()` (postgres.js 3.x) — it nests via SAVEPOINT
+   * so the body's atomicity (advisory lock + INSERT + supersede) rolls back to
+   * the savepoint on error without poisoning the outer tx. Mirrors transaction()
+   * (1a11447e) but hands the body the RAW tagged-template sql handle that the
+   * fact-insert / take-supersede paths need (tx``…``, tx.unsafe), not a
+   * BrainEngine. Replaces bare `sql.begin(...)` at those sites, which threw
+   * "sql.begin is not a function" under the tenant withSourceScope tx.
+   */
+  private async sqlTxRaw<T>(
+    fn: (tx: postgres.TransactionSql<Record<string, never>>) => Promise<T>,
+  ): Promise<T> {
+    const conn = this._sql || db.getConnection();
+    const reentrant = conn as unknown as {
+      begin?: (f: typeof fn) => Promise<T>;
+      savepoint?: (f: typeof fn) => Promise<T>;
+    };
+    if (typeof reentrant.begin !== 'function' && typeof reentrant.savepoint === 'function') {
+      return reentrant.savepoint(fn);
+    }
+    return conn.begin(fn) as Promise<T>;
+  }
+
+  /**
+   * B7 first-light fix #4 (close-the-class). Run a search query under an 8s
+   * statement_timeout, scoped so it can NEVER leak onto a pooled connection or
+   * the rest of a withSourceScope dispatch tx. At top level a real transaction
+   * scopes `SET LOCAL` and reverts on commit (the original behavior). When
+   * already inside the dispatch tx, a SAVEPOINT would NOT scope `SET LOCAL`
+   * (GUCs are transaction-scoped, not savepoint-scoped), so the 8s cap would
+   * leak onto every later statement in the dispatch — instead capture the prior
+   * value, set transaction-local, run, and restore in `finally`. No savepoint:
+   * these are read-only queries; we want the timeout, not rollback isolation.
+   * Replaces bare `sql.begin(...)` at the three search sites, which threw
+   * "sql.begin is not a function" under the tenant tx.
+   */
+  private async runSearchWithTimeout(
+    rawQuery: string,
+    params: unknown[],
+  ): Promise<Record<string, unknown>[]> {
+    const conn = this._sql || db.getConnection();
+    const run = (c: ReturnType<typeof postgres>) =>
+      c.unsafe(rawQuery, params as Parameters<typeof c.unsafe>[1]) as unknown as Promise<Record<string, unknown>[]>;
+    if (typeof (conn as { begin?: unknown }).begin === 'function') {
+      return conn.begin(async (sql) => {
+        await sql`SET LOCAL statement_timeout = '8s'`;
+        return run(sql as unknown as ReturnType<typeof postgres>);
+      }) as Promise<Record<string, unknown>[]>;
+    }
+    // Nested in withSourceScope's tx — save → set → run → restore.
+    const prior = await conn`SELECT current_setting('statement_timeout') AS v`;
+    const priorVal = (prior[0]?.v as string | undefined) ?? '5min';
+    await conn`SELECT set_config('statement_timeout', '8s', true)`;
+    try {
+      return await run(conn);
+    } finally {
+      // Restore even on error so the 8s cap can't leak; if the tx is already
+      // aborted the GUC dies with it on rollback, so swallow the restore error.
+      try { await conn`SELECT set_config('statement_timeout', ${priorVal}, true)`; } catch { /* tx aborted */ }
+    }
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -1625,12 +1765,11 @@ export class PostgresEngine implements BrainEngine {
       OFFSET ${offsetParam}
     `;
 
-    // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
-    // to the transaction so it can never leak onto a pooled connection.
-    const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
-      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
-    });
+    // Search-only 8s statement_timeout via the re-entrant helper (scopes the
+    // GUC at top level; save/restore when nested in a dispatch tx — see
+    // runSearchWithTimeout). Replaces the bare sql.begin() that threw under the
+    // tenant withSourceScope tx.
+    const rows = await this.runSearchWithTimeout(rawQuery, params);
     return rows.map(rowToSearchResult);
   }
 
@@ -1751,10 +1890,7 @@ export class PostgresEngine implements BrainEngine {
       OFFSET ${offsetParam}
     `;
 
-    const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
-      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
-    });
+    const rows = await this.runSearchWithTimeout(rawQuery, params);
     return rows.map(rowToSearchResult);
   }
 
@@ -1923,10 +2059,7 @@ export class PostgresEngine implements BrainEngine {
       OFFSET ${offsetParam}
     `;
 
-    const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
-      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
-    });
+    const rows = await this.runSearchWithTimeout(rawQuery, params);
     return rows.map(rowToSearchResult);
   }
 
@@ -3451,11 +3584,15 @@ export class PostgresEngine implements BrainEngine {
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
+    // B7 save_facts (v93) — client-authored provenance stamps. Null/false for
+    // every non-save_facts caller (server-authored).
+    const provenance     = input.provenance ?? null;
+    const clientAuthored = input.client_authored ?? false;
 
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
       const supersedeId = ctx.supersedeId;
-      const newId = await sql.begin(async (tx) => {
+      const newId = await this.sqlTxRaw(async (tx) => {
         if (entitySlug) {
           await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
         }
@@ -3464,12 +3601,14 @@ export class PostgresEngine implements BrainEngine {
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
             embedding, embedded_at,
-            claim_metric, claim_value, claim_unit, claim_period
+            claim_metric, claim_value, claim_unit, claim_period,
+            provenance, client_authored
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
+            ${provenance}, ${clientAuthored}
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
@@ -3481,7 +3620,7 @@ export class PostgresEngine implements BrainEngine {
     }
 
     // Plain insert path with optional advisory lock for the dedup window.
-    const id = await sql.begin(async (tx) => {
+    const id = await this.sqlTxRaw(async (tx) => {
       if (entitySlug) {
         await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
       }
@@ -3490,12 +3629,14 @@ export class PostgresEngine implements BrainEngine {
           source_id, entity_slug, fact, kind, visibility, notability, context,
           valid_from, valid_until, source, source_session, confidence,
           embedding, embedded_at,
-          claim_metric, claim_value, claim_unit, claim_period
+          claim_metric, claim_value, claim_unit, claim_period,
+          provenance, client_authored
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
           ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
+          ${provenance}, ${clientAuthored}
         ) RETURNING id
       `;
       return Number(ins[0].id);
@@ -3584,7 +3725,7 @@ export class PostgresEngine implements BrainEngine {
     // readable; batch sizes are small (5-30 rows per page in practice).
     // No supersede flow in this path — fence reconciliation is the
     // canonical source-of-truth direction, not the consolidator path.
-    const ids = await sql.begin(async (tx) => {
+    const ids = await this.sqlTxRaw(async (tx) => {
       const out: number[] = [];
       for (const input of rows) {
         const validFrom = input.valid_from ?? new Date();
@@ -3650,13 +3791,18 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND entity_slug = ${entitySlug}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -3674,6 +3820,7 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const entitySlug = opts?.entitySlug ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
@@ -3682,7 +3829,11 @@ export class PostgresEngine implements BrainEngine {
         ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -3700,13 +3851,18 @@ export class PostgresEngine implements BrainEngine {
     const activeOnly = opts?.activeOnly !== false;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
-        ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -3770,6 +3926,67 @@ export class PostgresEngine implements BrainEngine {
         AND entity_slug = ${entitySlug}
         AND expired_at IS NULL
       ORDER BY created_at DESC, id DESC
+      LIMIT ${k}
+    `;
+    return rows.map(rowToFactPg);
+  }
+
+  // B7 save_facts — Layer-1 (always-on) text dedup. Source-scoped, no entity
+  // prefilter. Matches normalized-exact OR pg_trgm similarity >= threshold.
+  // Runs inside the tenant withSourceScope tx; the explicit source_id filter
+  // is belt-and-suspenders alongside the RLS policy.
+  async findFactTextDuplicates(
+    source_id: string,
+    factText: string,
+    opts?: { threshold?: number; limit?: number },
+  ): Promise<Array<{ id: number; fact: string; score: number }>> {
+    const sql = this.sql;
+    const threshold = Math.min(Math.max(opts?.threshold ?? 0.85, 0), 1);
+    const limit = Math.min(Math.max(opts?.limit ?? 5, 1), 20);
+    // Normalized form for the exact-match arm: lower + trim + whitespace
+    // collapse. The trgm arm (pg_trgm lowercases internally) catches near-dups.
+    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    const rows = await sql<Array<{ id: number; fact: string; score: number }>>`
+      SELECT id, fact,
+             GREATEST(
+               similarity(fact, ${factText}),
+               CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+                    THEN 1.0 ELSE 0 END
+             )::real AS score
+      FROM facts
+      WHERE source_id = ${source_id}
+        AND expired_at IS NULL
+        AND (
+          fact % ${factText}
+          OR lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+        )
+        AND GREATEST(
+              similarity(fact, ${factText}),
+              CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+                   THEN 1.0 ELSE 0 END
+            ) >= ${threshold}
+      ORDER BY score DESC, id DESC
+      LIMIT ${limit}
+    `;
+    return rows.map(r => ({ id: Number(r.id), fact: r.fact, score: Number(r.score) }));
+  }
+
+  // B7 save_facts — Layer-2 (conditional) embedding-neighbor search.
+  // Source-scoped embedding KNN; NO entity prefilter (cf. findCandidateDuplicates).
+  async findFactEmbeddingNeighbors(
+    source_id: string,
+    embedding: Float32Array,
+    opts?: { k?: number },
+  ): Promise<FactRow[]> {
+    const sql = this.sql;
+    const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
+    const lit = toPgVectorLiteral(embedding);
+    const rows = await sql<FactRowSqlShape[]>`
+      SELECT * FROM facts
+      WHERE source_id = ${source_id}
+        AND expired_at IS NULL
+        AND embedding IS NOT NULL
+      ORDER BY embedding <=> ${sql.unsafe(`'${lit}'::vector`)}
       LIMIT ${k}
     `;
     return rows.map(rowToFactPg);
@@ -4270,8 +4487,7 @@ export class PostgresEngine implements BrainEngine {
     oldRow: number,
     newRow: Omit<TakeBatchInput, 'page_id' | 'row_num' | 'superseded_by'>,
   ): Promise<{ oldRow: number; newRow: number }> {
-    const conn = this.sql;
-    return await conn.begin(async (tx) => {
+    return await this.sqlTxRaw(async (tx) => {
       const [existing] = await tx`
         SELECT resolved_at FROM takes WHERE page_id = ${pageId} AND row_num = ${oldRow}
       `;
@@ -4748,6 +4964,15 @@ export class PostgresEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
+    // B7 first-light fix #3: the customer-plane tenant role cannot SELECT
+    // `config` (CAT-6 GRANT EXCLUSION; D3 banked — never grant). Issuing the
+    // read would throw "permission denied for table config" and ABORT the
+    // surrounding withSourceScope tx, failing the op (get_page/query/
+    // extract_facts brain_unavailable). The tenant plane has no operator config
+    // to read, so return null — callers default safely (kill-switches → on,
+    // model resolution → tier default, search mode → defaults). Operator /
+    // incumbent (BYPASSRLS, holds the grant) is unaffected. See _canReadConfig.
+    if (this._canReadConfig === false) return null;
     const sql = this.sql;
     const rows = await sql`SELECT value FROM config WHERE key = ${key}`;
     return rows.length > 0 ? (rows[0].value as string) : null;
@@ -4768,6 +4993,8 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async listConfigKeys(prefix: string): Promise<string[]> {
+    // B7 first-light fix #3: tenant role cannot read `config` (see getConfig).
+    if (this._canReadConfig === false) return [];
     const sql = this.sql;
     // LIKE-escape literal % and _ so a config key with those chars resolves correctly.
     const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');

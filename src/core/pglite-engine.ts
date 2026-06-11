@@ -827,6 +827,17 @@ export class PGLiteEngine implements BrainEngine {
     });
   }
 
+  async withSourceScope<T>(_sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // B7 RLS backstop is a Postgres-only, customer-plane construct. PGLite is
+    // the embedded single-principal engine (Sean's laptop / CLI / tests): no
+    // pooling, no RLS engine, exactly one source's data per database. There is
+    // no cross-tenant surface to confine, so withSourceScope is a pass-through —
+    // it runs `fn` against `this` unchanged. The Postgres engine sets the
+    // app.current_source_id GUC + pins a transaction; doing that here would be a
+    // no-op against a backend that ignores RLS, so we skip it entirely.
+    return fn(this);
+  }
+
   // Pages CRUD
   async getPage(slug: string, opts?: { sourceId?: string; includeDeleted?: boolean }): Promise<Page | null> {
     // v0.26.5: hide soft-deleted by default; opt-in via opts.includeDeleted.
@@ -3326,6 +3337,10 @@ export class PGLiteEngine implements BrainEngine {
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
+    // B7 save_facts (v93) — client-authored provenance stamps. Null/false for
+    // every non-save_facts caller (server-authored).
+    const provenance     = input.provenance ?? null;
+    const clientAuthored = input.client_authored ?? false;
 
     if (ctx.supersedeId !== undefined) {
       // Supersede flow: insert new + expire old in one txn so observers never
@@ -3337,25 +3352,29 @@ export class PGLiteEngine implements BrainEngine {
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period,
+                 provenance, client_authored
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  NULL, NULL,
-                 $13, $14, $15, $16
+                 $13, $14, $15, $16,
+                 $17, $18
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period,
+                 provenance, client_authored
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  $13::vector, $14,
-                 $15, $16, $17, $18
+                 $15, $16, $17, $18,
+                 $19, $20
                ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored],
         );
         const newId = ins.rows[0].id;
         await tx.query(
@@ -3374,25 +3393,29 @@ export class PGLiteEngine implements BrainEngine {
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period
+             claim_metric, claim_value, claim_unit, claim_period,
+             provenance, client_authored
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              NULL, NULL,
-             $13, $14, $15, $16
+             $13, $14, $15, $16,
+             $17, $18
            ) RETURNING id`
         : `INSERT INTO facts (
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period
+             claim_metric, claim_value, claim_unit, claim_period,
+             provenance, client_authored
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              $13::vector, $14,
-             $15, $16, $17, $18
+             $15, $16, $17, $18,
+             $19, $20
            ) RETURNING id`,
       embedStr === null
-        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored]
+        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored],
     );
     return { id: ins.rows[0].id, status: 'inserted' };
   }
@@ -3602,6 +3625,64 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows.map(rowToFact);
   }
 
+  // B7 save_facts — Layer-1 (always-on) text dedup. Source-scoped, no entity
+  // prefilter. Normalized-exact OR pg_trgm similarity >= threshold. pg_trgm is
+  // created in PGLITE_SCHEMA_SQL, so similarity()/% are available here too.
+  async findFactTextDuplicates(
+    source_id: string,
+    factText: string,
+    opts?: { threshold?: number; limit?: number },
+  ): Promise<Array<{ id: number; fact: string; score: number }>> {
+    const threshold = Math.min(Math.max(opts?.threshold ?? 0.85, 0), 1);
+    const limit = Math.min(Math.max(opts?.limit ?? 5, 1), 20);
+    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    const result = await this.db.query<{ id: number; fact: string; score: number }>(
+      `SELECT id, fact,
+              GREATEST(
+                similarity(fact, $2),
+                CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $3
+                     THEN 1.0 ELSE 0 END
+              )::real AS score
+       FROM facts
+       WHERE source_id = $1
+         AND expired_at IS NULL
+         AND (
+           fact % $2
+           OR lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $3
+         )
+         AND GREATEST(
+               similarity(fact, $2),
+               CASE WHEN lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $3
+                    THEN 1.0 ELSE 0 END
+             ) >= $4
+       ORDER BY score DESC, id DESC
+       LIMIT $5`,
+      [source_id, factText, normalized, threshold, limit],
+    );
+    return result.rows.map(r => ({ id: Number(r.id), fact: r.fact, score: Number(r.score) }));
+  }
+
+  // B7 save_facts — Layer-2 (conditional) embedding-neighbor search.
+  // Source-scoped embedding KNN; NO entity prefilter.
+  async findFactEmbeddingNeighbors(
+    source_id: string,
+    embedding: Float32Array,
+    opts?: { k?: number },
+  ): Promise<FactRow[]> {
+    const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
+    const vec = toPgVectorLiteral(embedding);
+    const result = await this.db.query<FactRowSqlShape>(
+      `SELECT * FROM facts
+       WHERE source_id = $1
+         AND expired_at IS NULL
+         AND embedding IS NOT NULL
+       ORDER BY embedding <=> $2::vector
+       LIMIT $3`,
+      [source_id, vec, k],
+    );
+    return result.rows.map(rowToFact);
+  }
+
   async findTrajectory(opts: import('./engine.ts').TrajectoryOpts): Promise<import('./engine.ts').TrajectoryPoint[]> {
     const limit = clampSearchLimit(opts.limit, 100, 500);
     const sinceDate = opts.since ? new Date(opts.since) : null;
@@ -3773,8 +3854,18 @@ export class PGLiteEngine implements BrainEngine {
       params.kinds = opts.kinds;
     }
     if (opts.visibility && opts.visibility.length > 0) {
-      whereParts.push(`visibility = ANY($visibility)`);
-      params.visibility = opts.visibility;
+      // B7 recall owner-visibility (pass 3): widen to
+      // (visibility = ANY(...) OR source_id = ownerSourceId) when an owner
+      // scope is supplied, so a source's owner reads their own facts back.
+      const ownerSourceId = opts.ownerSourceId ?? null;
+      if (ownerSourceId) {
+        whereParts.push(`(visibility = ANY($visibility) OR source_id = $ownerSourceId)`);
+        params.visibility = opts.visibility;
+        params.ownerSourceId = ownerSourceId;
+      } else {
+        whereParts.push(`visibility = ANY($visibility)`);
+        params.visibility = opts.visibility;
+      }
     }
     for (const c of opts.whereClauses ?? []) whereParts.push(c);
     Object.assign(params, opts.whereParams ?? {});

@@ -154,20 +154,27 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
   let cleaned = input.turnText.slice(0, MAX_TURN_TEXT_CHARS);
   for (const p of INJECTION_PATTERNS) cleaned = cleaned.replace(p.rx, p.replacement);
   cleaned = cleaned.trim();
-  if (!cleaned) return [];
+  if (!cleaned) {
+    // B7 first-light fix #4 (observability): no more silent zeros on the
+    // product's differentiator. Every failure-shaped empty return logs why.
+    console.warn(`[facts:extract] empty extraction (source=${input.source}): turn empty after sanitization`);
+    return [];
+  }
 
   if (!isAvailable('chat')) {
     // No chat gateway → no extraction. Caller still inserts facts via direct
     // `gbrain take add` paths.
+    console.warn(`[facts:extract] empty extraction (source=${input.source}): chat gateway unavailable (isAvailable('chat')===false — missing provider key in this process's env)`);
     return [];
   }
 
   const cap = Math.max(1, Math.min(input.maxFactsPerTurn ?? 10, 25));
   const defaultModel = await getFactsExtractionModel(input.engine);
+  const usedModel = input.model ?? defaultModel;
   let result: ChatResult;
   try {
     result = await chat({
-      model: input.model ?? defaultModel,
+      model: usedModel,
       system: EXTRACTOR_SYSTEM,
       messages: [
         {
@@ -186,13 +193,25 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
     // Re-throw aborts; absorb other errors as "no extraction" — caller's
     // `put_page` backstop will still record the page itself.
     if (isAbort(err)) throw err;
+    // Observability: surface the provider error + model so a tenant-vs-operator
+    // divergence (e.g. an unservable resolved model) is diagnosable in one probe.
+    console.warn(`[facts:extract] empty extraction (source=${input.source}, model=${usedModel}): chat() threw: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
 
-  if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') return [];
+  if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') {
+    console.warn(`[facts:extract] empty extraction (source=${input.source}, model=${usedModel}): chat stopReason=${result.stopReason}`);
+    return [];
+  }
 
   const parsedRaw = parseExtractorJson(result.text);
-  if (!parsedRaw) return [];
+  if (!parsedRaw) {
+    console.warn(`[facts:extract] empty extraction (source=${input.source}, model=${usedModel}): extractor JSON parse failed (stopReason=${result.stopReason}, text len=${result.text?.length ?? 0})`);
+    return [];
+  }
+  if (parsedRaw.length === 0) {
+    console.warn(`[facts:extract] 0 candidates (source=${input.source}, model=${usedModel}): extractor returned a valid but empty list for a non-empty turn`);
+  }
 
   const facts: ExtractedFact[] = [];
   for (const candidate of parsedRaw.slice(0, cap)) {

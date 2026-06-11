@@ -1539,6 +1539,12 @@ export async function hybridSearchCached(
   // today; the resolver already folded everything through.
   const cacheCfg = await loadCacheConfig(engine);
   const cacheEnabled = resolvedForCache.cache_enabled;
+  // v0.40.6 (B7 tenant query_cache fix): the cache row's owning source is the
+  // dispatch scope (cacheSourceId == ctx.sourceId == app.current_source_id),
+  // NOT the federated read allow-list (opts.sourceIds). Falling back to
+  // opts.sourceId preserves CLI/local behavior; only when both are unset does
+  // store()/lookup() default to 'default'.
+  const cacheSourceId = opts?.cacheSourceId ?? opts?.sourceId;
   const cache = new SemanticQueryCache(engine, {
     ...cacheCfg,
     enabled: cacheEnabled,
@@ -1607,7 +1613,7 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash });
+    const hit = await cache.lookup(queryEmbedding, { sourceId: cacheSourceId, knobsHash: cacheKnobsHash });
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
@@ -1708,7 +1714,7 @@ export async function hybridSearchCached(
   ) {
     trackCacheWrite(
       cache
-        .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
+        .store(query, queryEmbedding, results, finalMeta, { sourceId: cacheSourceId, knobsHash: cacheKnobsHash })
         .catch(() => { /* swallow */ }),
     );
   }

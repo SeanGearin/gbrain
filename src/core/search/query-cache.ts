@@ -234,7 +234,21 @@ export class SemanticQueryCache {
       // sent as a JSON.stringify and cast to JSONB inside the SQL; pre-v91
       // brains store an empty `{}` + zero bookmark (legacy compat per
       // the v0.40.3.0 IRON-RULE).
-      await this.engine.executeRaw(
+      //
+      // v0.40.6 (B7 tenant query_cache fix): wrap the INSERT in
+      // engine.transaction() so a failed cache write cannot abort the
+      // request. On the customer plane this write runs inside serve-http's
+      // withSourceScope dispatch tx; a raw INSERT that trips the query_cache
+      // RLS WITH CHECK (or any other error) raises 25P02 and POISONS that
+      // outer tx — every later statement dies and the op returns
+      // brain_unavailable (the try/catch below does NOT save it; the Postgres
+      // abort outlives the swallowed JS error — same mechanism documented in
+      // loadCacheConfig's B7 fix #4 chokepoint comment). engine.transaction()
+      // is re-entrant: a real tx at top level (CLI/eval), a SAVEPOINT when
+      // already inside the dispatch tx — so the failure rolls back to the
+      // savepoint and the outer tx survives. Best-effort is now real.
+      await this.engine.transaction((tx) =>
+        tx.executeRaw(
         `INSERT INTO query_cache (id, query_text, source_id, knobs_hash, embedding, results, meta, ttl_seconds, page_generations, max_generation_at_store, created_at)
          VALUES ($1, $2, $3, $4, $5::vector, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10, now())
          ON CONFLICT (id) DO UPDATE SET
@@ -259,9 +273,12 @@ export class SemanticQueryCache {
           JSON.stringify(snapshot.page_generations),
           snapshot.max_generation_at_store,
         ],
-      );
+      ));
     } catch {
       // swallow \u2014 cache write must never break the search hot path.
+      // With the engine.transaction() wrapper above, a nested failure has
+      // already rolled back to its SAVEPOINT, so the caller's (dispatch) tx
+      // is intact; this catch just absorbs the re-thrown error.
     }
   }
 
@@ -363,31 +380,34 @@ function safeJsonParse<T>(value: unknown, fallback: T): T {
  * three keys have sensible defaults; missing rows fall back to those.
  */
 export async function loadCacheConfig(engine: BrainEngine): Promise<QueryCacheConfig> {
-  const keys = [
-    'search.cache.enabled',
-    'search.cache.similarity_threshold',
-    'search.cache.ttl_seconds',
-  ];
   const config: QueryCacheConfig = {
     enabled: true,
     similarityThreshold: DEFAULT_SIMILARITY_THRESHOLD,
     ttlSeconds: DEFAULT_TTL_SECONDS,
   };
   try {
-    const rows = await engine.executeRaw<{ key: string; value: string }>(
-      `SELECT key, value FROM config WHERE key = ANY($1)`,
-      [keys],
-    );
-    for (const row of rows) {
-      if (row.key === 'search.cache.enabled') {
-        config.enabled = row.value === '1' || row.value.toLowerCase() === 'true';
-      } else if (row.key === 'search.cache.similarity_threshold') {
-        const v = parseFloat(row.value);
-        if (Number.isFinite(v)) config.similarityThreshold = clampThreshold(v);
-      } else if (row.key === 'search.cache.ttl_seconds') {
-        const v = parseInt(row.value, 10);
-        if (Number.isFinite(v)) config.ttlSeconds = clampTtl(v);
-      }
+    // B7 first-light fix #4 (close-the-class): route through the guarded
+    // engine.getConfig chokepoint instead of a raw `SELECT … FROM config`.
+    // On the customer-plane tenant role config is CAT-6 (GRANT-EXCLUDED), so a
+    // raw read throws "permission denied for table config" and ABORTS the
+    // withSourceScope dispatch tx — the try/catch here does NOT save it (the
+    // Postgres abort outlives the swallowed JS error). getConfig returns null
+    // for that role; semantics are identical (missing key → default).
+    const [enabled, threshold, ttl] = await Promise.all([
+      engine.getConfig('search.cache.enabled'),
+      engine.getConfig('search.cache.similarity_threshold'),
+      engine.getConfig('search.cache.ttl_seconds'),
+    ]);
+    if (enabled !== null) {
+      config.enabled = enabled === '1' || enabled.toLowerCase() === 'true';
+    }
+    if (threshold !== null) {
+      const v = parseFloat(threshold);
+      if (Number.isFinite(v)) config.similarityThreshold = clampThreshold(v);
+    }
+    if (ttl !== null) {
+      const v = parseInt(ttl, 10);
+      if (Number.isFinite(v)) config.ttlSeconds = clampTtl(v);
     }
   } catch {
     // Use defaults.

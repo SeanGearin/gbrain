@@ -786,7 +786,22 @@ const put_page: Operation = {
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    // Hosted-tenant plane is DB-only (B7 first-light fix #2). A remote caller
+    // confined to a provisioned, non-default source runs as the NOBYPASSRLS
+    // gbrain_tenant role inside serve-http's withSourceScope tx. That role is
+    // denied SELECT on `config` (CAT-6, GRANT EXCLUSION in b7-role.sql; D3
+    // banked — must NOT grant). The canonical write-through helper reads
+    // `config` (writePageThrough → getConfig('sync.repo_path')); under the
+    // tenant role that SELECT throws "permission denied for table config",
+    // which ABORTS the outer transaction — the helper's internal catch LOOKS
+    // non-fatal but the page INSERT then rolls back at commit and the op fails
+    // closed (brain_unavailable). Tenants have no repo, so skip write-through
+    // entirely. Operator ('default' source) + local CLI (remote===false) are
+    // unaffected — the ingestion cathedral keeps write-through. Discriminator
+    // is the withSourceScope tokenSourceId, NOT `remote` alone (operator MCP is
+    // remote).
+    const tenantScoped = ctx.remote !== false && ctx.sourceId !== 'default';
+    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent && !tenantScoped) {
       const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
@@ -801,6 +816,8 @@ const put_page: Operation = {
         },
         logger: ctx.logger,
       });
+    } else if (tenantScoped) {
+      writeThrough = { written: false, skipped: 'tenant_db_only' };
     } else if (isSandboxSubagent) {
       writeThrough = { written: false, skipped: 'subagent_sandbox' };
     } else if (ctx.dryRun) {
@@ -887,7 +904,13 @@ const put_page: Operation = {
     // (MEDIUM facts wait for the dream cycle but DO land via put_page,
     // matching the pre-fix behavior on this surface).
     let factsQueued: { queued: boolean } | { skipped: string } | undefined;
-    try {
+    // Skip on the hosted-tenant plane (B7 first-light fix #2): the kill-switch
+    // read isFactsExtractionEnabled → getConfig('facts.extraction_enabled') is a
+    // SELECT on the tenant-denied `config` table and would abort the tx before
+    // any enqueue. Tenant facts auto-extraction is deferred (separate work).
+    if (tenantScoped) {
+      factsQueued = { skipped: 'tenant_db_only' };
+    } else try {
       const { runFactsBackstop } = await import('./facts/backstop.ts');
       const r = await runFactsBackstop(
         {
@@ -926,7 +949,12 @@ const put_page: Operation = {
     // ingest_log + ~/.gbrain/validator-lint.jsonl. Does NOT reject the
     // write — that's the deferred strict-mode flip after the 7-day soak.
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
-    try {
+    // Skip on the hosted-tenant plane (B7 first-light fix #2): the feature-flag
+    // read getConfig('writer.lint_on_put_page') is a SELECT on the tenant-denied
+    // `config` table and would abort the tx.
+    if (tenantScoped) {
+      writerLint = { skipped: 'tenant_db_only' };
+    } else try {
       const { runPostWriteLint } = await import('./output/post-write.ts');
       const lint = await runPostWriteLint(ctx.engine, result.slug);
       if (lint.ran) {
@@ -1224,6 +1252,7 @@ const list_pages: Operation = {
     type: { type: 'string', description: 'Filter by page type' },
     tag: { type: 'string', description: 'Filter by tag' },
     limit: { type: 'number', description: 'Max results (default 50)' },
+    offset: { type: 'number', description: 'Skip the first N pages (for pagination). Default 0. Page by offset under a stable sort to enumerate every page beyond the limit.' },
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
@@ -1250,10 +1279,14 @@ const list_pages: Operation = {
     // were ignored at this op handler and the engine returned every source's
     // pages indiscriminately.
     const scope = sourceScopeOpts(ctx);
+    const offset = typeof p.offset === 'number' && Number.isFinite(p.offset)
+      ? Math.max(0, Math.floor(p.offset))
+      : 0;
     const pages = await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
       limit: clampSearchLimit(p.limit as number | undefined, 50, 100),
+      offset,
       includeDeleted: (p.include_deleted as boolean) === true,
       updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
       sort,
@@ -1498,6 +1531,16 @@ const query: Operation = {
       nearSymbol: (p.near_symbol as string) || undefined,
       walkDepth: typeof p.walk_depth === 'number' ? (p.walk_depth as number) : undefined,
       ...querySourceScope,
+      // v0.40.6 (B7 tenant query_cache fix): the semantic cache row is OWNED
+      // by the dispatch scope, not the read allow-list. querySourceScope above
+      // resolves a federated tenant to `sourceIds` (read scope), leaving scalar
+      // sourceId undefined — so the cache write fell back to 'default' and the
+      // RLS WITH CHECK on query_cache aborted the whole dispatch tx. Thread
+      // ctx.sourceId (== withSourceScope's app.current_source_id) as the cache
+      // owner. Cache-only; does not affect read scope. Explicit per-call
+      // source_id ('__all__' → {}) leaves this unset → store falls back to
+      // sourceId (local/CLI unchanged).
+      cacheSourceId: ctx.sourceId,
       // v0.29.1 — agent-explicit recency + salience. Omitted = heuristic defaults.
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
@@ -1985,7 +2028,16 @@ const get_stats: Operation = {
   handler: async (ctx) => {
     return ctx.engine.getStats();
   },
-  scope: 'admin',
+  // read, not admin (B7 first-light fix). get_stats is the tenant isolation
+  // verdict surface — a tenant must see its own page_count (≈1) to confirm the
+  // RLS wall holds. Every table getStats() reads (pages, content_chunks, links,
+  // tags, timeline_entries) carries the b7_tenant_isolation RLS policy, so under
+  // serve-http's withSourceScope wrap the NOBYPASSRLS tenant role sees ONLY its
+  // own source's rows — get_stats leaks nothing cross-tenant. The same counts
+  // are already exposed at read scope via get_brain_identity, which calls the
+  // identical getStats(). Operators are unaffected (admin implies read). Do NOT
+  // mint tenants admin scope to reach this; the tool is the read-scope surface.
+  scope: 'read',
   cliHints: { name: 'stats' },
 };
 
@@ -3542,6 +3594,34 @@ const extract_facts: Operation = {
   },
 };
 
+const save_facts: Operation = {
+  name: 'save_facts',
+  description:
+    'B7: insert PRE-EXTRACTED structured facts into per-source hot memory with ZERO server LLM. The deterministic sibling of extract_facts: the CALLER (the customer\'s own model) decides what is worth remembering and structures it; the server only validates, sanitizes (INJECTION_PATTERNS + 500-char cap), dedups, and inserts. Use this on the tenant plane where the chat gateway is intentionally unavailable. Each claim carries a REQUIRED provenance ("user_stated" for what the user actually said; "model_inferred" only for conservative, clearly-flagged inferences — never speculation). Dedup is two-layer and degrades gracefully: always-on pg_trgm / normalized-text, plus cosine when an embedding provider is configured. Rows are stamped source=mcp:save_facts, client_authored=true, provenance + confidence per row. Returns {inserted, duplicate, fact_ids, dedup_mode}. A malformed claim rejects the WHOLE batch and names the failing index.',
+  params: {
+    claims: {
+      type: 'array',
+      required: true,
+      description:
+        'Non-empty array of claim objects. Each object (strict — unknown keys rejected): claim (string, required, plain text, <=500 chars); provenance ("user_stated" | "model_inferred", REQUIRED, no default); kind ("fact" | "event" | "commitment" | "preference" | "belief", default "fact"); people (string[], surface forms as spoken, NOT slugs); entities (string[], non-person surface forms); date_context (string — resolve relative dates like "next Saturday" to a concrete date before sending); confidence (number 0-1; default 1.0 for user_stated, hard-capped at 0.7 for model_inferred).',
+      items: { type: 'object' },
+    },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'save_facts' };
+    // Deterministic, config-free intake. No kill-switch config read here: the
+    // tenant withSourceScope tx runs under the NOBYPASSRLS gbrain_tenant role,
+    // which is GRANT-excluded from the config table (a raw config read aborts
+    // the tx — the FLAG-C class). The whole point of this path is to need no
+    // gateway/config gate.
+    const { runSaveFacts } = await import('./facts/save.ts');
+    const sourceId = ctx.sourceId ?? 'default';
+    return runSaveFacts(p.claims, { engine: ctx.engine, sourceId });
+  },
+};
+
 const recall: Operation = {
   name: 'recall',
   description:
@@ -3553,6 +3633,7 @@ const recall: Operation = {
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (expired_at + superseded_by both set).' },
     limit: { type: 'number', description: 'Max rows to return. Default 50, cap 100.' },
+    offset: { type: 'number', description: 'Skip the first N rows (for pagination over the >100-row case). Default 0. Stable order is created_at DESC, id DESC, so paging by offset until a short page walks the full set with no gaps or dupes.' },
     grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
@@ -3560,6 +3641,12 @@ const recall: Operation = {
   handler: async (ctx, p) => {
     const sourceId = ctx.sourceId ?? 'default';
     const limit = typeof p.limit === 'number' ? p.limit : 50;
+    // Pagination offset (additive, default 0). Engine list methods clamp limit
+    // to MAX_SEARCH_LIMIT and apply offset against a stable created_at DESC,
+    // id DESC order, so a caller can page until a short page to exhaust >100 rows.
+    const offset = typeof p.offset === 'number' && Number.isFinite(p.offset)
+      ? Math.max(0, Math.floor(p.offset))
+      : 0;
     const includeExpired = p.include_expired === true;
     const grep = typeof p.grep === 'string' ? p.grep.toLowerCase() : null;
 
@@ -3571,6 +3658,31 @@ const recall: Operation = {
         ? undefined
         : ['world'] as ('private' | 'world')[];
 
+    // R-2 owner-visibility (pass 3): a remote caller reads their OWN source's
+    // facts back regardless of visibility. The engine predicate widens to
+    // (visibility = world OR source_id = ownerSourceId); because every list
+    // query below is already `WHERE source_id = sourceId`, this only ever
+    // surfaces the caller's own source — never a third party's private facts.
+    //
+    // The owner signal is the AUTHENTICATED write-authority source
+    // (ctx.auth.sourceId — "the source the calling OAuth client is scoped to",
+    // i.e. the source it OWNS), NOT the request-derived ctx.sourceId. The two
+    // are equal for a scoped caller, but ctx.sourceId is coerced to 'default'
+    // for an unscoped/legacy/public caller — keying the carve-out on it would
+    // leak the default brain's private facts to a world reader. Keying on
+    // ctx.auth.sourceId means: a token scoped to a source owns it (tenant sees
+    // own private); an unauthenticated/unscoped caller gets no carve-out and
+    // stays world-only, verbatim. No config read (CAT-6/FLAG-C zone): the scope
+    // rides on the auth context set by the dispatch.
+    const ownerSourceId =
+      ctx.remote === false
+        ? null
+        : (typeof ctx.auth?.sourceId === 'string' && ctx.auth.sourceId.length > 0
+            ? ctx.auth.sourceId
+            : null);
+
+    const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId };
+
     let rows: Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>> = [];
 
     if (p.supersessions === true) {
@@ -3579,33 +3691,17 @@ const recall: Operation = {
     } else if (typeof p.entity === 'string' && p.entity.length > 0) {
       const { resolveEntitySlug } = await import('./entities/resolve.ts');
       const slug = (await resolveEntitySlug(ctx.engine, sourceId, p.entity)) ?? p.entity;
-      rows = await ctx.engine.listFactsByEntity(sourceId, slug, {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsByEntity(sourceId, slug, listOpts);
     } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
-      rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, listOpts);
     } else if (p.since !== undefined) {
       const since = parseSinceParam(p.since);
       if (since) {
-        rows = await ctx.engine.listFactsSince(sourceId, since, {
-          activeOnly: !includeExpired,
-          limit,
-          visibility,
-        });
+        rows = await ctx.engine.listFactsSince(sourceId, since, listOpts);
       }
     } else {
       // No filter: return recent across the source.
-      rows = await ctx.engine.listFactsSince(sourceId, new Date(0), {
-        activeOnly: !includeExpired,
-        limit,
-        visibility,
-      });
+      rows = await ctx.engine.listFactsSince(sourceId, new Date(0), listOpts);
     }
 
     if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
@@ -4717,6 +4813,8 @@ export const operations: Operation[] = [
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)
   extract_facts, recall, forget_fact,
+  // B7: deterministic structured-facts intake (tenant plane, zero server LLM)
+  save_facts,
   // v0.32.6: contradiction probe MCP surface (M3)
   find_contradictions,
   // v0.33: expertise + relationship-proximity routing

@@ -40,7 +40,11 @@ beforeEach(async () => {
 function makeEvent(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
   const content = overrides.content ?? '# captured thought';
   return {
-    source_id: 'webhook-test',
+    // 'default' is the only source resetPgliteState re-seeds. Since D-INT-2 now
+    // threads event.source_id into importFromContent (which FKs pages.source_id
+    // to sources), the fixture must name a source that exists; single-plane
+    // events are 'default'. Tests needing a non-default source seed it first.
+    source_id: 'default',
     source_kind: 'webhook',
     source_uri: 'mcp-webhook:client-x:1234',
     received_at: new Date('2026-05-20T12:00:00Z').toISOString(),
@@ -192,5 +196,42 @@ describe('ingest_capture handler — integration with importFromContent', () => 
     const ev = makeEvent({ content: longContent });
     const result = await handler(makeJob({ event: ev, slug: 'wiki/long' }));
     expect(result.chunks).toBeGreaterThan(0);
+  });
+
+  // D-INT-2: the B2 write-seal stamps event.source_id at POST /ingest; the
+  // deferred ingest_capture write must land the page on THAT source, not
+  // 'default'. The handler runs on a BYPASSRLS engine in production, so RLS
+  // cannot catch a write that targets the wrong source — this is the only
+  // guard against a tenant's capture landing in another brain.
+  test('D-INT-2: threads event.source_id so the page lands on the sealed source, not default', async () => {
+    // The FK target must exist (production provisions the source before ingest).
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+      ['tenant-x', 'Tenant X'],
+    );
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: '# sealed-source capture', source_id: 'tenant-x' });
+    const result = await handler(makeJob({ event: ev, slug: 'wiki/sealed' }));
+    expect(result.status).toBe('imported');
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages WHERE slug = $1`,
+      ['wiki/sealed'],
+    );
+    expect(rows[0]?.source_id).toBe('tenant-x');
+    expect(rows[0]?.source_id).not.toBe('default');
+  });
+
+  test('D-INT-2: single-plane event (source_id default) still lands on default — behavior unchanged', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: '# single plane', source_id: 'default' });
+    const result = await handler(makeJob({ event: ev, slug: 'wiki/single-plane' }));
+    expect(result.status).toBe('imported');
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages WHERE slug = $1`,
+      ['wiki/single-plane'],
+    );
+    expect(rows[0]?.source_id).toBe('default');
   });
 });

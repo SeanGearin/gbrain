@@ -25,9 +25,11 @@ import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middlew
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
+import { resolveIngestSourceId } from '../core/ingest-source-seal.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { isValidSourceId, SOURCE_ID_RE } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -395,6 +397,405 @@ export function skillPublishStatus(publishSkills: boolean): { bannerValue: strin
   };
 }
 
+// ---------------------------------------------------------------------------
+// B4 provisioning — atomic per-tenant source + source-bound oauth_client
+// ---------------------------------------------------------------------------
+//
+// POST /admin/provision-source-client (wired in runServeHttp below) is the one
+// cross-repo piece Model B's tenant-provisioning saga needs. Minting an
+// oauth_client bound to `source_id == tenant_id` is CLI-only upstream
+// (`gbrain auth register-client --source`); DCR `/register` can mint a client
+// but cannot set source_id. This helper exposes that capability over HTTP
+// behind a `sources_admin` gate so the worker's provisioning step can call it.
+//
+// The logic is extracted (not inlined in the route closure) so it is
+// unit-testable against an in-process PGLite engine without bringing up
+// Express — the same idiom as probeHealth / probeLiveness / queryAgentClientSpend
+// above. The route stays a thin auth + parse wrapper; the full HTTP path
+// (bearer middleware, scope gate) is covered by the DATABASE_URL-gated e2e.
+//
+// Contract (design phase2-b4-provisioning §4):
+//   - source_id is validated against gbrain's canonical SOURCE_ID_RE — the
+//     strict implementation of the [a-z0-9-]{1,32} charset (it additionally
+//     forbids edge hyphens, exactly what addSource/sources_add require). Reusing
+//     the canonical validator means a 400 here never diverges from what addSource
+//     would reject downstream.
+//   - The source is created if absent (idempotent) with federated:false, so a
+//     tenant source is read-isolated by construction (Model B isolation).
+//   - The client is minted via registerClientManual, which hashes the secret
+//     with the SAME SHA-256 path the CLI/DCR use (hashToken). Secret hashing is
+//     never reimplemented here.
+//   - The secret is revealed exactly ONCE, on the creating call (200).
+//   - Idempotent per source_id: a repeat call for a source that already has a
+//     bound (non-deleted) client returns 409 with the existing client_id and
+//     NO secret. Re-revealing or re-minting would be a silent rotation — out of
+//     scope; a separate explicit rotate path is the design's §12.4 ruling. The
+//     saga reuses the secret it stored in its own ledger on first success.
+//
+// Atomicity / partial-state recovery: source-create (sources INSERT via
+// addSource) and client-mint (oauth_clients INSERT via registerClientManual)
+// are two writes that do not share a DB transaction. Success ⟺ both exist. If
+// the mint fails after the source is created, the orphaned source is
+// reclaimable AND self-healing: a retry sees no bound client (→ proceed), sees
+// the source already exists (→ skip create), and mints the missing client. This
+// is the "closes the source-without-client partial state" property the design's
+// option (a) calls for, achieved by idempotent retry rather than a cross-module
+// 2-phase commit.
+export type ProvisionSourceClientResult =
+  | { status: 200; body: { source_id: string; client_id: string; client_secret: string } }
+  | { status: 409; body: { error: 'already_provisioned'; source_id: string; client_id: string } }
+  | { status: 400; body: { error: string; message: string } }
+  | { status: 500; body: { error: string; message: string } };
+
+export async function provisionSourceClient(
+  engine: BrainEngine,
+  oauthProvider: GBrainOAuthProvider,
+  input: unknown,
+): Promise<ProvisionSourceClientResult> {
+  const body = (input ?? {}) as Record<string, unknown>;
+  const sourceId = body.source_id;
+
+  // 1. Charset gate — gbrain's canonical strict validator (the type guard
+  //    narrows `sourceId` to string for the rest of the function).
+  if (!isValidSourceId(sourceId)) {
+    return {
+      status: 400,
+      body: {
+        error: 'invalid_source_id',
+        message:
+          `source_id must be 1-32 lowercase alphanumeric chars with optional ` +
+          `interior hyphens (matches ${SOURCE_ID_RE}). Got: ${JSON.stringify(sourceId)}.`,
+      },
+    };
+  }
+
+  // display_name: optional string, defaults to source_id.
+  const rawDisplay = body.display_name;
+  if (rawDisplay !== undefined && typeof rawDisplay !== 'string') {
+    return {
+      status: 400,
+      body: { error: 'invalid_display_name', message: 'display_name must be a string when provided.' },
+    };
+  }
+  const displayName = typeof rawDisplay === 'string' && rawDisplay.length > 0 ? rawDisplay : sourceId;
+
+  // federated_read: optional string[]; each entry lands in the client's
+  // federated_read array (read scope) so each must be a legal source_id. When
+  // omitted, registerClientManual defaults it to [source_id] (read == write,
+  // the isolated default).
+  const rawFederated = body.federated_read;
+  let federatedRead: string[] | undefined;
+  if (rawFederated !== undefined) {
+    if (!Array.isArray(rawFederated) || !rawFederated.every(isValidSourceId)) {
+      return {
+        status: 400,
+        body: { error: 'invalid_federated_read', message: 'federated_read must be an array of valid source_ids when provided.' },
+      };
+    }
+    federatedRead = rawFederated as string[];
+  }
+
+  const sql = sqlQueryForEngine(engine);
+
+  // 2. Mint-once gate: a source that already has a bound, non-deleted client is
+  //    already provisioned. Return its client_id, never a secret.
+  try {
+    const existingClient = await sql`
+      SELECT client_id FROM oauth_clients
+       WHERE source_id = ${sourceId} AND deleted_at IS NULL
+       LIMIT 1
+    `;
+    if (existingClient.length > 0) {
+      return {
+        status: 409,
+        body: { error: 'already_provisioned', source_id: sourceId, client_id: String(existingClient[0].client_id) },
+      };
+    }
+  } catch (e) {
+    return { status: 500, body: { error: 'lookup_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+
+  // 3. Create the source if absent. Skipping when present is what makes a
+  //    source-without-client retry converge (recovers the partial state).
+  const { addSource, SourceOpError } = await import('../core/sources-ops.ts');
+  try {
+    const existingSource = await sql`SELECT id FROM sources WHERE id = ${sourceId} LIMIT 1`;
+    if (existingSource.length === 0) {
+      await addSource(engine, { id: sourceId, name: displayName, localPath: null, federated: false });
+    }
+  } catch (e) {
+    // A concurrent provision may have created the source between our check and
+    // the insert; source_id_taken is benign (the source now exists — proceed to
+    // mint). invalid_id is a 400 (defense-in-depth; the charset gate above
+    // should have caught it). Anything else is a real IO failure.
+    if (e instanceof SourceOpError && e.code === 'source_id_taken') {
+      // fall through to mint
+    } else if (e instanceof SourceOpError && e.code === 'invalid_id') {
+      return { status: 400, body: { error: 'invalid_source_id', message: e.message } };
+    } else {
+      return { status: 500, body: { error: 'source_create_failed', message: e instanceof Error ? e.message : String(e) } };
+    }
+  }
+
+  // 4. Mint the source-bound confidential client. registerClientManual hashes
+  //    the secret internally (hashToken / SHA-256) and persists source_id +
+  //    federated_read — we do not reimplement any of it.
+  try {
+    const { clientId, clientSecret } = await oauthProvider.registerClientManual(
+      displayName,
+      ['client_credentials'],
+      'read write',
+      [],
+      sourceId,
+      federatedRead,
+    );
+    // B4 mints a CONFIDENTIAL client (registerClientManual defaults the auth
+    // method to client_secret_post, so a secret is always minted on this path).
+    // master's v0.41.3 T2 widened the return to `clientSecret?: string` to admit
+    // public-client mints (auth method 'none', no secret); guard so a public
+    // mint slipping through here fails closed rather than returning a 200 with
+    // no usable credential.
+    if (!clientSecret) {
+      return { status: 500, body: { error: 'client_mint_failed', message: 'confidential client minted without a secret' } };
+    }
+    // 5. Secret revealed exactly once.
+    return { status: 200, body: { source_id: sourceId, client_id: clientId, client_secret: clientSecret } };
+  } catch (e) {
+    // The source may now exist without a client (a reclaimable orphan); a retry
+    // of this same request skips source-create and re-attempts the mint.
+    return { status: 500, body: { error: 'client_mint_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// B4 provisioning — revoke a source-bound client (rotation / rollback seam)
+// ---------------------------------------------------------------------------
+//
+// POST /admin/revoke-source-client (wired below) gives the worker's provisioning
+// saga a bearer-reachable way to disable a tenant's gbrain client — the
+// capability the existing /admin/api/revoke-client lacks for machines (it is
+// cookie/SPA-gated). It is the rollback half of the reconciler and the rotation
+// primitive: revoke flips deleted_at, so the next provisionSourceClient call
+// (whose mint-once gate filters `deleted_at IS NULL`) sees no live client and
+// mints a fresh secret. Revoke + re-provision == rotate; no rotate-specific
+// logic.
+//
+// Same auth shape as provisionSourceClient (sources_admin bearer, enforced at
+// the route). Extracted for in-process PGLite unit testing.
+//
+// Hard refusals / guards:
+//   - source_id must be charset-valid (400) and client_id a non-empty string (400).
+//   - source_id === 'default' is HARD-REFUSED (403). The default source holds
+//     Sean's own claude.ai / CLI clients; the provisioning bearer must never be
+//     able to disable them.
+//   - The client must be bound to that source AND not already deleted, else 404
+//     (idempotent: a second revoke, or a source/client mismatch, both land here).
+//   - Revoke reuses the /admin/api/revoke-client SQL pattern verbatim (soft-
+//     delete the client + delete its live tokens), additionally source-scoped on
+//     the UPDATE for TOCTOU safety. Not reimplemented.
+export type RevokeSourceClientResult =
+  | { status: 200; body: { source_id: string; client_id: string; revoked: true } }
+  | { status: 403; body: { error: 'forbidden_default'; message: string } }
+  | { status: 404; body: { error: 'not_found_or_already_revoked'; source_id: string; client_id: string } }
+  | { status: 400; body: { error: string; message: string } }
+  | { status: 500; body: { error: string; message: string } };
+
+export async function revokeSourceClient(engine: BrainEngine, input: unknown): Promise<RevokeSourceClientResult> {
+  const body = (input ?? {}) as Record<string, unknown>;
+  const sourceId = body.source_id;
+  const clientId = body.client_id;
+
+  if (!isValidSourceId(sourceId)) {
+    return {
+      status: 400,
+      body: {
+        error: 'invalid_source_id',
+        message:
+          `source_id must be 1-32 lowercase alphanumeric chars with optional ` +
+          `interior hyphens (matches ${SOURCE_ID_RE}). Got: ${JSON.stringify(sourceId)}.`,
+      },
+    };
+  }
+  if (typeof clientId !== 'string' || clientId.length === 0) {
+    return { status: 400, body: { error: 'invalid_client_id', message: 'client_id must be a non-empty string.' } };
+  }
+
+  // HARD REFUSE the default source — Sean's own clients live there.
+  if (sourceId === 'default') {
+    return { status: 403, body: { error: 'forbidden_default', message: 'Revoking clients on the default source is not permitted.' } };
+  }
+
+  const sql = sqlQueryForEngine(engine);
+
+  // Verify the binding: the client must be bound to this source and live.
+  try {
+    const bound = await sql`
+      SELECT client_id FROM oauth_clients
+       WHERE client_id = ${clientId} AND source_id = ${sourceId} AND deleted_at IS NULL
+       LIMIT 1
+    `;
+    if (bound.length === 0) {
+      // Idempotent: already-revoked, or a source/client mismatch, both land here.
+      return { status: 404, body: { error: 'not_found_or_already_revoked', source_id: sourceId, client_id: clientId } };
+    }
+  } catch (e) {
+    return { status: 500, body: { error: 'lookup_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+
+  // Revoke — same SQL pattern as /admin/api/revoke-client (soft-delete the
+  // client + kill its live tokens), source-scoped on the UPDATE for TOCTOU
+  // safety. Not reimplemented.
+  try {
+    await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId} AND source_id = ${sourceId} AND deleted_at IS NULL`;
+    await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
+  } catch (e) {
+    return { status: 500, body: { error: 'revoke_failed', message: e instanceof Error ? e.message : String(e) } };
+  }
+
+  return { status: 200, body: { source_id: sourceId, client_id: clientId, revoked: true } };
+}
+
+// ---------------------------------------------------------------------------
+// B4 provisioning — audit trail
+// ---------------------------------------------------------------------------
+//
+// Provisioning is the most security-sensitive admin action on this surface (it
+// mints a credential), so every call is persisted to mcp_request_log AND
+// broadcast to the admin SSE feed via the same executeRawJsonb + broadcastEvent
+// pattern B2 used for /ingest denials. Both the success (200) and the
+// authorization-deny (403) paths produce a row.
+//
+// THE SECRET NEVER APPEARS. The audit params are built explicitly from
+// audit-safe identifiers (source_id, client_id, outcome) — result.body is never
+// spread, so the client_secret present on the 200 body cannot leak into a
+// persisted row or a broadcast payload. The test pins this.
+//
+// Extracted (not inlined in the route closure) so the audit write + secret
+// absence are unit-testable against in-process PGLite, with a `broadcast`
+// callback the test can spy on. This function NEVER throws — audit failure must
+// not turn a successful provision into a 500.
+export interface ProvisionAuditInput {
+  authInfo: Pick<AuthInfo, 'clientId' | 'clientName' | 'scopes'>;
+  /** Raw source_id from the request body — logged even when invalid. */
+  sourceId: unknown;
+  /** The outcome to audit. Accepts the route-level 403 deny as well as any
+   *  ProvisionSourceClientResult / RevokeSourceClientResult. */
+  result: { status: number; body: Record<string, unknown> };
+  latencyMs: number;
+  broadcast?: (event: Record<string, unknown>) => void;
+  /** Audit operation label. Defaults to 'provision-source-client'. The revoke
+   *  endpoint passes 'revoke-source-client'. */
+  operation?: string;
+  /** Explicit client_id to audit (the revoke endpoint passes the inbound
+   *  client_id so it is logged even on a deny/404, where result.body carries
+   *  no client_id). When omitted, falls back to result.body.client_id (the
+   *  provision endpoint's minted id). */
+  clientId?: unknown;
+}
+
+export async function recordProvisionAudit(engine: BrainEngine, input: ProvisionAuditInput): Promise<void> {
+  try {
+    const { authInfo, sourceId, result, latencyMs, broadcast } = input;
+    const operation = input.operation ?? 'provision-source-client';
+    const agentName = authInfo.clientName ?? authInfo.clientId;
+    const status = result.status === 200 ? 'success' : 'error';
+
+    // Build params from audit-safe identifiers ONLY. result.body is never
+    // spread — client_secret (present on the provision 200 body) must not be
+    // persisted. The explicit input.clientId wins (revoke audits the inbound id
+    // on every outcome); otherwise fall back to the result's client_id.
+    const clientId =
+      typeof input.clientId === 'string' && input.clientId.length > 0
+        ? input.clientId
+        : typeof result.body.client_id === 'string'
+          ? result.body.client_id
+          : undefined;
+
+    const params: Record<string, unknown> = {};
+    if (typeof sourceId === 'string') params.source_id = sourceId;
+    else params.invalid_input = true;
+    if (clientId !== undefined) params.client_id = clientId;
+    params.outcome = typeof result.body.error === 'string' ? result.body.error : 'success';
+
+    const errorMessage =
+      result.status === 200
+        ? null
+        : `${result.body.error ?? 'error'}: ${result.body.message ?? ''}`.trim();
+
+    try {
+      await executeRawJsonb(
+        engine,
+        `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [authInfo.clientId, agentName, operation, latencyMs, status, errorMessage],
+        [params],
+      );
+    } catch {
+      /* best effort — audit must never break the response */
+    }
+
+    if (broadcast) {
+      const event: Record<string, unknown> = {
+        agent: agentName,
+        operation,
+        scopes: authInfo.scopes.join(','),
+        latency_ms: latencyMs,
+        status,
+        timestamp: new Date().toISOString(),
+      };
+      if (typeof sourceId === 'string') event.source_id = sourceId;
+      if (clientId !== undefined) event.client_id = clientId;
+      if (status === 'error') {
+        event.error = { code: result.body.error, message: result.body.message };
+      }
+      broadcast(event);
+    }
+  } catch {
+    /* recordProvisionAudit never throws into the request path */
+  }
+}
+
+/**
+ * B7 two-DSN split (design D6). Resolve the PRIVILEGED connection the
+ * customer-plane serve-http uses for exactly two surfaces — the /admin/*
+ * handlers and the mcp_request_log audit writes — both of which touch tables
+ * the NOBYPASSRLS tenant role is denied (sources / oauth_clients writes,
+ * mcp_request_log).
+ *
+ * When GBRAIN_ADMIN_DATABASE_URL is unset (or points at the same DB, or the
+ * primary engine is not Postgres), this returns the primary engine itself — so
+ * single-plane deploys (Sean's box: one BYPASSRLS role, no admin DSN) are
+ * byte-identical to before B7. `owned: true` means a second pool was connected
+ * and the caller disconnects it on shutdown.
+ */
+export async function resolvePrivilegedEngine(
+  primary: BrainEngine,
+  primaryUrl: string | undefined,
+): Promise<{ engine: BrainEngine; owned: boolean }> {
+  const adminUrl = process.env.GBRAIN_ADMIN_DATABASE_URL?.trim();
+  if (!adminUrl || adminUrl === primaryUrl || primary.kind !== 'postgres') {
+    return { engine: primary, owned: false };
+  }
+  // Dynamic import keeps PostgresEngine out of the eager load on the common
+  // fallback path and sidesteps any import cycle through the command layer.
+  const { PostgresEngine } = await import('../core/postgres-engine.ts');
+  const { resolvePoolSize } = await import('../core/db.ts');
+  const adminEngine = new PostgresEngine();
+  // poolSize forces PostgresEngine.connect down the INSTANCE-pool path (its own
+  // postgres() client on adminUrl) instead of the process-wide module singleton.
+  // The PRIMARY engine connected first and already owns that singleton on the
+  // TENANT url; without poolSize this connect() would see it open and silently
+  // REUSE the tenant connection ("connect() called with a different database_url
+  // ... Using existing connection"), leaving the "privileged" engine RLS/
+  // permission-confined to the tenant role — the production twin of the
+  // 2026-06-04 T-INT harness bug (commit 44e5748a fixed only the test). Size it
+  // like the main pool (resolvePoolSize honors GBRAIN_POOL_SIZE) because this
+  // pool now serves per-request verifyAccessToken. disconnect() tears down the
+  // instance pool without touching the module singleton.
+  await adminEngine.connect({ engine: 'postgres', database_url: adminUrl, poolSize: resolvePoolSize() });
+  return { engine: adminEngine, owned: true };
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -439,14 +840,46 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // a postgres.js singleton, so `gbrain serve --http` works against PGLite
   // brains too. The narrow SqlQuery contract is scalar-binds-only; JSONB
   // writes use executeRawJsonb (see mcp_request_log INSERT sites below).
-  const sql = sqlQueryForEngine(engine);
+  // B7 two-DSN split (D6). `privilegedEngine` is the ADMIN/incumbent connection
+  // (GBRAIN_ADMIN_DATABASE_URL), used by EXACTLY the /admin/* handlers and the
+  // mcp_request_log audit writes. `engine` stays the TENANT pool that op
+  // dispatch runs through (wrapped in engine.withSourceScope). When no admin
+  // DSN is set, privilegedEngine === engine — single-plane deploys unchanged.
+  const { engine: privilegedEngine, owned: ownsPrivilegedEngine } =
+    await resolvePrivilegedEngine(engine, (config as { database_url?: string }).database_url);
+  if (ownsPrivilegedEngine) {
+    const closeAdmin = () => { void privilegedEngine.disconnect().catch(() => {}); };
+    process.once('SIGTERM', closeAdmin);
+    process.once('SIGINT', closeAdmin);
+  }
+
+  // `sql` is the PRIVILEGED handle — it serves the /admin/* dashboard + token
+  // CRUD routes and the startup banner (all admin-surface reads/writes against
+  // mcp_request_log / oauth_clients / access_tokens).
+  //
+  // The OAuth provider ALSO runs on the privileged handle. It is not a pure
+  // bearer-read: alongside resolving a bearer -> source (verifyAccessToken
+  // SELECT) it performs WRITES the NOBYPASSRLS tenant role is denied — the
+  // startup sweepExpiredTokens DELETE on oauth_tokens/oauth_codes, the legacy
+  // access_tokens last_used_at UPDATE inside verifyAccessToken, and token
+  // issuance / client registration / code consumption. b7-role.sql grants the
+  // tenant role SELECT-only on the oauth_* tables (design D6: "WRITES ride the
+  // privileged connection, never this role"), so running the provider on the
+  // tenant engine made the boot sweep log "permission denied for table
+  // oauth_tokens" and 401'd every legacy admin bearer on the last_used_at
+  // UPDATE. Routing the whole provider through privilegedEngine honors D6 and
+  // keeps its reads+writes on one role. On a single-plane deploy
+  // privilegedEngine === engine, so this is byte-identical to before for Sean's
+  // box; op dispatch still runs on `engine` (tenant) via engine.withSourceScope.
+  const sql = sqlQueryForEngine(privilegedEngine);
+  const oauthSql = sql;
 
   // Initialize OAuth provider. F12 cleanup: DCR-disable now flips a
   // constructor option instead of monkey-patching `_clientsStore` after
   // construction. Same outcome (no /register endpoint when --enable-dcr
   // is not passed); cleaner shape for tests and future maintainers.
   const oauthProvider = new GBrainOAuthProvider({
-    sql,
+    sql: oauthSql,
     tokenTtl,
     dcrDisabled: !enableDcr,
   });
@@ -927,7 +1360,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // exists but agent dispatch hasn't recorded anything.
   app.get('/admin/api/agents/spend', requireAdmin, async (_req: Request, res: Response) => {
     try {
-      const rows = await queryAgentClientSpend(engine);
+      const rows = await queryAgentClientSpend(privilegedEngine);
       res.json(rows);
     } catch (e) {
       // Pre-v0.38 brains: tables may not exist yet. Return empty so the UI
@@ -1314,6 +1747,94 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
+  // POST /admin/provision-source-client — B4 tenant provisioning (§4).
+  //
+  // Atomically creates a source (if absent) and a source-bound confidential
+  // oauth_client, returning {source_id, client_id, client_secret} once. The
+  // worker's provisioning saga calls this over HTTP with a sources_admin-scoped
+  // bearer (NOT the cookie admin session — this is a machine endpoint, not a
+  // browser one). Authorization mirrors the /mcp per-op pattern: authenticate
+  // with requireBearerAuth, then enforce scope through hasScope so the scope
+  // hierarchy holds (an `admin` bearer satisfies `sources_admin`; a literal
+  // requiredScopes:['sources_admin'] on the SDK middleware would reject it).
+  // Not localOnly — the worker reaches it over the network.
+  app.post(
+    '/admin/provision-source-client',
+    requireBearerAuth({ verifier: oauthProvider }),
+    express.json(),
+    async (req: Request, res: Response) => {
+      const startTime = Date.now();
+      const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
+      const reqSourceId = (req.body as Record<string, unknown> | undefined)?.source_id;
+      // Authorization deny is itself a security-relevant audit event.
+      if (!hasScope(authInfo.scopes, 'sources_admin')) {
+        const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
+        await recordProvisionAudit(privilegedEngine, {
+          authInfo, sourceId: reqSourceId, result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+        });
+        res.status(403).json(denied.body);
+        return;
+      }
+      let result: { status: number; body: Record<string, unknown> };
+      try {
+        result = await provisionSourceClient(privilegedEngine, oauthProvider, req.body);
+      } catch (e) {
+        // provisionSourceClient maps its own failures to {status, body}; an
+        // escape here is unexpected. Return a JSON envelope, never Express's
+        // default HTML error page (mirrors the /ingest F14 guard).
+        result = { status: 500, body: { error: 'provision_failed', message: e instanceof Error ? e.message : String(e) } };
+      }
+      // Audit every outcome (success + the in-function 400/409/500). The secret
+      // on the 200 body is never persisted — recordProvisionAudit builds params
+      // from audit-safe identifiers only.
+      await recordProvisionAudit(privilegedEngine, {
+        authInfo, sourceId: reqSourceId, result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+      });
+      res.status(result.status).json(result.body);
+    },
+  );
+
+  // POST /admin/revoke-source-client — B4 rotation / rollback seam.
+  //
+  // Disables a tenant's source-bound gbrain client (soft-delete + token purge)
+  // so the worker's reconciler can roll back a half-provisioned tenant and so
+  // rotation composes (revoke → next provision mints a fresh secret). Same auth
+  // shape as provision-source-client: requireBearerAuth + hasScope sources_admin.
+  // Hard-refuses the default source so the provisioning bearer can never disable
+  // Sean's own clients.
+  app.post(
+    '/admin/revoke-source-client',
+    requireBearerAuth({ verifier: oauthProvider }),
+    express.json(),
+    async (req: Request, res: Response) => {
+      const startTime = Date.now();
+      const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
+      const reqBody = req.body as Record<string, unknown> | undefined;
+      const reqSourceId = reqBody?.source_id;
+      const reqClientId = reqBody?.client_id;
+      if (!hasScope(authInfo.scopes, 'sources_admin')) {
+        const denied = { status: 403, body: { error: 'insufficient_scope', message: "requires 'sources_admin'" } };
+        await recordProvisionAudit(privilegedEngine, {
+          authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
+          result: denied, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+        });
+        res.status(403).json(denied.body);
+        return;
+      }
+      let result: { status: number; body: Record<string, unknown> };
+      try {
+        result = await revokeSourceClient(privilegedEngine, req.body);
+      } catch (e) {
+        result = { status: 500, body: { error: 'revoke_failed', message: e instanceof Error ? e.message : String(e) } };
+      }
+      await recordProvisionAudit(privilegedEngine, {
+        authInfo, operation: 'revoke-source-client', sourceId: reqSourceId, clientId: reqClientId,
+        result, latencyMs: Date.now() - startTime, broadcast: broadcastEvent,
+      });
+      res.status(result.status).json(result.body);
+    },
+  );
+
   // ---------------------------------------------------------------------------
   // SSE live activity feed
   // ---------------------------------------------------------------------------
@@ -1428,7 +1949,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const latency = Date.now() - startTime;
       try {
         await executeRawJsonb(
-          engine,
+          privilegedEngine,
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
@@ -1468,7 +1989,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
@@ -1500,7 +2021,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
@@ -1569,7 +2090,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       let toolResult: Awaited<ReturnType<typeof dispatchToolCall>>;
       try {
-        toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
+        // B7 chokepoint (design §B). Run op dispatch inside withSourceScope so
+        // every source-scoped read/write the op performs is confined to the
+        // token's source by the RLS policies (sql/b7-policies.sql): one
+        // transaction with app.current_source_id = tokenSourceId set
+        // transaction-locally. On the BYPASSRLS incumbent / single-plane role
+        // the GUC is inert (policies never evaluated), so behavior is unchanged.
+        toolResult = await engine.withSourceScope(tokenSourceId, (scopedEngine) =>
+          dispatchToolCall(scopedEngine, name, params as Record<string, unknown> | undefined, {
           remote: true,
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
@@ -1585,7 +2113,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             warn: (msg: string) => console.error(`[WARN] ${msg}`),
             error: (msg: string) => console.error(`[ERROR] ${msg}`),
           },
-        });
+        }));
       } catch (e) {
         // dispatchToolCall absorbs OperationError + Error and returns
         // isError:true; only an unexpected throw lands here. Treat as the
@@ -1596,7 +2124,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const errorPayload = serializeError(e);
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
@@ -1628,7 +2156,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         } catch { /* ignore */ }
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
             [authInfo.clientId, agentName, name, latency, 'error', errMsg],
@@ -1650,7 +2178,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       try {
         await executeRawJsonb(
-          engine,
+          privilegedEngine,
           `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [authInfo.clientId, agentName, name, latency, 'success'],
@@ -1739,10 +2267,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     'application/json',
   ]);
 
-  // Single MinionQueue instance shared across POST /ingest invocations
-  // (the queue is stateless beyond the engine handle; reusing avoids
-  // per-request construction).
-  const ingestQueue = new MinionQueue(engine);
+  // Single MinionQueue instance shared across POST /ingest invocations.
+  // D-INT-1 (privileged enqueue, approved 2026-06-04): bound to
+  // privilegedEngine, NOT the tenant `engine`. The enqueue writes minion_jobs,
+  // a CAT-6 infra table with no gbrain_tenant grant (sql/b7-role.sql, design
+  // D2), so on the customer plane a tenant-pool INSERT is permission-denied;
+  // it must run on the privileged/incumbent connection, mirroring the
+  // mcp_request_log audit write. The queue is stateless beyond the engine
+  // handle; reusing the instance avoids per-request construction.
+  const ingestQueue = new MinionQueue(privilegedEngine);
 
   app.post(
     '/ingest',
@@ -1835,7 +2368,60 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
+      // B2 write-seal: source_id is the token's write authority
+      // (authInfo.sourceId), NEVER the client-supplied x-gbrain-source-id
+      // header. A header that differs is a cross-source write attempt → deny
+      // + audit-log (acceptance: identity comes from the token alone; denials
+      // are audit-logged). Pre-fix this line read the header directly, the
+      // likeliest cross-tenant bleed on the write side.
+      const sourceDecision = resolveIngestSourceId(authInfo, req.header('x-gbrain-source-id'));
+      if (!sourceDecision.ok) {
+        // Audit the denial through the same surfaces as every other /ingest
+        // and /mcp rejection: a persisted mcp_request_log row (status 'error',
+        // so the admin error-rate query at the /admin/api/health-indicators
+        // route counts it) + the live SSE feed + a stderr line. The persisted
+        // params carry ONLY the source decision, never the rejected body — the
+        // write never happened and the payload is untrusted network input.
+        const latency = Date.now() - startTime;
+        try {
+          await executeRawJsonb(
+            privilegedEngine,
+            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+            [
+              authInfo.clientId,
+              agentName,
+              'webhook_ingest',
+              latency,
+              'error',
+              `source_forbidden: attempted ${JSON.stringify(sourceDecision.attempted)} authorized ${JSON.stringify(sourceDecision.authorized)}`,
+            ],
+            [{ attempted_source: sourceDecision.attempted, authorized_source: sourceDecision.authorized }],
+          );
+        } catch { /* best effort */ }
+        broadcastEvent({
+          agent: agentName,
+          operation: 'webhook_ingest',
+          scopes: authInfo.scopes.join(','),
+          latency_ms: latency,
+          status: 'error',
+          error: { code: 'source_forbidden', message: 'cross-source write blocked' },
+          timestamp: new Date().toISOString(),
+        });
+        console.error(
+          `[INGEST-DENY] cross-source write blocked client_id=${authInfo.clientId} ` +
+          `attempted_source=${JSON.stringify(sourceDecision.attempted)} ` +
+          `authorized_source=${JSON.stringify(sourceDecision.authorized)}`,
+        );
+        res.status(403).json({
+          error: 'source_forbidden',
+          message:
+            'x-gbrain-source-id does not match the source this token is authorized to write. ' +
+            'Omit the header — ingestion is scoped to your token’s source.',
+        });
+        return;
+      }
+      const sourceId = sourceDecision.sourceId;
       const callerSlug = req.header('x-gbrain-slug');
 
       const event: IngestionEvent = {
@@ -1866,6 +2452,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
+        // B7 (design §B) + D-INT-1 (privileged enqueue, approved 2026-06-04).
+        // The /ingest request-path DB write is the minion_jobs ENQUEUE — the
+        // actual page write is deferred to the ingest_capture worker, which
+        // runs on the background / BYPASSRLS plane, so RLS does not bite there.
+        // Source authority is already sealed into event.source_id by the B2
+        // write-seal (resolveIngestSourceId above), so the enqueue itself is
+        // infra plumbing, not tenant content — RLS confinement of it buys
+        // nothing.
+        //
+        // DECISION D-INT-1: the enqueue runs on privilegedEngine (the shared
+        // ingestQueue is bound to it), exactly like the mcp_request_log audit
+        // write three lines below. minion_jobs is a CAT-6 infra table with NO
+        // gbrain_tenant grant (sql/b7-role.sql, design D2); on the customer
+        // plane a tenant-pool INSERT would be permission-denied. This keeps
+        // minion_jobs CAT-6-excluded — no new policy, no schema change. The
+        // prior withSourceScope wrap is dropped: the privileged role bypasses
+        // RLS, so setting app.current_source_id around the write was symbolic.
         const job = await ingestQueue.add(
           'ingest_capture',
           {
@@ -1887,7 +2490,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const latency = Date.now() - startTime;
         try {
           await executeRawJsonb(
-            engine,
+            privilegedEngine,
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
              VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
             [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],
