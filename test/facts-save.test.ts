@@ -32,7 +32,7 @@ let engine: PGLiteEngine;
 const TEST_SOURCES = [
   'tenant-a', 'tenant-dedup', 'tenant-near', 'tenant-batchdup',
   'tenant-validate', 'tenant-atomic', 'tenant-x', 'tenant-y',
-  'tenant-entity', 'tenant-rel',
+  'tenant-entity', 'tenant-rel', 'tenant-restricted',
 ];
 
 beforeAll(async () => {
@@ -419,6 +419,90 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     );
     if ('error' in saved) throw new Error('unexpected validation error');
     expect((await readFactRaw(saved.fact_ids[0])).entity_slug).toBeNull();
+  });
+});
+
+describe('save_facts — restricted-data scrub (drop one, keep the batch)', () => {
+  test('drops a Luhn-valid card claim, keeps the clean claims, counts it in `dropped`', async () => {
+    const res = await runSaveFacts(
+      [
+        { claim: 'Dana prefers async standups', provenance: 'user_stated' },
+        { claim: 'Dana card 4111 1111 1111 1111', provenance: 'user_stated' },
+        { claim: 'Dana is based in Denver', provenance: 'user_stated' },
+      ],
+      { engine, sourceId: 'tenant-restricted' },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    // Card claim dropped; the other two saved. The batch is NOT rejected.
+    expect(res.inserted).toBe(2);
+    expect(res.dropped).toBe(1);
+    expect(res.fact_ids).toHaveLength(2);
+    // Only the two clean rows landed in the table; the card value never persisted.
+    expect(await countFacts('tenant-restricted')).toBe(2);
+    const texts = await engine.executeRaw<{ fact: string }>(
+      `SELECT fact FROM facts WHERE source_id = $1`,
+      ['tenant-restricted'],
+    );
+    expect(texts.some(t => t.fact.includes('4111'))).toBe(false);
+    expect(texts.some(t => t.fact.includes('async standups'))).toBe(true);
+  });
+
+  test('drops a formatted SSN claim', async () => {
+    const res = await runSaveFacts(
+      [{ claim: 'his ssn is 123-45-6789', provenance: 'user_stated' }],
+      { engine, sourceId: 'tenant-restricted' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.inserted).toBe(0);
+    expect(res.dropped).toBe(1);
+    expect(res.fact_ids).toHaveLength(0);
+  });
+
+  test('a bare 9-digit invoice number with no SSN context is SAVED', async () => {
+    const res = await runSaveFacts(
+      [{ claim: 'invoice 123456789 is paid', provenance: 'user_stated' }],
+      { engine, sourceId: 'tenant-restricted' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.inserted).toBe(1);
+    expect(res.dropped).toBe(0);
+  });
+
+  test('a batch that is entirely restricted returns inserted:0, dropped:N (not a batch error)', async () => {
+    const res = await runSaveFacts(
+      [
+        { claim: 'sk-AbCd1234EfGh5678IjKl9012mnop', provenance: 'user_stated' },
+        { claim: 'card 4111111111111111', provenance: 'user_stated' },
+      ],
+      { engine, sourceId: 'tenant-restricted' },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    expect(res.inserted).toBe(0);
+    expect(res.dropped).toBe(2);
+  });
+
+  test('clean batch reports dropped:0', async () => {
+    const res = await runSaveFacts(
+      [{ claim: 'Dana likes hiking', provenance: 'user_stated' }],
+      { engine, sourceId: 'tenant-restricted' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.dropped).toBe(0);
+  });
+
+  test('the MCP save_facts op surfaces `dropped` in its payload', async () => {
+    const r = await dispatchToolCall(
+      engine,
+      'save_facts',
+      { claims: [{ claim: 'card 4111-1111-1111-1111', provenance: 'user_stated' }] },
+      { remote: true, sourceId: 'tenant-restricted' },
+    );
+    expect(r.isError).toBeFalsy();
+    const payload = JSON.parse(r.content[0].text);
+    expect(payload.dropped).toBe(1);
+    expect(payload.inserted).toBe(0);
   });
 });
 

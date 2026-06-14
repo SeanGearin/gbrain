@@ -34,6 +34,7 @@
 import { z } from 'zod';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
+import { scanRestrictedData, logRestrictedDrop } from './restricted-data.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
 import { resolveEntitySlug } from '../entities/resolve.ts';
@@ -76,6 +77,13 @@ export type SaveFactsResult =
   | {
       inserted: number;
       duplicate: number;
+      /**
+       * Claims dropped by the restricted-data scrub (PCI card / SSN /
+       * credential). These are NOT inserted and NOT counted as duplicates;
+       * the rest of the batch proceeds. Always present (0 when nothing was
+       * dropped). The dropped value itself is never returned or logged.
+       */
+      dropped: number;
       fact_ids: number[];
       /**
        * Which dedup layers were active for this batch:
@@ -161,6 +169,7 @@ export async function runSaveFacts(
   // of itself. Each surviving claim carries its sanitized `cleaned` text
   // forward; the insert loop never re-sanitizes.
   const claims: Array<{ claim: ValidClaim; cleaned: string }> = [];
+  let dropped = 0;
   for (let i = 0; i < rawClaims.length; i++) {
     const parsed = ClaimSchema.safeParse(rawClaims[i]);
     if (!parsed.success) {
@@ -180,6 +189,18 @@ export async function runSaveFacts(
         failed_index: i,
         detail: `claim[${i}].claim: empty after sanitization`,
       };
+    }
+    // Restricted-data scrub (PCI card / SSN / credential). Distinct from the
+    // whole-batch reject above: a well-formed claim that happens to carry
+    // restricted data is DROPPED (kept out of `claims`, never inserted) while
+    // the rest of the batch proceeds — partial save beats a hard error for a
+    // memory tool. Conservative, high-signal only; the value is never logged.
+    // See facts/restricted-data.ts.
+    const restricted = scanRestrictedData(cleaned);
+    if (restricted.restricted && restricted.category) {
+      logRestrictedDrop(restricted.category, 'mcp:save_facts');
+      dropped += 1;
+      continue;
     }
     claims.push({ claim: parsed.data, cleaned });
   }
@@ -283,5 +304,5 @@ export async function runSaveFacts(
     else duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
   }
 
-  return { inserted, duplicate, fact_ids, dedup_mode };
+  return { inserted, duplicate, dropped, fact_ids, dedup_mode };
 }

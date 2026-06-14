@@ -23,6 +23,8 @@
  * module itself.
  */
 
+import { luhnOk } from './luhn.ts';
+
 const REDACTED = '[REDACTED]';
 
 // Emails: RFC-5322-adjacent. Keeps the host so replay debug can say "an
@@ -50,22 +52,6 @@ const BEARER_RE = /\b(?:bearer|Bearer)\s+[A-Za-z0-9._~+/-]{10,}=*/g;
 // Credit card numbers: 13–19 digits with optional spaces/dashes. Every
 // match must pass Luhn to qualify — this is the key false-positive guard.
 const CC_RE = /(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)/g;
-
-/** Luhn mod-10 check. Returns true when the digit sequence is a valid card number. */
-function luhnOk(digits: string): boolean {
-  let sum = 0;
-  let parity = digits.length % 2;
-  for (let i = 0; i < digits.length; i++) {
-    let n = digits.charCodeAt(i) - 48;
-    if (n < 0 || n > 9) return false;
-    if (i % 2 === parity) {
-      n *= 2;
-      if (n > 9) n -= 9;
-    }
-    sum += n;
-  }
-  return sum % 10 === 0;
-}
 
 /**
  * Redact obvious PII from a captured query string.

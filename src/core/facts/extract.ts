@@ -24,6 +24,7 @@
 import { chat, embedOne, isAvailable } from '../ai/gateway.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
+import { scanRestrictedData, logRestrictedDrop } from './restricted-data.ts';
 import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
@@ -225,6 +226,18 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
     // Sanitize on the way OUT too.
     for (const p of INJECTION_PATTERNS) factText = factText.replace(p.rx, p.replacement);
     if (factText.length > 500) factText = factText.slice(0, 497) + '...';
+
+    // Restricted-data scrub (PCI card / SSN / credential). Runs at this same
+    // post-structuring, pre-insert seam as INJECTION_PATTERNS and BEFORE the
+    // embed call + the fence/DB write downstream, so a hit never persists to
+    // the markdown system-of-record or the facts table. Conservative,
+    // high-signal only — drop the offending claim, keep the rest of the turn,
+    // log the category (never the value). See facts/restricted-data.ts.
+    const restricted = scanRestrictedData(factText);
+    if (restricted.restricted && restricted.category) {
+      logRestrictedDrop(restricted.category, input.source);
+      continue;
+    }
 
     const kind = ALL_EXTRACT_KINDS.includes(candidate.kind as FactKind)
       ? (candidate.kind as FactKind)

@@ -17,6 +17,11 @@
 
 import { describe, test, expect } from 'bun:test';
 import { extractFactsFromTurn, parseExtractorJson } from '../src/core/facts/extract.ts';
+import {
+  __setChatTransportForTests,
+  resetGateway,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
 
 describe('extractFactsFromTurn', () => {
   test('empty turn returns no facts', async () => {
@@ -114,5 +119,79 @@ describe('parseExtractorJson — B1 parser-pin (v0.31.2 ship-blocker fix)', () =
     const parsed = parseExtractorJson(raw);
     expect(parsed).not.toBeNull();
     expect(parsed![0].notability).toBe('high');
+  });
+});
+
+/**
+ * Restricted-data scrub on the LLM (extract_facts / conversation) plane. The
+ * scrub runs inside extractFactsFromTurn on each extracted claim, so a card /
+ * SSN / credential the model surfaces is dropped before it can be embedded,
+ * fenced to disk, or inserted. Gateway is stubbed so the test is deterministic
+ * (no key, no network); the stub flips isAvailable('chat') true.
+ */
+describe('extractFactsFromTurn — restricted-data scrub', () => {
+  function stubChat(
+    facts: Array<{ fact: string; kind: string; notability: 'high' | 'medium' | 'low'; entity?: string | null }>,
+  ) {
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: JSON.stringify({
+        facts: facts.map(f => ({
+          fact: f.fact,
+          kind: f.kind,
+          entity: f.entity ?? null,
+          confidence: 1.0,
+          notability: f.notability,
+        })),
+      }),
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    }));
+  }
+
+  test('drops a card-bearing extracted claim, keeps the clean one', async () => {
+    stubChat([
+      { fact: 'paid with 4111 1111 1111 1111', kind: 'fact', notability: 'high' },
+      { fact: 'alice-example moved to Berlin', kind: 'event', notability: 'high' },
+    ]);
+    try {
+      const facts = await extractFactsFromTurn({ turnText: 'a turn', source: 'mcp:extract_facts' });
+      expect(facts.map(f => f.fact)).toEqual(['alice-example moved to Berlin']);
+      expect(facts.some(f => f.fact.includes('4111'))).toBe(false);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('drops SSN-bearing and credential-bearing claims, keeps the clean one', async () => {
+    stubChat([
+      { fact: 'his ssn is 123-45-6789', kind: 'fact', notability: 'high' },
+      { fact: 'api key sk-AbCd1234EfGh5678IjKl9012mnop', kind: 'fact', notability: 'high' },
+      { fact: 'bob-example is hiring two engineers', kind: 'event', notability: 'high' },
+    ]);
+    try {
+      const facts = await extractFactsFromTurn({ turnText: 'a turn', source: 'mcp:extract_facts' });
+      expect(facts.map(f => f.fact)).toEqual(['bob-example is hiring two engineers']);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
+  });
+
+  test('a clean turn keeps every extracted claim', async () => {
+    stubChat([
+      { fact: 'invoice 123456789 was paid', kind: 'fact', notability: 'medium' },
+      { fact: 'the deal closed at $4,532', kind: 'fact', notability: 'medium' },
+    ]);
+    try {
+      const facts = await extractFactsFromTurn({ turnText: 'a turn', source: 'mcp:extract_facts' });
+      expect(facts).toHaveLength(2);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+    }
   });
 });
