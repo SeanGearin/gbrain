@@ -63,6 +63,16 @@
  *        NOT 42501 / poison the dispatch tx (the exact search_brain/query path
  *        that returned brain_unavailable; also the guard on PUBLIC EXECUTE of
  *        the reader fn)
+ *   P-13e writer-fix + forced Layer-2: store() writes page_generations as a
+ *        JSONB OBJECT (Fix B — raw-object bind, not the pre-fix double-encoded
+ *        string scalar), and a cache MISS (clock bumped between store and lookup)
+ *        drives jsonb_each(page_generations) on real postgres.js WITHOUT throwing
+ *        — the Layer-2 path P-13d's Layer-1 hit never reached, and the encode
+ *        PGLite hides. Asserts jsonb_typeof = 'object' after store + a served hit.
+ *   P-13f shape-guard: a legacy double-encoded (string-scalar) page_generations
+ *        row — the shape EVERY pre-fix prod row carries — invalidates CLEANLY on
+ *        a forced Layer-2 eval (Fix A — jsonb_typeof guard short-circuits before
+ *        jsonb_each) instead of raising 22023 and poisoning the dispatch tx
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from 'postgres';
@@ -70,7 +80,7 @@ import { execSync } from 'child_process';
 import { join } from 'path';
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
-import { SemanticQueryCache } from '../../src/core/search/query-cache.ts';
+import { SemanticQueryCache, cacheRowId } from '../../src/core/search/query-cache.ts';
 import type { SearchResult, HybridSearchMeta } from '../../src/core/types.ts';
 
 const DB = process.env.GBRAIN_B8_DATABASE_URL;
@@ -639,6 +649,185 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
         expect(hit.hit).toBe(true);
         // And the dispatch tx must NOT be poisoned: a later statement still runs
         // (pre-fix this threw 25P02 "current transaction is aborted").
+        const ok = await e.executeRaw<{ ok: number }>(`SELECT 1 AS ok`);
+        expect(Number(ok[0]?.ok)).toBe(1);
+      });
+    } finally {
+      await tenantEngine.disconnect();
+    }
+  });
+
+  test('P-13e writer-fix + forced Layer-2: page_generations stores as a JSONB object and a cache MISS runs jsonb_each without throwing (the path PGLite hides)', async () => {
+    // P-13d proved the clock-reader fn survives under the tenant, but its
+    // lookup() hit via LAYER 1 — no page write between store and lookup, so the
+    // gate's `clock <= max_generation_at_store` short-circuited the OR BEFORE
+    // jsonb_each ever ran. The double-encode bug only fires on LAYER 2: a cache
+    // MISS where the clock advanced, so the gate evaluates
+    // jsonb_each(qc.page_generations). Pre-fix, store() bound page_generations as
+    // JSON.stringify(...) into $9::jsonb; postgres.js double-encoded that into a
+    // JSONB STRING SCALAR (PGLite parses it back, hiding the bug). jsonb_each on a
+    // non-object raises 22023 → aborts the withSourceScope dispatch tx (25P02) →
+    // search_brain/query returns brain_unavailable. This drives that exact Layer-2
+    // path on real Postgres as gbrain_tenant; Fix B (raw-object bind) is what
+    // makes the column an object, and this is its end-to-end proof.
+    const [{ dim }] = await admin`
+      SELECT atttypmod AS dim FROM pg_attribute
+      WHERE attrelid = 'query_cache'::regclass AND attname = 'embedding'`;
+    const D = Number(dim) > 0 ? Number(dim) : 1536;
+    // Seed 11 — orthogonal to P-13d's emb(1)/emb(2), so this lookup matches ONLY
+    // this row (cosine distance 0 to itself, 1 to those).
+    const emb = (seed: number): Float32Array => {
+      const e = new Float32Array(D);
+      e[seed % D] = 1;
+      return e;
+    };
+    const META: HybridSearchMeta = {
+      vector_enabled: true,
+      detail_resolved: 'medium',
+      expansion_applied: false,
+      intent: 'general',
+    };
+    const resultWithPage: SearchResult[] = [{
+      slug: 'people/a-one',
+      page_id: aPageId,
+      title: 'A One',
+      type: 'person',
+      chunk_text: 'alpha chunk',
+      chunk_source: 'compiled_truth',
+      chunk_id: 1,
+      chunk_index: 0,
+      score: 1,
+      stale: false,
+    }];
+    const QTEXT = 'p13e writer-fix layer2 miss';
+    const rowId = cacheRowId(QTEXT, A, '');
+
+    const tenantEngine = new PostgresEngine();
+    await tenantEngine.connect({ engine: 'postgres', database_url: tenantUrl(DB as string), poolSize: 2 });
+    try {
+      await tenantEngine.withSourceScope(A, async (e) => {
+        const cache = new SemanticQueryCache(e);
+
+        // 1) store() with a real page → snapshot {aPageId: gen}, bookmark = clock
+        //    value at store time (C0).
+        await cache.store(QTEXT, emb(11), resultWithPage, META, { sourceId: A });
+
+        // 2) WRITER-FIX PROOF (Fix B): page_generations round-tripped as a JSONB
+        //    OBJECT, not the pre-fix string scalar. Read inside this tx — the row
+        //    is uncommitted until the block returns, so a separate admin
+        //    connection could not see it yet.
+        const shape = await e.executeRaw<{ t: string | null }>(
+          `SELECT jsonb_typeof(page_generations) AS t FROM query_cache WHERE id = $1`,
+          [rowId],
+        );
+        expect(shape[0]?.t).toBe('object');
+
+        // 3) Force LAYER 2: bump the global page_generation_clock with an
+        //    unrelated own-source page INSERT (allowed for the tenant; bumps the
+        //    per-statement clock). aPageId is untouched → its stored generation
+        //    stays valid, so the gate SERVES the row rather than invalidating it.
+        await e.executeRaw(
+          `INSERT INTO pages (source_id, slug, type, title)
+           VALUES ($1, 'people/p13e-clockbump', 'person', 'Clock Bump')`,
+          [A],
+        );
+
+        // 4) lookup() now takes the MISS→Layer-2 branch: Layer 1 fails (clock >
+        //    C0), so the gate evaluates jsonb_each(page_generations). Pre-fix this
+        //    threw on the string scalar; post-fix the object iterates, aPageId
+        //    still matches → row served. No throw, rows return.
+        const hit = await cache.lookup(emb(11), { sourceId: A });
+        expect(hit.hit).toBe(true);
+
+        // 5) results/meta still round-trip — the writer-fix changed ONLY $9
+        //    (page_generations); $6/$7 (results/meta) bind unchanged. Pins that
+        //    scope claim on the read side.
+        expect(hit.results?.[0]?.page_id).toBe(aPageId);
+        expect(hit.results?.[0]?.slug).toBe('people/a-one');
+        expect(hit.meta?.intent).toBe('general');
+
+        // 6) The dispatch tx is intact — a later statement still runs (pre-fix the
+        //    jsonb_each throw left it aborted: 25P02 "current transaction is
+        //    aborted" on the next statement).
+        const ok = await e.executeRaw<{ ok: number }>(`SELECT 1 AS ok`);
+        expect(Number(ok[0]?.ok)).toBe(1);
+      });
+    } finally {
+      await tenantEngine.disconnect();
+    }
+  });
+
+  test('P-13f shape-guard: a legacy double-encoded (string-scalar) page_generations row invalidates cleanly on forced Layer-2 — no jsonb_each throw, dispatch tx survives', async () => {
+    // Fix A defends the rows ALREADY on the box. Every query_cache row the
+    // pre-fix store() wrote since v0.40.3.0 carries page_generations as a JSONB
+    // STRING SCALAR (the double-encode). Fix B stops NEW bad rows; Fix A keeps the
+    // EXISTING ones from crashing search until they age out by TTL (no migration).
+    // This reproduces that exact shape and proves the guard: on a forced Layer-2
+    // evaluation the row invalidates CLEANLY (clean miss → re-query) instead of
+    // raising "cannot call jsonb_each on a non-object" (22023) and poisoning the
+    // withSourceScope dispatch tx (25P02 → brain_unavailable).
+    const [{ dim }] = await admin`
+      SELECT atttypmod AS dim FROM pg_attribute
+      WHERE attrelid = 'query_cache'::regclass AND attname = 'embedding'`;
+    const D = Number(dim) > 0 ? Number(dim) : 1536;
+    // Seed 17 — orthogonal to P-13d (1,2) and P-13e (11).
+    const emb = (seed: number): Float32Array => {
+      const e = new Float32Array(D);
+      e[seed % D] = 1;
+      return e;
+    };
+    const META: HybridSearchMeta = {
+      vector_enabled: true,
+      detail_resolved: 'medium',
+      expansion_applied: false,
+      intent: 'general',
+    };
+    const resultWithPage: SearchResult[] = [{
+      slug: 'people/a-one',
+      page_id: aPageId,
+      title: 'A One',
+      type: 'person',
+      chunk_text: 'alpha chunk',
+      chunk_source: 'compiled_truth',
+      chunk_id: 1,
+      chunk_index: 0,
+      score: 1,
+      stale: false,
+    }];
+    const QTEXT = 'p13f legacy string-scalar guard';
+    const rowId = cacheRowId(QTEXT, A, '');
+
+    const tenantEngine = new PostgresEngine();
+    await tenantEngine.connect({ engine: 'postgres', database_url: tenantUrl(DB as string), poolSize: 2 });
+    try {
+      // 1) Seed a PROPER (post-fix, object-shaped) row via the cache; commits on
+      //    block exit so the admin connection below can see + mutate it.
+      await tenantEngine.withSourceScope(A, async (e) => {
+        await new SemanticQueryCache(e).store(QTEXT, emb(17), resultWithPage, META, { sourceId: A });
+      });
+
+      // 2) Rewrite it (admin / BYPASSRLS) into the EXACT pre-fix double-encode
+      //    shape: object → its JSON text → wrapped as a JSONB string scalar, the
+      //    same shape postgres.js produced from JSON.stringify(...)::jsonb. And
+      //    zero the bookmark so Layer 1 ALWAYS fails (clock value on a populated
+      //    brain is > 0) → the lookup is deterministically forced into Layer 2.
+      const before = await admin`SELECT jsonb_typeof(page_generations) AS t FROM query_cache WHERE id = ${rowId}`;
+      expect(before[0]?.t).toBe('object'); // sanity: the fixed writer produced an object
+      await admin`UPDATE query_cache
+                     SET page_generations = to_jsonb(page_generations::text),
+                         max_generation_at_store = 0
+                   WHERE id = ${rowId}`;
+      const after = await admin`SELECT jsonb_typeof(page_generations) AS t FROM query_cache WHERE id = ${rowId}`;
+      expect(after[0]?.t).toBe('string'); // now the legacy crash shape
+
+      // 3) lookup() as gbrain_tenant inside withSourceScope → forced Layer 2 on the
+      //    string scalar. jsonb_typeof(page_generations) = 'object' is FALSE, so
+      //    the guard short-circuits BEFORE jsonb_each: clean miss, no throw.
+      await tenantEngine.withSourceScope(A, async (e) => {
+        const hit = await new SemanticQueryCache(e).lookup(emb(17), { sourceId: A });
+        expect(hit.hit).toBe(false);
+        // Dispatch tx not poisoned — pre-Fix-A the jsonb_each throw left it
+        // aborted, and this next statement would raise 25P02.
         const ok = await e.executeRaw<{ ok: number }>(`SELECT 1 AS ok`);
         expect(Number(ok[0]?.ok)).toBe(1);
       });

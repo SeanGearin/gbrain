@@ -178,8 +178,19 @@ export const CACHE_GATE_WHERE_CLAUSE = `
     -- they invalidate when Layer 1 fails (D20 / codex CDX-6 fix). Per-page
     -- mismatch (page deleted via LEFT JOIN p.id IS NULL, or page generation
     -- bumped) invalidates.
+    --
+    -- Shape-guard (jsonb_typeof = 'object'): legacy rows written by the
+    -- pre-fix store() double-encoded page_generations into a JSONB *string
+    -- scalar* on postgres.js (the JSON.stringify-into-::jsonb footgun). Calling
+    -- jsonb_each on a non-object throws "cannot call jsonb_each on a non-object",
+    -- which aborts the withSourceScope dispatch tx → brain_unavailable. The
+    -- typeof check short-circuits before jsonb_each so any non-object shape
+    -- (string/array/null) fails Layer 2 cleanly (row invalidates → re-query)
+    -- instead of throwing. Engine-neutral: no-op on PGLite (always an object),
+    -- gates the bad shape on Postgres. Such rows age out by TTL; no migration.
     (
-      qc.page_generations <> '{}'::jsonb
+      jsonb_typeof(qc.page_generations) = 'object'
+      AND qc.page_generations <> '{}'::jsonb
       AND NOT EXISTS (
         SELECT 1
         FROM jsonb_each(qc.page_generations) AS g(page_id, stored_gen)

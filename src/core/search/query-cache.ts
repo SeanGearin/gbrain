@@ -230,10 +230,20 @@ export class SemanticQueryCache {
       // so ON CONFLICT (id) DO UPDATE just refreshes the same-mode row.
       //
       // v0.40.3.0: page_generations JSONB + max_generation_at_store BIGINT
-      // stamped per D11 (cache invalidation gate). page_generations is
-      // sent as a JSON.stringify and cast to JSONB inside the SQL; pre-v91
-      // brains store an empty `{}` + zero bookmark (legacy compat per
-      // the v0.40.3.0 IRON-RULE).
+      // stamped per D11 (cache invalidation gate); pre-v91 brains store an
+      // empty `{}` + zero bookmark (legacy compat per the v0.40.3.0 IRON-RULE).
+      //
+      // page_generations ($9) is bound as a RAW OBJECT (NOT JSON.stringify'd)
+      // into the $9::jsonb cast. The object-positional contract — postgres.js
+      // unsafe(sql, params) / PGLite db.query(sql, params), same path as
+      // executeRawJsonb — encodes a JS object to a proper JSONB OBJECT. Passing
+      // JSON.stringify(...) instead double-encodes it into a JSONB STRING SCALAR
+      // on postgres.js (PGLite hides it), and the gate's jsonb_each(page_generations)
+      // then throws "cannot call jsonb_each on a non-object" on a cache MISS,
+      // aborting the dispatch tx → brain_unavailable. results/meta ($6/$7) stay
+      // JSON.stringify'd: they are double-encoded too but consumed only in JS via
+      // safeJsonParse (never by in-SQL jsonb_each), so the shape is harmless there.
+      // ONLY $9's encoding changes here.
       //
       // v0.40.6 (B7 tenant query_cache fix): wrap the INSERT in
       // engine.transaction() so a failed cache write cannot abort the
@@ -270,7 +280,9 @@ export class SemanticQueryCache {
           JSON.stringify(results),
           JSON.stringify(meta),
           ttl,
-          JSON.stringify(snapshot.page_generations),
+          // Raw object (NOT JSON.stringify) → $9::jsonb stores a proper JSONB
+          // object via the object-positional contract. See comment above.
+          snapshot.page_generations,
           snapshot.max_generation_at_store,
         ],
       ));
