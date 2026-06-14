@@ -247,6 +247,25 @@ CREATE TRIGGER bump_page_generation_clock_trg
   FOR EACH STATEMENT
   EXECUTE FUNCTION bump_page_generation_clock_fn();
 
+-- Read-side sibling of the writer above. The query-cache two-layer freshness
+-- gate (src/core/search/query-cache-gate.ts) reads this clock as the INVOKING
+-- role at three sites (the lookup WHERE clause + the store-time snapshot). The
+-- customer-plane gbrain_tenant role has NO grant on page_generation_clock
+-- (CAT-6 by exclusion), so an inline \`SELECT … FROM page_generation_clock\`
+-- raises 42501, which aborts the withSourceScope dispatch tx (25P02) and
+-- surfaces as brain_unavailable on search_brain/query. Routing the read through
+-- a SECURITY DEFINER reader runs it as the BYPASSRLS owner (which holds the
+-- grant); PUBLIC keeps the default EXECUTE so the tenant can call it. STABLE:
+-- reads, never writes. Do NOT inline this back into a bare subquery — that
+-- reintroduces the 42501. Must stay SECURITY DEFINER + pinned search_path at
+-- EVERY site (this file, schema-embedded.ts (generated), migrate.ts v115,
+-- pglite-schema.ts); CREATE OR REPLACE resets attributes on every initSchema
+-- replay. Pinned by P-13c in test/e2e/b8-rls-proof.test.ts.
+CREATE OR REPLACE FUNCTION page_generation_clock_value() RETURNS bigint
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS \$\$
+  SELECT COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)::bigint
+\$\$;
+
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);

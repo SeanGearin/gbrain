@@ -5166,6 +5166,33 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE facts ADD COLUMN IF NOT EXISTS client_authored BOOLEAN NOT NULL DEFAULT FALSE;
     `,
   },
+  {
+    version: 115,
+    name: 'page_generation_clock_value_reader_fn',
+    // Read-path companion to v107's writer fix. v107 made the WRITE-side trigger
+    // function (bump_page_generation_clock_fn) SECURITY DEFINER so tenant DML on
+    // `pages` didn't 42501 on the no-grant page_generation_clock table. But the
+    // query-cache freshness gate (src/core/search/query-cache-gate.ts) ALSO
+    // reads that clock — inline, as the invoking role — at three sites (the
+    // lookup WHERE + the store-time snapshot). Under the customer-plane
+    // gbrain_tenant role those reads raise 42501, which aborts the
+    // withSourceScope dispatch tx (25P02) and returns brain_unavailable from
+    // search_brain/query. The fix routes all three reads through this STABLE
+    // SECURITY DEFINER reader (runs as the BYPASSRLS owner; PUBLIC keeps default
+    // EXECUTE so the tenant can call it). Idempotent CREATE OR REPLACE; the
+    // durable definition also lives in schema.sql -> schema-embedded.ts (replayed
+    // at every startup) and pglite-schema.ts. This migration brings already-
+    // running brains to the same definition without waiting for a restart replay.
+    // Pinned by P-13c (source) + P-13d (tenant read-survival) in
+    // test/e2e/b8-rls-proof.test.ts.
+    idempotent: true,
+    sql: `
+      CREATE OR REPLACE FUNCTION page_generation_clock_value() RETURNS bigint
+        LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+        SELECT COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)::bigint
+      $$;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

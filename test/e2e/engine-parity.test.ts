@@ -149,6 +149,28 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(pgResults[0]?.slug).toBe(pgliteResults[0]?.slug);
   });
 
+  test('page_generation_clock_value() reader fn exists + is callable on both engines', async () => {
+    // The query-cache freshness gate now calls page_generation_clock_value()
+    // instead of an inline `SELECT … FROM page_generation_clock` (the tenant-
+    // plane 42501 read-path fix). The fn MUST exist on BOTH engines or the gate
+    // SQL fails to resolve. SECURITY DEFINER is load-bearing on Postgres (the
+    // gbrain_tenant customer plane) and inert-but-present on PGLite (single role).
+    for (const [label, eng] of [
+      ['postgres', pgEngine],
+      ['pglite', pgliteEngine],
+    ] as const) {
+      const rows = await eng.executeRaw<{ prosecdef: boolean }>(
+        `SELECT p.prosecdef
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE p.proname = 'page_generation_clock_value' AND n.nspname = 'public'`,
+      );
+      expect(rows.length).toBe(1);
+      const v = await eng.executeRaw<{ v: number }>(`SELECT page_generation_clock_value() AS v`);
+      expect(Number(v[0]?.v)).toBeGreaterThanOrEqual(0);
+      if (label === 'postgres') expect(rows[0]?.prosecdef).toBe(true);
+    }
+  });
+
   test('hard-exclude is consistent across engines', async () => {
     // Both engines should hide test/ pages by default; both should opt
     // them back in via include_slug_prefixes.

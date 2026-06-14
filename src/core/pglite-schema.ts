@@ -179,6 +179,16 @@ CREATE TRIGGER bump_page_generation_clock_trg
   FOR EACH STATEMENT
   EXECUTE FUNCTION bump_page_generation_clock_fn();
 
+-- Read-side sibling (mirror of src/schema.sql). SECURITY DEFINER is inert on
+-- PGLite (single role) but the function must EXIST or the query-cache gate SQL
+-- (which now calls page_generation_clock_value() instead of an inline subquery)
+-- won't resolve. See src/schema.sql for the full rationale + the 42501 tenant
+-- bug this read-path fix closes.
+CREATE OR REPLACE FUNCTION page_generation_clock_value() RETURNS bigint
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)::bigint
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);

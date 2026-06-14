@@ -55,6 +55,14 @@
  *   P-13b replay durability: initSchema replay over an already-fixed DB keeps
  *        prosecdef + search_path; tenant writes survive (the restart-clobber
  *        mechanism, simulated twice)
+ *   P-13c READER SOURCE PIN (runs everywhere, no DB): every CREATE OR REPLACE of
+ *        page_generation_clock_value in src/ carries SECURITY DEFINER + pinned
+ *        search_path — the READ-path sibling of P-13a
+ *   P-13d reader read-survival: a tenant cached store + lookup inside
+ *        withSourceScope succeeds — the page_generation_clock_value() reads do
+ *        NOT 42501 / poison the dispatch tx (the exact search_brain/query path
+ *        that returned brain_unavailable; also the guard on PUBLIC EXECUTE of
+ *        the reader fn)
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from 'postgres';
@@ -62,6 +70,8 @@ import { execSync } from 'child_process';
 import { join } from 'path';
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { SemanticQueryCache } from '../../src/core/search/query-cache.ts';
+import type { SearchResult, HybridSearchMeta } from '../../src/core/types.ts';
 
 const DB = process.env.GBRAIN_B8_DATABASE_URL;
 const describeB8 = DB ? describe : describe.skip;
@@ -566,6 +576,76 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
       expect(del.count).toBe(1);
     });
   });
+
+  test('P-13d reader read-survival: tenant cached store+lookup survives (page_generation_clock_value)', async () => {
+    // The READ-path bug, sibling of the P-13b WRITE-path one. query-cache-gate
+    // read page_generation_clock inline as the invoking role. Under gbrain_tenant
+    // (no grant on that CAT-6 table) that raised 42501 and aborted the
+    // withSourceScope dispatch tx (25P02): the JS try/catch swallowed the error
+    // but could not un-abort the tx, so the subsequent real search ran on a dead
+    // tx and search_brain/query returned brain_unavailable. The
+    // page_generation_clock_value() SECURITY DEFINER reader (PUBLIC EXECUTE) is
+    // the fix. This drives the store-time snapshot reads (sites 1+2) AND the
+    // lookup gate read (site 3) on a real PostgresEngine connected AS
+    // gbrain_tenant, inside the production withSourceScope wrapper. If EXECUTE on
+    // the fn is ever revoked from PUBLIC this goes red — remedy: add
+    // `GRANT EXECUTE ON FUNCTION page_generation_clock_value() TO gbrain_tenant`
+    // to b7-role.sql.
+
+    // Match query_cache.embedding's declared dimension (pgvector encodes the
+    // dimension directly in atttypmod), or a mismatched ::vector cast — not the
+    // 42501 under test — would be what fails.
+    const [{ dim }] = await admin`
+      SELECT atttypmod AS dim FROM pg_attribute
+      WHERE attrelid = 'query_cache'::regclass AND attname = 'embedding'`;
+    const D = Number(dim) > 0 ? Number(dim) : 1536;
+    const emb = (seed: number): Float32Array => {
+      const e = new Float32Array(D);
+      e[seed % D] = 1;
+      return e;
+    };
+    const META: HybridSearchMeta = {
+      vector_enabled: true,
+      detail_resolved: 'medium',
+      expansion_applied: false,
+      intent: 'general',
+    };
+    const resultWithPage: SearchResult[] = [{
+      slug: 'people/a-one',
+      page_id: aPageId,
+      title: 'A One',
+      type: 'person',
+      chunk_text: 'alpha chunk',
+      chunk_source: 'compiled_truth',
+      chunk_id: 1,
+      chunk_index: 0,
+      score: 1,
+      stale: false,
+    }];
+
+    const tenantEngine = new PostgresEngine();
+    await tenantEngine.connect({ engine: 'postgres', database_url: tenantUrl(DB as string), poolSize: 2 });
+    try {
+      await tenantEngine.withSourceScope(A, async (e) => {
+        const cache = new SemanticQueryCache(e);
+        // store() with a real page_id → combined snapshot query (site 2: pages + clock).
+        await cache.store('tenant clock survives', emb(1), resultWithPage, META, { sourceId: A });
+        // store() with empty results → empty-snapshot branch (site 1: clock only).
+        await cache.store('tenant clock survives empty', emb(2), [], META, { sourceId: A });
+        // lookup() → CACHE_GATE_WHERE_CLAUSE (site 3: clock read embedded in WHERE).
+        const hit = await cache.lookup(emb(1), { sourceId: A });
+        // A hit can only happen if the gate's clock read SUCCEEDED. Pre-fix it
+        // 42501'd → swallowed → miss, and poisoned the tx.
+        expect(hit.hit).toBe(true);
+        // And the dispatch tx must NOT be poisoned: a later statement still runs
+        // (pre-fix this threw 25P02 "current transaction is aborted").
+        const ok = await e.executeRaw<{ ok: number }>(`SELECT 1 AS ok`);
+        expect(Number(ok[0]?.ok)).toBe(1);
+      });
+    } finally {
+      await tenantEngine.disconnect();
+    }
+  });
 });
 
 /**
@@ -607,6 +687,52 @@ describe('P-13a source pin: every bump_page_generation_clock_fn definition is SE
     for (const s of sites) {
       expect(`${s.file}: ${s.tail}`).toMatch(/SECURITY DEFINER/);
       expect(`${s.file}: ${s.tail}`).toMatch(/SET search_path = public, pg_temp/);
+    }
+  });
+});
+
+/**
+ * P-13c — READER SOURCE-LEVEL PIN. The read-path sibling of P-13a. Also OUTSIDE
+ * the GBRAIN_B8_DATABASE_URL gate: needs no database, runs on every `bun test`.
+ * Fires at test time — not prod-restart time — if a future merge reintroduces
+ * the unsafe (non-SECURITY DEFINER) form of the page_generation_clock_value()
+ * reader at any definition site, which would re-arm the 42501 tenant lockout on
+ * the search_brain/query read path (the symptom P-13d exercises live).
+ */
+describe('P-13c source pin: every page_generation_clock_value definition is SECURITY DEFINER', () => {
+  test('all CREATE OR REPLACE sites in src/ carry SECURITY DEFINER + pinned search_path', () => {
+    const SRC = join(import.meta.dir, '..', '..', 'src');
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (/\.(ts|sql)$/.test(name)) files.push(p);
+      }
+    };
+    walk(SRC);
+
+    type Site = { file: string; body: string };
+    const sites: Site[] = [];
+    // The reader is LANGUAGE sql with its attributes BEFORE the dollar-quoted
+    // body, and the body holds no semicolons, so match the whole statement up to
+    // the terminating `;`. Tolerant of the escaped-dollar form ($ -> \$) the
+    // generator emits into schema-embedded.ts.
+    const def = /CREATE OR REPLACE FUNCTION page_generation_clock_value[\s\S]*?;/g;
+    for (const file of files) {
+      const text = readFileSync(file, 'utf8');
+      for (const m of text.matchAll(def)) {
+        sites.push({ file: file.slice(SRC.length + 1), body: m[0] });
+      }
+    }
+
+    // 4 known sites: schema.sql, core/schema-embedded.ts (generated),
+    // core/pglite-schema.ts, core/migrate.ts (v115). A drop below 4 means a
+    // definition site moved — re-point this pin, don't delete it.
+    expect(sites.length).toBeGreaterThanOrEqual(4);
+    for (const s of sites) {
+      expect(`${s.file}: ${s.body}`).toMatch(/SECURITY DEFINER/);
+      expect(`${s.file}: ${s.body}`).toMatch(/SET search_path = public, pg_temp/);
     }
   });
 });

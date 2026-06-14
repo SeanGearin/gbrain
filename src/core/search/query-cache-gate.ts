@@ -98,7 +98,11 @@ export async function buildPageGenerationsSnapshot(
       // Per D20, empty-result cache rows trust Layer 1 exclusively;
       // bumping the clock on subsequent writes correctly invalidates them.
       const rows = await engine.executeRaw<{ v: number }>(
-        `SELECT COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)::bigint AS v`,
+        // Read the clock through the SECURITY DEFINER reader, NOT an inline
+        // `SELECT … FROM page_generation_clock` — the no-grant gbrain_tenant
+        // role 42501s on the bare table and aborts the dispatch tx. Do not
+        // inline back. See page_generation_clock_value() in src/schema.sql.
+        `SELECT page_generation_clock_value() AS v`,
       );
       snapshot.max_generation_at_store = Number(rows[0]?.v ?? 0);
       return snapshot;
@@ -117,7 +121,7 @@ export async function buildPageGenerationsSnapshot(
          FROM pages WHERE id = ANY($1::int[])
        UNION ALL
        SELECT 'CLOCK' AS k,
-              COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)::bigint AS v,
+              page_generation_clock_value() AS v,
               TRUE AS is_max`,
       [pageIds],
     );
@@ -132,12 +136,13 @@ export async function buildPageGenerationsSnapshot(
     }
     return snapshot;
   } catch {
-    // Pre-v105 brain (no `page_generation_clock` table yet). Return the
-    // empty snapshot with zero bookmark — every cache row will fall
-    // through to Layer 2 (which is stricter post-v0.41.19.0 and will
-    // invalidate empty snapshots). Acceptable upgrade-path one-time
-    // cache miss; migration v105 fills the table within the same
-    // initSchema() call so this branch is short-lived.
+    // Pre-v105 brain (no `page_generation_clock` table yet) or pre-v115 (no
+    // page_generation_clock_value() reader fn yet). Return the empty snapshot
+    // with zero bookmark — every cache row will fall through to Layer 2 (which
+    // is stricter post-v0.41.19.0 and will invalidate empty snapshots).
+    // Acceptable upgrade-path one-time cache miss; initSchema replays both the
+    // table and the reader fn within the same call so this branch is
+    // short-lived.
     return snapshot;
   }
 }
@@ -157,11 +162,14 @@ export async function buildPageGenerationsSnapshot(
  */
 export const CACHE_GATE_WHERE_CLAUSE = `
   (
-    -- Layer 1 (cheap bookmark): O(1) single-row read from page_generation_clock.
-    -- Bumped per-statement by bump_page_generation_clock_trg on every INSERT,
-    -- UPDATE, or DELETE on pages. If no statement has fired since this row
-    -- stored, the row is fresh corpus-wide.
-    COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0)
+    -- Layer 1 (cheap bookmark): O(1) single-row read of the global generation
+    -- clock via the page_generation_clock_value() SECURITY DEFINER reader (NOT
+    -- an inline SELECT from page_generation_clock -- the no-grant gbrain_tenant
+    -- role 42501s on the bare table, aborting the dispatch tx; do not inline
+    -- back). The clock is bumped per-statement by bump_page_generation_clock_trg
+    -- on every INSERT/UPDATE/DELETE on pages. If no statement has fired since
+    -- this row stored, the row is fresh corpus-wide.
+    page_generation_clock_value()
       <= qc.max_generation_at_store
     OR
     -- Layer 2 (per-page snapshot): bookmark fired, but maybe THIS row's
