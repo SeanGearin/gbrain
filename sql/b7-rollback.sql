@@ -64,6 +64,8 @@ DROP POLICY IF EXISTS b7_tenant_isolation ON takes;
 DROP POLICY IF EXISTS b7_tenant_isolation ON links;
 DROP POLICY IF EXISTS b7_tenant_isolation ON eval_candidates;
 DROP POLICY IF EXISTS b7_tenant_isolation ON sources;
+DROP POLICY IF EXISTS b7_tenant_isolation ON slug_aliases;
+DROP POLICY IF EXISTS b7_tenant_isolation ON page_aliases;
 
 COMMIT;
 

@@ -108,6 +108,22 @@ CREATE POLICY b7_tenant_isolation ON query_cache FOR ALL
   USING      (source_id = current_setting('app.current_source_id', true))
   WITH CHECK (source_id = current_setting('app.current_source_id', true));
 
+-- slug_aliases / page_aliases: read-path alias lookup tables, source_id directly
+-- on each row (see src/core/pglite-schema.ts / migrate.ts). Same CAT-1 shape as
+-- their siblings above. The tenant holds SELECT-only on these (b7-role.sql Step
+-- 2c), so in practice only the USING leg bites reads; WITH CHECK is carried for
+-- parity with the FOR ALL siblings and to stay fail-closed if a write grant is
+-- ever added. Mirrors the policy hand-applied to prod 2026-06-14 (18 -> 20).
+DROP POLICY IF EXISTS b7_tenant_isolation ON slug_aliases;
+CREATE POLICY b7_tenant_isolation ON slug_aliases FOR ALL
+  USING      (source_id = current_setting('app.current_source_id', true))
+  WITH CHECK (source_id = current_setting('app.current_source_id', true));
+
+DROP POLICY IF EXISTS b7_tenant_isolation ON page_aliases;
+CREATE POLICY b7_tenant_isolation ON page_aliases FOR ALL
+  USING      (source_id = current_setting('app.current_source_id', true))
+  WITH CHECK (source_id = current_setting('app.current_source_id', true));
+
 -- ----------------------------------------------------------------------------
 -- CAT-2 — no own source_id; derived through page_id -> pages.source_id.
 -- Policy: the owning page is in-source. Indexed point-lookup on pages PK.

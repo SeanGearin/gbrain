@@ -44,8 +44,10 @@
  *   P-11 oauth_clients/oauth_tokens/oauth_codes/access_tokens are deny-by-GRANT
  *        under the tenant role: SELECT raises `permission denied`, NOT 0 rows.
  *        The old vestigial SELECT grant (RLS-dead) was revoked on prod
- *        2026-06-11 and removed from b7-role.sql; shipped == live at the 18-table
- *        manifest. Distinct from P-4 so these four can't silently regrow.
+ *        2026-06-11 and removed from b7-role.sql; shipped == live at the grant
+ *        manifest (17 DML + SELECT-only sources/slug_aliases/page_aliases =
+ *        20 policied tables as of 2026-06-14). Distinct from P-4 so these four
+ *        can't silently regrow.
  *   P-12b same-source write availability across ALL 17 tenant-DML tables
  *        (pins the whole trigger/grant time-bomb class, not just pages)
  *   P-13a SOURCE PIN (runs everywhere, no DB needed): every CREATE OR REPLACE
@@ -95,11 +97,16 @@ const TENANT_PW = 'b8_proof_tenant_pw_local_only';
 const SQL_DIR = join(import.meta.dir, '..', '..', 'sql');
 const DB_NAME = DB ? new URL(DB).pathname.replace(/^\//, '') : '';
 
-/** The 18 tables sql/b7-policies.sql row-scopes, by category. */
+/** The 20 tables sql/b7-policies.sql row-scopes, by category. */
 const CAT1 = ['pages', 'ingest_log', 'files', 'facts', 'calibration_profiles',
   'take_proposals', 'take_nudge_log', 'think_ab_results', 'query_cache'];
 const CAT2 = ['content_chunks', 'tags', 'timeline_entries', 'page_versions', 'raw_data', 'takes'];
-const POLICED = [...CAT1, ...CAT2, 'links', 'eval_candidates', 'sources'];
+/** SELECT-only, source_id-direct read-path alias tables. Same CAT-1 policy
+ *  shape as the CAT1 set, but the tenant holds SELECT-ONLY (no DML grant), so
+ *  they sit outside P-9's DML-granted coverage check while still being row-
+ *  scoped + counted. Synced into the b7 manifest 2026-06-14 (policy 18 -> 20). */
+const SELECT_ONLY_ALIASES = ['slug_aliases', 'page_aliases'];
+const POLICED = [...CAT1, ...CAT2, 'links', 'eval_candidates', 'sources', ...SELECT_ONLY_ALIASES];
 
 /** CAT-6 infra: no grant to gbrain_tenant -> permission denied on first touch.
  *  oauth_clients/oauth_tokens/oauth_codes/access_tokens are now ALSO deny-by-
@@ -381,7 +388,7 @@ describeB8('B8 cross-source denial proof (local scratch Postgres + gbrain_tenant
     const rows = await admin`
       SELECT tablename, qual, with_check FROM pg_policies
       WHERE policyname = 'b7_tenant_isolation' ORDER BY tablename`;
-    expect(rows.length).toBe(18);
+    expect(rows.length).toBe(20);
     for (const r of rows) {
       const text = `${r.qual ?? ''} ${r.with_check ?? ''}`;
       // pg_policies renders it as current_setting('app.current_source_id'::text, true)

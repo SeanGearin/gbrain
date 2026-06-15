@@ -91,9 +91,22 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 TO gbrain_tenant;
 
 -- ----------------------------------------------------------------------------
--- Step 2c — SELECT-only on the tenant's own-row source registry.
+-- Step 2c — SELECT-only on the tenant's own-row source registry + the two
+-- read-path alias tables.
 --   sources: SELECT is row-confined to the tenant's own row by the CAT-5 policy.
 --   WRITES ride the privileged connection (D6), never this role.
+--
+--   slug_aliases / page_aliases: read-path lookup tables. resolveSlugWithAlias
+--   (wikilink redirect) and the free-text alias leg of search read these as the
+--   tenant on the request path — find_experts is one consumer. Both carry
+--   source_id directly and are row-confined to the tenant's own source by their
+--   CAT-1 policies in b7-policies.sql. SELECT-only by design: the tenant never
+--   writes aliases on the request path (re-ingest authoring rides the trusted
+--   local CLI / privileged plane), so they deliberately get NO DML and NO
+--   sequence USAGE — matching the live grant hand-applied to prod 2026-06-14
+--   (policies-first then SELECT-only grant; policy count 18 -> 20). Syncing the
+--   grant here makes any role built FROM this manifest carry it; b8-rls-proof
+--   at 20 is the executable proof.
 --
 -- The oauth_clients / oauth_tokens / oauth_codes / access_tokens SELECT grants
 -- that used to live here (the CAT-3 bearer-bootstrap carve-out) were VESTIGIAL:
@@ -102,12 +115,14 @@ TO gbrain_tenant;
 -- production. They were RLS-dead (no row policy → SELECT returned 0 rows, never
 -- a leak — proven by the old P-11) and were REVOKEd from gbrain_tenant on prod
 -- 2026-06-11 (runbook R-2). Removing them here brings shipped SQL back in line
--- with the live 18-table grant manifest (17 DML + sources). The tenant now gets
--- `permission denied` on these four tables (deny-by-GRANT, CAT-6 style), pinned
--- by the rewritten P-11 in test/e2e/b8-rls-proof.test.ts.
+-- with the live grant manifest. The tenant now gets `permission denied` on
+-- these four tables (deny-by-GRANT, CAT-6 style), pinned by the rewritten P-11
+-- in test/e2e/b8-rls-proof.test.ts.
 -- ----------------------------------------------------------------------------
 GRANT SELECT ON
-  sources
+  sources,
+  slug_aliases,
+  page_aliases
 TO gbrain_tenant;
 
 -- ----------------------------------------------------------------------------
