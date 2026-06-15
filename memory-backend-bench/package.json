@@ -1,0 +1,21 @@
+{
+  "name": "memory-backend-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun src/cli.ts",
+    "bench:all": "bash scripts/run_all.sh",
+    "fetch:data": "bash scripts/fetch-datasets.sh",
+    "check": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "@dqbd/tiktoken": "^1.0.22",
+    "@honcho-ai/sdk": "2.1.2",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
