@@ -12,12 +12,22 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
+
+class RecordingScopeEngine extends PGLiteEngine {
+  readonly sourceScopeCalls: string[] = [];
+
+  async withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    this.sourceScopeCalls.push(sourceId);
+    return super.withSourceScope(sourceId, fn);
+  }
+}
 
 beforeAll(async () => {
   // v0.41.5.0+: DEFAULT_EMBEDDING_DIMENSIONS is 1280 (ZE Matryoshka). unitVec()
@@ -61,13 +71,13 @@ async function insertTyped(args: {
   valid_from: Date;
   visibility?: 'private' | 'world';
   vecIdx?: number;
-}): Promise<void> {
+}, targetEngine: PGLiteEngine = engine): Promise<void> {
   const sid = args.source_id ?? 'default';
-  await engine.executeRaw(
+  await targetEngine.executeRaw(
     `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT DO NOTHING`,
     [sid],
   );
-  await engine.executeRaw(
+  await targetEngine.executeRaw(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, source, valid_from,
                         claim_metric, claim_value, claim_unit, claim_period,
                         visibility, embedding, embedded_at)
@@ -173,6 +183,63 @@ describe('find_trajectory MCP op — source scoping (D-CDX-6)', () => {
     const result = await op.handler(ctx, { entity_slug: 'optraj-scalar' }) as any;
     expect(result.points.length).toBe(1);
     expect(result.points[0].value).toBe(100);
+  });
+
+  test('remote caller self-wraps in withSourceScope when dispatch did not scope it', async () => {
+    const scopedEngine = new RecordingScopeEngine();
+    await scopedEngine.connect({});
+    await scopedEngine.initSchema();
+    try {
+      await insertTyped({
+        source_id: 'optraj-wrap',
+        entity_slug: 'optraj-wrap',
+        metric: 'mrr',
+        value: 321,
+        visibility: 'world',
+        valid_from: new Date('2026-01-15'),
+      }, scopedEngine);
+
+      const op = operationsByName['find_trajectory'];
+      const result = await op.handler(
+        mkCtx({ engine: scopedEngine, remote: true, sourceId: 'optraj-wrap' }),
+        { entity_slug: 'optraj-wrap' },
+      ) as any;
+      expect(result.points.map((p: any) => p.value)).toEqual([321]);
+      expect(scopedEngine.sourceScopeCalls).toEqual(['optraj-wrap']);
+    } finally {
+      await scopedEngine.disconnect();
+    }
+  });
+
+  test('remote caller does not double-wrap when dispatch already set sourceScopeActive', async () => {
+    const scopedEngine = new RecordingScopeEngine();
+    await scopedEngine.connect({});
+    await scopedEngine.initSchema();
+    try {
+      await insertTyped({
+        source_id: 'optraj-active',
+        entity_slug: 'optraj-active',
+        metric: 'mrr',
+        value: 654,
+        visibility: 'world',
+        valid_from: new Date('2026-01-15'),
+      }, scopedEngine);
+
+      const op = operationsByName['find_trajectory'];
+      const result = await op.handler(
+        mkCtx({
+          engine: scopedEngine,
+          remote: true,
+          sourceId: 'optraj-active',
+          sourceScopeActive: true,
+        }),
+        { entity_slug: 'optraj-active' },
+      ) as any;
+      expect(result.points.map((p: any) => p.value)).toEqual([654]);
+      expect(scopedEngine.sourceScopeCalls).toEqual([]);
+    } finally {
+      await scopedEngine.disconnect();
+    }
   });
 });
 

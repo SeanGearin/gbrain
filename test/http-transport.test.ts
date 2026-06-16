@@ -15,6 +15,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createHash } from 'crypto';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
 
@@ -29,8 +30,10 @@ interface FakeEngine {
   // tag is preserved as a fallback for any code path we missed (none
   // expected after the migration, but harmless if it sticks around).
   executeRaw: <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
+  withSourceScope: <T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>) => Promise<T>;
   sql: ReturnType<typeof makeSqlTag>;
   audit: { token_name: string | null; operation: string; status: string; latency_ms: number }[];
+  sourceScopeCalls: string[];
 }
 
 function makeSqlTag(handler: SqlHandler) {
@@ -77,6 +80,7 @@ function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
   const validTokens = cfg.validTokens ?? new Map();
   const revokedTokens = cfg.revokedTokens ?? new Set();
   const audit: FakeEngine['audit'] = [];
+  const sourceScopeCalls: string[] = [];
 
   // Legacy template-tag handler. Preserved so any non-migrated call path
   // still has a place to land (defense in depth). The new code path routes
@@ -134,7 +138,19 @@ function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
     return Promise.resolve(result as T[]);
   };
 
-  return { kind: 'postgres', executeRaw, sql, audit };
+  const fake = {
+    kind: 'postgres' as const,
+    executeRaw,
+    withSourceScope: async <T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> => {
+      sourceScopeCalls.push(sourceId);
+      return fn(fake as unknown as BrainEngine);
+    },
+    sql,
+    audit,
+    sourceScopeCalls,
+  };
+
+  return fake;
 }
 
 interface TestServer {
@@ -339,6 +355,27 @@ describe('http-transport: tools/call dispatch', () => {
     const body = await r.json();
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain('Unknown tool');
+  });
+
+  test('9c. legacy tools/call dispatch enters source scope exactly once', async () => {
+    const scopedSrv = await startTest({
+      validTokens: new Map([[hash('tok-scope'), { id: 'tok-scope-id', name: 'scope' }]]),
+    });
+    try {
+      const r = await fetch(`${scopedSrv.url}/mcp`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer tok-scope', 'Content-Type': 'application/json' },
+        // recall self-wraps when sourceScopeActive is absent. The legacy
+        // transport must mark dispatch active so this remains one wrapper.
+        body: rpc('tools/call', { name: 'recall', arguments: {} }),
+      });
+      expect(r.status).toBe(200);
+      expect(scopedSrv.engine.sourceScopeCalls).toEqual(['default']);
+      const body = await r.json();
+      expect(body.result.isError).toBe(true);
+    } finally {
+      scopedSrv.stop();
+    }
   });
 });
 
