@@ -36,6 +36,7 @@ import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
+import { constructGraphFromClaim } from './construct.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -95,10 +96,15 @@ function resolveConfidence(c: ValidClaim): number {
 
 /**
  * Fold the structured surface forms into the `context` column so nothing the
- * client captured is lost, without resolving entities (which would need the
- * LLM/embedding entity resolver). entity_slug stays NULL — the claim text
+ * client captured is lost. This is the FACT-ROW projection: entity_slug stays
+ * NULL (the fact is not pinned to a single primary entity) and the claim text
  * itself carries the names as spoken, so pg_trgm dedup and grep/keyword recall
- * still work; entity-scoped recall is the deferred enhancement.
+ * still work.
+ *
+ * The same people[]/entities[] arrays ALSO drive the deterministic graph
+ * construct (entity stub pages + co-occurrence edges) AFTER the row inserts —
+ * see constructGraphFromClaim. That construct is LLM-free (pure slugify + SQL
+ * upserts), so the graph is built with no entity-resolver inference.
  *
  * Surface forms are untrusted, so the assembled string passes through the same
  * sanitizer as the claim.
@@ -240,8 +246,25 @@ export async function runSaveFacts(
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, there is no fence/markdown source to reconcile through
     fact_ids.push(result.id);
-    if (result.status === 'inserted') inserted += 1;
-    else duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
+    if (result.status === 'inserted') {
+      inserted += 1;
+      // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
+      // this claim's people[]/entities[] into entity stub pages + bidirectional
+      // co-occurrence edges so traverse_graph / find_experts have a graph to
+      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts in this SAME
+      // withSourceScope tx (same-tx visibility lets the edge batch see the
+      // stubs written microseconds earlier). Runs only on a genuine insert: a
+      // duplicate's canonical fact already built the identical graph. The fact
+      // is the primary value, the graph is derived. See facts/construct.ts for
+      // the tenant-plane discipline (low-level writes, config-free, source-scoped).
+      await constructGraphFromClaim(ctx.engine, ctx.sourceId, {
+        people: c.people,
+        entities: c.entities,
+        claimText: cleaned,
+      });
+    } else {
+      duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
+    }
   }
 
   return { inserted, duplicate, fact_ids, dedup_mode };
