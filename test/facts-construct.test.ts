@@ -27,6 +27,7 @@ const TEST_SOURCES = [
   'tc-empty', 'tc-junk', 'tc-dupname', 'tc-cap', 'tc-traverse',
   'tc-scope-x', 'tc-scope-y', 'tc-noclobber', 'tc-resolve-existing',
   'tc-resolve-new', 'tc-resolve-other-a', 'tc-resolve-other-b',
+  'tc-person-wins',
 ];
 
 beforeAll(async () => {
@@ -302,6 +303,41 @@ describe('save_facts → graph (end to end, the packet inverse)', () => {
     expect(await countPages('tc-shared')).toBe(3);
     expect(await countLinks('tc-shared')).toBe(4);
     expect(await edgesBetween('tc-shared', 'people/alice-chen', 'people/bob-stone')).toHaveLength(0);
+  });
+
+  test('person membership in one claim wins over entities membership elsewhere in the batch', async () => {
+    const res = await runSaveFacts(
+      [
+        {
+          claim: 'Athlete Example appeared in the standings',
+          provenance: 'user_stated',
+          entities: ['Athlete Example'],
+        },
+        {
+          claim: 'Athlete Example is a player',
+          provenance: 'user_stated',
+          people: ['Athlete Example'],
+        },
+      ],
+      { engine, sourceId: 'tc-person-wins' },
+    );
+    if ('error' in res) throw new Error('unexpected error');
+    expect(res.inserted).toBe(2);
+
+    const person = await getPageRow('tc-person-wins', 'people/athlete-example');
+    expect(person).not.toBeNull();
+    expect(person!.type).toBe('person');
+    expect(await getPageRow('tc-person-wins', 'companies/athlete-example')).toBeNull();
+    expect(await countPages('tc-person-wins')).toBe(1);
+
+    const facts = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts WHERE source_id = $1 ORDER BY id ASC`,
+      ['tc-person-wins'],
+    );
+    expect(facts.map(f => f.entity_slug)).toEqual([
+      'people/athlete-example',
+      'people/athlete-example',
+    ]);
   });
 });
 
