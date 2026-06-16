@@ -49,6 +49,11 @@ export interface DispatchOpts {
    */
   sourceId?: string;
   /**
+   * True when the caller has already entered engine.withSourceScope(sourceId).
+   * Handlers that need the tenant RLS GUC can self-wrap only when this is false.
+   */
+  sourceScopeActive?: boolean;
+  /**
    * v0.31 (eD3): hook called by the dispatcher AFTER op.handler succeeds
    * to compute `_meta.brain_hot_memory` for the response. Wrapped in its
    * own try/catch (eE4) so a DB blip in the helper degrades to no _meta
@@ -209,6 +214,7 @@ export function buildOperationContext(
     // CLI / HTTP / stdio transports SHOULD pass an explicit sourceId via opts;
     // this fallback covers code paths that historically passed undefined.
     sourceId: opts.sourceId ?? 'default',
+    sourceScopeActive: opts.sourceScopeActive === true,
     auth: opts.auth,
   };
 }

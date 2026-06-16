@@ -19,11 +19,21 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSaveFacts } from '../src/core/facts/save.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 
 let engine: PGLiteEngine;
+
+class RecordingScopeEngine extends PGLiteEngine {
+  readonly sourceScopeCalls: string[] = [];
+
+  async withSourceScope<T>(sourceId: string, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    this.sourceScopeCalls.push(sourceId);
+    return super.withSourceScope(sourceId, fn);
+  }
+}
 
 const SOURCES = ['tenant-x', 'tenant-y', 'default'];
 
@@ -126,5 +136,56 @@ describe('recall owner-visibility (R-3)', () => {
     // the OR predicate is additive, never subtractive).
     const texts = (await recallFacts(ownerCaller('tenant-x'))).map(f => f.fact);
     expect(texts).toContain('Owner world fact epsilon');
+  });
+
+  test('(4) remote recall enters withSourceScope when dispatch did not already scope it', async () => {
+    const scopedEngine = new RecordingScopeEngine();
+    await scopedEngine.connect({});
+    await scopedEngine.initSchema();
+    try {
+      await scopedEngine.executeRaw(
+        `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT DO NOTHING`,
+        ['tenant-scope'],
+      );
+      await scopedEngine.insertFact(
+        { fact: 'Scoped recall fact', kind: 'fact', source: 'test', visibility: 'private' },
+        { source_id: 'tenant-scope' },
+      );
+
+      const r = await dispatchToolCall(scopedEngine, 'recall', {}, ownerCaller('tenant-scope'));
+      expect(r.isError).toBeFalsy();
+      const payload = JSON.parse(r.content[0].text);
+      expect((payload.facts as Array<{ fact: string }>).map(f => f.fact)).toContain('Scoped recall fact');
+      expect(scopedEngine.sourceScopeCalls).toEqual(['tenant-scope']);
+    } finally {
+      await scopedEngine.disconnect();
+    }
+  });
+
+  test('(5) recall does not double-wrap when serve-http already entered withSourceScope', async () => {
+    const scopedEngine = new RecordingScopeEngine();
+    await scopedEngine.connect({});
+    await scopedEngine.initSchema();
+    try {
+      await scopedEngine.executeRaw(
+        `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT DO NOTHING`,
+        ['tenant-active'],
+      );
+      await scopedEngine.insertFact(
+        { fact: 'Already scoped recall fact', kind: 'fact', source: 'test', visibility: 'private' },
+        { source_id: 'tenant-active' },
+      );
+
+      const r = await dispatchToolCall(scopedEngine, 'recall', {}, {
+        ...ownerCaller('tenant-active'),
+        sourceScopeActive: true,
+      });
+      expect(r.isError).toBeFalsy();
+      const payload = JSON.parse(r.content[0].text);
+      expect((payload.facts as Array<{ fact: string }>).map(f => f.fact)).toContain('Already scoped recall fact');
+      expect(scopedEngine.sourceScopeCalls).toEqual([]);
+    } finally {
+      await scopedEngine.disconnect();
+    }
   });
 });

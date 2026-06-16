@@ -391,6 +391,14 @@ export interface OperationContext {
    * satisfied even on single-source brains.
    */
   sourceId: string;
+  /**
+   * True when the transport has already pinned this operation to a
+   * `withSourceScope(sourceId, ...)` transaction. Tenant RLS needs the
+   * app.current_source_id GUC, but PostgresEngine.withSourceScope is not
+   * re-entrant; handlers that self-wrap must skip when the dispatch layer
+   * already did it.
+   */
+  sourceScopeActive?: boolean;
 }
 
 /**
@@ -3681,47 +3689,56 @@ const recall: Operation = {
             ? ctx.auth.sourceId
             : null);
 
-    const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId };
+    const runRecallQuery = async (engine: BrainEngine) => {
+      const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId };
 
-    let rows: Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>> = [];
+      let rows: Awaited<ReturnType<typeof engine.listFactsByEntity>> = [];
 
-    if (p.supersessions === true) {
-      const since = parseSinceParam(p.since);
-      rows = await ctx.engine.listSupersessions(sourceId, { since: since ?? undefined, limit });
-    } else if (typeof p.entity === 'string' && p.entity.length > 0) {
-      const { resolveEntitySlug } = await import('./entities/resolve.ts');
-      const slug = (await resolveEntitySlug(ctx.engine, sourceId, p.entity)) ?? p.entity;
-      rows = await ctx.engine.listFactsByEntity(sourceId, slug, listOpts);
-    } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
-      rows = await ctx.engine.listFactsBySession(sourceId, p.session_id, listOpts);
-    } else if (p.since !== undefined) {
-      const since = parseSinceParam(p.since);
-      if (since) {
-        rows = await ctx.engine.listFactsSince(sourceId, since, listOpts);
+      if (p.supersessions === true) {
+        const since = parseSinceParam(p.since);
+        rows = await engine.listSupersessions(sourceId, { since: since ?? undefined, limit });
+      } else if (typeof p.entity === 'string' && p.entity.length > 0) {
+        const { resolveEntitySlug } = await import('./entities/resolve.ts');
+        const slug = (await resolveEntitySlug(engine, sourceId, p.entity)) ?? p.entity;
+        rows = await engine.listFactsByEntity(sourceId, slug, listOpts);
+      } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
+        rows = await engine.listFactsBySession(sourceId, p.session_id, listOpts);
+      } else if (p.since !== undefined) {
+        const since = parseSinceParam(p.since);
+        if (since) {
+          rows = await engine.listFactsSince(sourceId, since, listOpts);
+        }
+      } else {
+        // No filter: return recent across the source.
+        rows = await engine.listFactsSince(sourceId, new Date(0), listOpts);
       }
-    } else {
-      // No filter: return recent across the source.
-      rows = await ctx.engine.listFactsSince(sourceId, new Date(0), listOpts);
-    }
 
-    if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
+      if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 
-    // v0.32: optional pending-consolidation count piggy-backed on the recall
-    // response. Single round trip on thin-client; omitted when not requested
-    // so existing callers see no shape change.
-    let pending_consolidation_count: number | undefined;
-    if (p.include_pending === true) {
-      try {
-        pending_consolidation_count = await ctx.engine.countUnconsolidatedFacts(sourceId);
-      } catch (e) {
-        // Best-effort: if the count query fails we still return facts. Field
-        // stays undefined so callers can tell the difference between "0
-        // pending" and "we couldn't ask."
-        process.stderr.write(
-          `[recall] countUnconsolidatedFacts failed: ${(e as Error).message}\n`,
-        );
+      // v0.32: optional pending-consolidation count piggy-backed on the recall
+      // response. Single round trip on thin-client; omitted when not requested
+      // so existing callers see no shape change.
+      let pending_consolidation_count: number | undefined;
+      if (p.include_pending === true) {
+        try {
+          pending_consolidation_count = await engine.countUnconsolidatedFacts(sourceId);
+        } catch (e) {
+          // Best-effort: if the count query fails we still return facts. Field
+          // stays undefined so callers can tell the difference between "0
+          // pending" and "we couldn't ask."
+          process.stderr.write(
+            `[recall] countUnconsolidatedFacts failed: ${(e as Error).message}\n`,
+          );
+        }
       }
-    }
+
+      return { rows, pending_consolidation_count };
+    };
+
+    const { rows, pending_consolidation_count } =
+      ctx.remote !== false && !ctx.sourceScopeActive
+        ? await ctx.engine.withSourceScope(sourceId, runRecallQuery)
+        : await runRecallQuery(ctx.engine);
 
     return {
       facts: rows.map(r => ({

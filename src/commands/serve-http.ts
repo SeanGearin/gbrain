@@ -2207,6 +2207,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           remote: true,
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
+          sourceScopeActive: true,
           metaHook: getBrainHotMemoryMeta,
           // v0.31 follow-up fix: thread auth so the whoami op (and any
           // future scope-aware handlers) can introspect the caller. The
