@@ -358,11 +358,14 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // takes_search / query (when it returns takes) can server-side filter.
         // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens
         // path defaults to 'default' per AuthResult.sourceId above.
-        const result = await dispatchToolCall(engine, toolName, args, {
-          remote: true,
-          takesHoldersAllowList: auth.takesHoldersAllowList,
-          sourceId: auth.sourceId,
-        });
+        const tokenSourceId = auth.sourceId ?? 'default';
+        const result = await engine.withSourceScope(tokenSourceId, (scopedEngine) =>
+          dispatchToolCall(scopedEngine, toolName, args, {
+            remote: true,
+            takesHoldersAllowList: auth.takesHoldersAllowList,
+            sourceId: tokenSourceId,
+            sourceScopeActive: true,
+          }));
         const status = result.isError ? 'error' : 'success';
         logRequest(auth.tokenName!, `tools/call:${toolName}`, status, Date.now() - startedMs);
         return Response.json(

@@ -3655,6 +3655,7 @@ const find_trajectory: Operation = {
     if (typeof p.entity_slug !== 'string' || !p.entity_slug.trim()) {
       throw new Error('find_trajectory requires entity_slug (string)');
     }
+    const entitySlug = p.entity_slug;
     const metric = typeof p.metric === 'string' ? p.metric : undefined;
     const kind = (p.kind === 'metric' || p.kind === 'event' || p.kind === 'all')
       ? (p.kind as 'metric' | 'event' | 'all')
@@ -3663,11 +3664,12 @@ const find_trajectory: Operation = {
     const until  = typeof p.until  === 'string' ? p.until  : undefined;
     const limit  = typeof p.limit  === 'number' ? p.limit  : undefined;
     const scope = sourceScopeOpts(ctx);
+    const sourceId = ctx.sourceId ?? 'default';
 
     // D-CDX-1: thread ctx.remote into the engine so visibility filtering
     // happens at SQL level. Mirrors recall's posture for untrusted callers.
-    const points = await ctx.engine.findTrajectory({
-      entitySlug: p.entity_slug,
+    const runFindTrajectory = (engine: BrainEngine) => engine.findTrajectory({
+      entitySlug,
       ...scope,
       remote: ctx.remote === true,
       metric,
@@ -3676,6 +3678,10 @@ const find_trajectory: Operation = {
       until,
       limit,
     });
+    const points =
+      ctx.remote !== false && !ctx.sourceScopeActive
+        ? await ctx.engine.withSourceScope(sourceId, runFindTrajectory)
+        : await runFindTrajectory(ctx.engine);
 
     const { computeTrajectoryStats, TRAJECTORY_SCHEMA_VERSION } = await import('./trajectory.ts');
     const { regressions, drift_score } = computeTrajectoryStats(points);
