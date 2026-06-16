@@ -9,9 +9,9 @@
  * nothing to walk. This composes the existing LLM-free primitives into the
  * per-fact construct that turns those arrays into entity pages + edges.
  *
- *   1. each name in people[] (person) / entities[] (company) → a canonical slug
- *      (`slugifyEntity`), with a stub page created at that slug only if one is
- *      absent (an already-present page is reused, never clobbered);
+ *   1. each name in people[] (person) / entities[] (company) → the standard
+ *      source-scoped entity resolver, with an existing exact / fuzzy / prefix
+ *      page reused as-is and a typed stub minted only on fallback_slugify;
  *   2. BIDIRECTIONAL entity↔entity co-occurrence edges between every co-mentioned
  *      pair. Bidirectional because `traverseGraph` walks `from_page_id →
  *      to_page_id` ONLY (postgres-engine.ts:2381 / pglite parity) — a single
@@ -46,21 +46,16 @@
  *     from the fact insert is a possible hardening; deliberately out of scope for
  *     this first build — see the findings doc.)
  *
- * WHY NO FUZZY ENTITY RESOLUTION HERE. The build sketch floated resolving each
- * name against existing pages via `resolveEntitySlugWithSource` to dedup variant
- * surface forms. We deliberately DON'T: its fuzzy branch reuses an existing page
- * at similarity ≥ 0.4 (resolve.ts), which can MERGE two distinct people ("Hana"
- * vs "Hanna Whitfield") onto one node — exactly the "wrong merge" the sketch's
- * own caveat promises never happens. Deterministic slugify + idempotent upsert
- * already gives perfect dedup on a REPEATED surface form (the common case, since
- * the customer's model emits consistent names) at ZERO wrong-merge risk. The
- * cost is a duplicate stub for a name VARIANT ("Bob" vs "Robert Smith") — the
- * safe degradation the sketch accepts. Richer coreference is the optional,
- * customer-plane (LLM-on-the-customer's-plan) enhancement, not required for the
- * graph to exist.
+ * STANDARD ENTITY RESOLUTION. `resolveEntitySlugWithSource` is already
+ * source-scoped and pure SQL: exact page → fuzzy/prefix existing page →
+ * fallback slugify. The construct uses that resolver through the SAME engine it
+ * was handed by save_facts. On the tenant plane that engine is the
+ * withSourceScope transaction handle, preserving the red-team isolation proof;
+ * there is no fresh engine, config read, model call, or embedding call here.
  */
 
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
 
 /**
@@ -84,6 +79,12 @@ const LINK_SOURCE = 'manual';
  * documented_by), which is why both directions are inserted explicitly below.
  */
 const LINK_TYPE = 'co_occurrence';
+
+/**
+ * Resolver fuzzy threshold. Kept as the standard resolver default (>= 0.4) and
+ * named here so the construct's merge tolerance has one obvious tuning point.
+ */
+const ENTITY_RESOLUTION_FUZZY_THRESHOLD = 0.4;
 
 /**
  * Per-fact cap on entities considered for graph construction. ClaimSchema does
@@ -143,11 +144,12 @@ export async function constructGraphFromClaim(
   let pagesCreated = 0;
   for (const ref of refs) {
     if (slugs.length >= MAX_ENTITIES_PER_FACT) break;
-    const slug = canonicalSlug(ref.name, ref.type);
-    if (slug === null) continue; // name slugified to an empty body — skip
+    const resolved = await resolveConstructSlug(engine, sourceId, ref.name, ref.type);
+    if (resolved === null) continue; // name slugified to an empty body — skip
+    const { slug, shouldCreateStub } = resolved;
     if (seen.has(slug)) continue;
     seen.add(slug);
-    if (await ensureStub(engine, sourceId, slug, ref.name, ref.type)) pagesCreated += 1;
+    if (shouldCreateStub && await ensureStub(engine, sourceId, slug, ref.name, ref.type)) pagesCreated += 1;
     slugs.push(slug);
   }
 
@@ -167,11 +169,37 @@ export async function constructGraphFromClaim(
 }
 
 /**
- * Canonical slug for an entity name, or null if the name has no slug body.
+ * Resolve an entity name for graph construction.
+ *
+ * Exact / fuzzy / prefix hits are existing pages, so the construct reuses them
+ * without touching the page body. Only the resolver's fallback_slugify branch
+ * means "new entity"; at that point the construct mints its typed graph-stub
+ * slug (`people/...` or `companies/...`) and creates it via ensureStub.
+ */
+async function resolveConstructSlug(
+  engine: BrainEngine,
+  sourceId: string,
+  name: string,
+  type: 'person' | 'company',
+): Promise<{ slug: string; shouldCreateStub: boolean } | null> {
+  const resolved = await resolveEntitySlugWithSource(engine, sourceId, name, {
+    fuzzyThreshold: ENTITY_RESOLUTION_FUZZY_THRESHOLD,
+  });
+  if (resolved === null) return null;
+  if (resolved.source !== 'fallback_slugify') {
+    return { slug: resolved.slug, shouldCreateStub: false };
+  }
+
+  const slug = fallbackStubSlug(name, type);
+  return slug ? { slug, shouldCreateStub: true } : null;
+}
+
+/**
+ * Typed fallback slug for a new entity name, or null if the name has no slug body.
  * `slugifyEntity` always returns `<prefix>/<body>`; a body-less result
  * (e.g. a punctuation-only name → "people/") is a junk page we refuse to mint.
  */
-function canonicalSlug(name: string, type: 'person' | 'company'): string | null {
+function fallbackStubSlug(name: string, type: 'person' | 'company'): string | null {
   const slug = slugifyEntity(name, type);
   const body = slug.slice(slug.indexOf('/') + 1);
   return body ? slug : null;
@@ -186,7 +214,7 @@ function canonicalSlug(name: string, type: 'person' | 'company'): string | null 
  * every mention would clobber a page that some other path (e.g. a customer-plane
  * enrich step) enriched between facts. The exact, source-scoped getPage gate
  * means a later mention of an existing entity only wires edges — it never
- * rewrites the page. (Exact slug only — no fuzzy lookup, so no wrong-merge.)
+ * rewrites the page.
  *
  * Deliberately minimal content: a graph anchor, not a profile.
  */

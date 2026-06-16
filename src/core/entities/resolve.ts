@@ -23,6 +23,8 @@
 
 import type { BrainEngine } from '../engine.ts';
 
+const DEFAULT_FUZZY_THRESHOLD = 0.4;
+
 /**
  * Canonicalize a free-form entity reference to a page slug.
  *
@@ -116,10 +118,15 @@ export interface ResolveResult {
   source: ResolutionSource;
 }
 
+export interface ResolveEntitySlugOptions {
+  fuzzyThreshold?: number;
+}
+
 export async function resolveEntitySlugWithSource(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  opts: ResolveEntitySlugOptions = {},
 ): Promise<ResolveResult | null> {
   if (!raw) return null;
   const trimmed = raw.trim();
@@ -131,7 +138,7 @@ export async function resolveEntitySlugWithSource(
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
+  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, opts.fuzzyThreshold);
   if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
 
   if (isBareName(trimmed)) {
@@ -335,6 +342,7 @@ async function tryFuzzyMatch(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  threshold = DEFAULT_FUZZY_THRESHOLD,
 ): Promise<string | null> {
   const lc = raw.toLowerCase();
   const fragment = slugify(raw);
@@ -359,7 +367,7 @@ async function tryFuzzyMatch(
        LIMIT 3`,
       [source_id, lc, fragment],
     );
-    if (rows.length > 0 && rows[0].score >= 0.4) return rows[0].slug;
+    if (rows.length > 0 && rows[0].score >= threshold) return rows[0].slug;
   } catch {
     // pg_trgm functions might not be available on every engine config;
     // fall through to slugify.

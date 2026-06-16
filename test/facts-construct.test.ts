@@ -25,7 +25,8 @@ let engine: PGLiteEngine;
 const TEST_SOURCES = [
   'tc-unit', 'tc-e2e', 'tc-idem', 'tc-shared', 'tc-single',
   'tc-empty', 'tc-junk', 'tc-dupname', 'tc-cap', 'tc-traverse',
-  'tc-scope-x', 'tc-scope-y', 'tc-noclobber',
+  'tc-scope-x', 'tc-scope-y', 'tc-noclobber', 'tc-resolve-existing',
+  'tc-resolve-new', 'tc-resolve-other-a', 'tc-resolve-other-b',
 ];
 
 beforeAll(async () => {
@@ -165,6 +166,74 @@ describe('constructGraphFromClaim — unit', () => {
     expect(rows[0].compiled_truth).toContain('A rich bio that must survive');
     // ...and the edge to Newco was still wired off the reused page.
     expect(await edgesBetween('tc-noclobber', 'people/enriched-one', 'companies/newco')).toHaveLength(1);
+  });
+
+  test('resolves a short name to an existing same-source entity instead of minting a duplicate stub', async () => {
+    await engine.putPage(
+      'people/marcus-vale',
+      {
+        title: 'Marcus Vale',
+        type: 'person',
+        compiled_truth: '# Marcus Vale\n\nExisting entity page.',
+        timeline: '',
+        frontmatter: {},
+      },
+      { sourceId: 'tc-resolve-existing' },
+    );
+
+    const res = await constructGraphFromClaim(engine, 'tc-resolve-existing', {
+      people: ['Marcus'],
+      entities: ['Beacon Capital'],
+      claimText: 'Marcus advises Beacon Capital',
+    });
+    expect(res.pagesCreated).toBe(1); // Beacon Capital only
+    expect(res.edgesCreated).toBe(2);
+    expect(await getPageRow('tc-resolve-existing', 'people/marcus-vale')).not.toBeNull();
+    expect(await getPageRow('tc-resolve-existing', 'people/marcus')).toBeNull();
+    expect(await edgesBetween(
+      'tc-resolve-existing',
+      'people/marcus-vale',
+      'companies/beacon-capital',
+    )).toHaveLength(1);
+  });
+
+  test('mints a typed stub when the resolver falls back for a genuinely new name', async () => {
+    const res = await constructGraphFromClaim(engine, 'tc-resolve-new', {
+      people: ['Zelda Morrow'],
+      claimText: 'Zelda Morrow started a new project',
+    });
+    expect(res.pagesCreated).toBe(1);
+    expect(res.edgesCreated).toBe(0);
+    const page = await getPageRow('tc-resolve-new', 'people/zelda-morrow');
+    expect(page).not.toBeNull();
+    expect(page!.title).toBe('Zelda Morrow');
+  });
+
+  test('resolution stays source-scoped; a match in another source does not get reused', async () => {
+    await engine.putPage(
+      'people/marcus-vale',
+      {
+        title: 'Marcus Vale',
+        type: 'person',
+        compiled_truth: '# Marcus Vale\n\nForeign source page.',
+        timeline: '',
+        frontmatter: {},
+      },
+      { sourceId: 'tc-resolve-other-a' },
+    );
+
+    const res = await constructGraphFromClaim(engine, 'tc-resolve-other-b', {
+      people: ['Marcus'],
+      entities: ['Local Co'],
+      claimText: 'Marcus advises Local Co',
+    });
+    expect(res.pagesCreated).toBe(2);
+    expect(res.edgesCreated).toBe(2);
+    expect(await getPageRow('tc-resolve-other-b', 'people/marcus-vale')).toBeNull();
+    expect(await getPageRow('tc-resolve-other-b', 'people/marcus')).not.toBeNull();
+    expect(await countPages('tc-resolve-other-a')).toBe(1);
+    expect(await countPages('tc-resolve-other-b')).toBe(2);
+    expect(await edgesBetween('tc-resolve-other-b', 'people/marcus', 'companies/local-co')).toHaveLength(1);
   });
 });
 
@@ -312,8 +381,15 @@ describe('edge cases', () => {
 
 describe('resource bound', () => {
   test('entities-per-fact is capped (no quadratic edge blow-up)', async () => {
-    // 40 distinct names; the construct considers only the first 32.
-    const people = Array.from({ length: 40 }, (_, i) => `Person Number ${i}`);
+    // 40 distinct names; the construct considers only the first 32. Use varied
+    // tokens so this test measures the cap, not fuzzy resolver coalescing.
+    const people = [
+      'Aster', 'Beryl', 'Cobalt', 'Delta', 'Ember', 'Fable', 'Garnet', 'Harbor',
+      'Ion', 'Juno', 'Krypton', 'Lumen', 'Mosaic', 'Nova', 'Onyx', 'Prism',
+      'Quartz', 'Riviera', 'Summit', 'Tango', 'Umber', 'Vector', 'Warden', 'Xenon',
+      'Yonder', 'Zephyr', 'Atlas', 'Blaze', 'Cipher', 'Dynamo', 'Equinox', 'Fjord',
+      'Glyph', 'Helix', 'Indigo', 'Jasper', 'Kepler', 'Lagoon', 'Meridian', 'Nexus',
+    ];
     const res = await constructGraphFromClaim(engine, 'tc-cap', {
       people,
       claimText: 'a very crowded claim',
@@ -322,8 +398,8 @@ describe('resource bound', () => {
     expect(res.edgesCreated).toBe(32 * 31); // bounded, not 40*39
     expect(await countPages('tc-cap')).toBe(32);
     // First-32 (input order) present; the 33rd was dropped from the graph.
-    expect(await getPageRow('tc-cap', 'people/person-number-31')).not.toBeNull();
-    expect(await getPageRow('tc-cap', 'people/person-number-32')).toBeNull();
+    expect(await getPageRow('tc-cap', 'people/fjord')).not.toBeNull();
+    expect(await getPageRow('tc-cap', 'people/glyph')).toBeNull();
   });
 });
 
