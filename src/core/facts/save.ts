@@ -37,7 +37,9 @@ import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
 import { scanRestrictedData, logRestrictedDrop } from './restricted-data.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
-import { resolveEntitySlug } from '../entities/resolve.ts';
+import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { slugifyEntity } from '../enrichment-service.ts';
+import { constructGraphFromClaim } from './construct.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -105,9 +107,14 @@ function resolveConfidence(c: ValidClaim): number {
 /**
  * Fold the structured surface forms into the `context` column so nothing the
  * client captured is lost. entity_slug is resolved separately (see
- * primarySubject + resolveEntitySlug in the insert loop) — this fold keeps
+ * primarySubject + resolvePrimaryEntitySlug in the insert loop) — this fold keeps
  * EVERY surface form recoverable even when the claim has no single primary
  * subject and entity_slug stays NULL.
+ *
+ * The same people[]/entities[] arrays ALSO drive the deterministic graph
+ * construct (entity stub pages + co-occurrence edges) AFTER the row inserts —
+ * see constructGraphFromClaim. That construct is LLM-free (pure slugify + SQL
+ * upserts), so the graph is built with no entity-resolver inference.
  *
  * Surface forms are untrusted, so the assembled string passes through the same
  * sanitizer as the claim.
@@ -132,14 +139,31 @@ function buildContext(c: ValidClaim): string | null {
  * surface forms stay recoverable via `context`). A "subject" longer than
  * 200 chars isn't a name; skip rather than resolve garbage.
  */
-function primarySubject(c: ValidClaim): string | null {
+function primarySubject(c: ValidClaim): { raw: string; type: 'person' | 'company' } | null {
   const people = (c.people ?? []).map(s => s.trim()).filter(Boolean);
   const entities = (c.entities ?? []).map(s => s.trim()).filter(Boolean);
-  let subject: string | null = null;
-  if (people.length === 1) subject = people[0];
-  else if (people.length === 0 && entities.length === 1) subject = entities[0];
-  if (subject !== null && subject.length > 200) return null;
+  let subject: { raw: string; type: 'person' | 'company' } | null = null;
+  if (people.length === 1) subject = { raw: people[0], type: 'person' };
+  else if (people.length === 0 && entities.length === 1) subject = { raw: entities[0], type: 'company' };
+  if (subject !== null && subject.raw.length > 200) return null;
   return subject;
+}
+
+async function resolvePrimaryEntitySlug(
+  engine: BrainEngine,
+  sourceId: string,
+  subject: { raw: string; type: 'person' | 'company' },
+): Promise<string | null> {
+  const resolved = await resolveEntitySlugWithSource(engine, sourceId, subject.raw);
+  if (resolved === null) return null;
+  if (resolved.source !== 'fallback_slugify') return resolved.slug;
+
+  // When there is no existing page, save_facts and the graph construct must
+  // agree on the new canonical slug. The construct mints typed fallback stubs
+  // (`people/...` / `companies/...`), so stamp facts with that same slug up front.
+  const slug = slugifyEntity(subject.raw, subject.type);
+  const body = slug.slice(slug.indexOf('/') + 1);
+  return body ? slug : null;
 }
 
 /**
@@ -271,17 +295,18 @@ export async function runSaveFacts(
     // deterministic resolver the read side uses (recall's entity branch,
     // operations.ts) and the extract write path uses (backstop.ts). Same
     // function on both sides of the seam means write format == query format
-    // by construction, including the slugify fallback when no page matches.
+    // by construction, including the typed slugify fallback when no page matches.
     // The resolver is SQL-only (pages exact → pg_trgm fuzzy → prefix
     // expansion → slugify) — no LLM, no embedding, no config read — and
     // gbrain_tenant holds SELECT on all three tables it touches (pages,
     // links, content_chunks; b7-role.sql), so it is safe inside the tenant
     // withSourceScope tx. Subject strings are attacker-controlled but only
     // ever travel as parameterized SQL values; the written slug is either an
-    // existing same-source page slug or slugify output ([a-z0-9-]).
+    // existing same-source page slug or typed slugify output
+    // (people/[a-z0-9-] / companies/[a-z0-9-]).
     const subject = primarySubject(c);
     const entitySlug = subject
-      ? await resolveEntitySlug(ctx.engine, ctx.sourceId, subject)
+      ? await resolvePrimaryEntitySlug(ctx.engine, ctx.sourceId, subject)
       : null;
 
     // --- insert (stamped) ------------------------------------------------
@@ -300,8 +325,25 @@ export async function runSaveFacts(
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, there is no fence/markdown source to reconcile through
     fact_ids.push(result.id);
-    if (result.status === 'inserted') inserted += 1;
-    else duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
+    if (result.status === 'inserted') {
+      inserted += 1;
+      // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
+      // this claim's people[]/entities[] into entity stub pages + bidirectional
+      // co-occurrence edges so traverse_graph / find_experts have a graph to
+      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts in this SAME
+      // withSourceScope tx (same-tx visibility lets the edge batch see the
+      // stubs written microseconds earlier). Runs only on a genuine insert: a
+      // duplicate's canonical fact already built the identical graph. The fact
+      // is the primary value, the graph is derived. See facts/construct.ts for
+      // the tenant-plane discipline (low-level writes, config-free, source-scoped).
+      await constructGraphFromClaim(ctx.engine, ctx.sourceId, {
+        people: c.people,
+        entities: c.entities,
+        claimText: cleaned,
+      });
+    } else {
+      duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
+    }
   }
 
   return { inserted, duplicate, dropped, fact_ids, dedup_mode };

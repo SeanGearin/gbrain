@@ -112,11 +112,10 @@ describe('save_facts — insert + stamping (B-SF4 a, d, e)', () => {
     expect(row.client_authored).toBe(true);
     expect(row.provenance).toBe('user_stated');
     expect(row.confidence).toBe(1.0);
-    // v1.1 recall-miss fix: a single-person claim gets its subject mapped to
-    // entity_slug at save time. tenant-a has no pages, so the resolver falls
-    // through to the deterministic slugify floor — same floor recall's entity
-    // branch resolves a query through, so the round-trip still matches.
-    expect(row.entity_slug).toBe('priya');
+    // v1.1 recall-miss fix + graph construct: a single-person claim gets its
+    // subject mapped to entity_slug at save time. tenant-a has no pages, so the
+    // resolver falls through to the same typed slug the graph construct mints.
+    expect(row.entity_slug).toBe('people/priya');
     expect(row.visibility).toBe('private');
     expect(row.context).toContain('Priya');
   });
@@ -367,7 +366,7 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     expect(await recallByEntity('tenant-entity', 'people/priya-sharma')).toContain(factId);
   });
 
-  test('no matching page: slugify floor still round-trips (write and read share the resolver)', async () => {
+  test('no matching page: typed graph fallback still round-trips (write and read share the resolver)', async () => {
     const saved = await runSaveFacts(
       [{ claim: 'Zinnia moved to Lisbon in May', provenance: 'user_stated', people: ['Zinnia'] }],
       { engine, sourceId: 'tenant-entity' },
@@ -376,7 +375,7 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     const factId = saved.fact_ids[0];
 
     const row = await readFactRaw(factId);
-    expect(row.entity_slug).toBe('zinnia');
+    expect(row.entity_slug).toBe('people/zinnia');
 
     expect(await recallByEntity('tenant-entity', 'Zinnia')).toContain(factId);
   });
@@ -387,14 +386,14 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
       { engine, sourceId: 'tenant-entity' },
     );
     if ('error' in person) throw new Error('unexpected validation error');
-    expect((await readFactRaw(person.fact_ids[0])).entity_slug).toBe('carla');
+    expect((await readFactRaw(person.fact_ids[0])).entity_slug).toBe('people/carla');
 
     const entity = await runSaveFacts(
       [{ claim: 'Acme Corp raised a Series B', provenance: 'user_stated', entities: ['Acme Corp'] }],
       { engine, sourceId: 'tenant-entity' },
     );
     if ('error' in entity) throw new Error('unexpected validation error');
-    expect((await readFactRaw(entity.fact_ids[0])).entity_slug).toBe('acme-corp');
+    expect((await readFactRaw(entity.fact_ids[0])).entity_slug).toBe('companies/acme-corp');
   });
 
   test('relationship-class claim (two people) saves cleanly with NULL entity_slug — no crash, no false stamp', async () => {
