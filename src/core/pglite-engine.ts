@@ -5375,6 +5375,14 @@ export class PGLiteEngine implements BrainEngine {
       params.push(escaped);
       prefixCondition = `AND p.slug LIKE $${params.length} ESCAPE '\\'`;
     }
+    let sourceCondition = '';
+    if (opts.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceCondition = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts.sourceId) {
+      params.push(opts.sourceId);
+      sourceCondition = `AND p.source_id = $${params.length}`;
+    }
     params.push(limit);
     const limitParam = `$${params.length}`;
 
@@ -5406,13 +5414,14 @@ export class PGLiteEngine implements BrainEngine {
                 + ln(1 + COUNT(DISTINCT t.id))
                 + ${recencySql}
                 AS score
-         FROM pages p
-         LEFT JOIN takes t ON t.page_id = p.id AND t.active = TRUE
-        WHERE GREATEST(p.updated_at, COALESCE(p.salience_touched_at, p.updated_at)) >= $1::timestamptz
-          ${prefixCondition}
-        GROUP BY p.id
-        ORDER BY score DESC
-        LIMIT ${limitParam}`,
+       FROM pages p
+       LEFT JOIN takes t ON t.page_id = p.id AND t.active = TRUE
+      WHERE GREATEST(p.updated_at, COALESCE(p.salience_touched_at, p.updated_at)) >= $1::timestamptz
+        ${prefixCondition}
+        ${sourceCondition}
+      GROUP BY p.id
+      ORDER BY score DESC
+      LIMIT ${limitParam}`,
       params
     );
     return (rows as Record<string, unknown>[]).map(r => ({

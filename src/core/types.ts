@@ -406,6 +406,10 @@ export interface SalienceOpts {
   days?: number;
   /** Max rows to return (clamped at 100). Default 20. */
   limit?: number;
+  /** Filter to a single source for remote/customer reads. */
+  sourceId?: string;
+  /** Filter to any of these sources; wins over sourceId when present. */
+  sourceIds?: string[];
   /** Optional slug-prefix filter (e.g., `personal`, `wiki/people`). */
   slugPrefix?: string;
   /**
