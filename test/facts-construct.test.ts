@@ -27,7 +27,7 @@ const TEST_SOURCES = [
   'tc-empty', 'tc-junk', 'tc-dupname', 'tc-cap', 'tc-traverse',
   'tc-scope-x', 'tc-scope-y', 'tc-noclobber', 'tc-resolve-existing',
   'tc-resolve-new', 'tc-resolve-other-a', 'tc-resolve-other-b',
-  'tc-person-wins',
+  'tc-person-wins', 'tc-chunks', 'tc-chunks-idem', 'tc-chunks-noclobber',
 ];
 
 beforeAll(async () => {
@@ -90,6 +90,21 @@ async function edgesBetween(
        JOIN pages t ON t.id = l.to_page_id
       WHERE f.source_id = $1 AND f.slug = $2 AND t.slug = $3`,
     [sourceId, fromSlug, toSlug],
+  );
+}
+
+/** Chunk rows for a page, with whether each is embedded yet. */
+async function chunksFor(
+  sourceId: string,
+  slug: string,
+): Promise<Array<{ chunk_text: string; chunk_source: string; has_embedding: boolean }>> {
+  return engine.executeRaw<{ chunk_text: string; chunk_source: string; has_embedding: boolean }>(
+    `SELECT cc.chunk_text, cc.chunk_source, (cc.embedding IS NOT NULL) AS has_embedding
+       FROM content_chunks cc
+       JOIN pages p ON p.id = cc.page_id
+      WHERE p.source_id = $1 AND p.slug = $2
+      ORDER BY cc.chunk_index`,
+    [sourceId, slug],
   );
 }
 
@@ -458,5 +473,90 @@ describe('source scoping (column-level; RLS half proven on Postgres)', () => {
     expect(await countPages('tc-scope-y')).toBe(0);
     expect(await countLinks('tc-scope-y')).toBe(0);
     expect(await getPageRow('tc-scope-y', 'people/xavier-one')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Searchability — the search_brain-empty root cause (findings 2026-06-17).
+// A stub built via low-level putPage alone has ZERO content_chunks, so the
+// entity is invisible to search_brain/query (hybrid search over content_chunks)
+// even though recall (facts) sees it. Construct now also chunks each NEW stub.
+// ---------------------------------------------------------------------------
+describe('constructGraphFromClaim — searchability (stub chunks)', () => {
+  test('a new stub gets content_chunks (NULL embedding) so search_brain can reach it', async () => {
+    const res = await constructGraphFromClaim(engine, 'tc-chunks', {
+      people: ['Marcus Vale'],
+      entities: ['Sightline'],
+      claimText: 'Marcus Vale is tracking the Sightline deal',
+    });
+    // Two stubs minted → each compiled_truth chunked (≤300 words → 1 chunk each).
+    expect(res.pagesCreated).toBe(2);
+    expect(res.chunksCreated).toBe(2);
+
+    const companyChunks = await chunksFor('tc-chunks', 'companies/sightline');
+    expect(companyChunks.length).toBeGreaterThan(0);
+    // chunk_source is the compiled_truth lane, and the entity NAME is in the text
+    // (so a keyword/semantic search for "Sightline" can match the chunk).
+    expect(companyChunks[0].chunk_source).toBe('compiled_truth');
+    expect(companyChunks.some(c => /sightline/i.test(c.chunk_text))).toBe(true);
+    // Deferred-embed contract: chunks land NULL-embedding (no embed call on the
+    // tenant plane); `embed --stale` fills the vector arm. Keyword search works
+    // immediately via the chunk_search_vector trigger (prod Postgres).
+    expect(companyChunks.every(c => c.has_embedding === false)).toBe(true);
+
+    const personChunks = await chunksFor('tc-chunks', 'people/marcus-vale');
+    expect(personChunks.length).toBeGreaterThan(0);
+
+    // The acceptance criterion, at unit grain: a keyword search now returns the
+    // entity page (pre-fix this was empty — 0 chunks → nothing to match). The
+    // chunk_search_vector trigger populates search_vector even with NULL embedding.
+    const hits = await engine.searchKeyword('Sightline', { sourceId: 'tc-chunks' });
+    expect(hits.some(h => h.slug === 'companies/sightline')).toBe(true);
+  });
+
+  test('re-running the identical claim creates no duplicate chunks', async () => {
+    const first = await constructGraphFromClaim(engine, 'tc-chunks-idem', {
+      people: ['Dana Vale'],
+      entities: ['Boltline'],
+      claimText: 'Dana Vale owns Boltline',
+    });
+    expect(first.chunksCreated).toBe(2);
+
+    const again = await constructGraphFromClaim(engine, 'tc-chunks-idem', {
+      people: ['Dana Vale'],
+      entities: ['Boltline'],
+      claimText: 'Dana Vale owns Boltline',
+    });
+    // Existing pages are reused, never re-chunked.
+    expect(again.pagesCreated).toBe(0);
+    expect(again.chunksCreated).toBe(0);
+    // Still exactly one chunk for the company (no duplication).
+    expect((await chunksFor('tc-chunks-idem', 'companies/boltline')).length).toBe(1);
+  });
+
+  test('reused (already-enriched) pages are not re-chunked', async () => {
+    // Seed an enriched page directly with its own chunk set.
+    await engine.putPage(
+      'companies/acme',
+      { title: 'Acme', type: 'company', compiled_truth: '# Acme\n\nA real profile with substance.', timeline: '' },
+      { sourceId: 'tc-chunks-noclobber' },
+    );
+    await engine.upsertChunks(
+      'companies/acme',
+      [{ chunk_index: 0, chunk_text: 'A real profile with substance.', chunk_source: 'compiled_truth' }],
+      { sourceId: 'tc-chunks-noclobber' },
+    );
+
+    const res = await constructGraphFromClaim(engine, 'tc-chunks-noclobber', {
+      people: ['Quinn Real'],
+      entities: ['Acme'],
+      claimText: 'Quinn Real works at Acme',
+    });
+    // Only the new person stub is created + chunked; Acme is reused untouched.
+    expect(res.pagesCreated).toBe(1);
+    expect(res.chunksCreated).toBe(1);
+    const acme = await chunksFor('tc-chunks-noclobber', 'companies/acme');
+    expect(acme.length).toBe(1);
+    expect(acme[0].chunk_text).toBe('A real profile with substance.');
   });
 });
