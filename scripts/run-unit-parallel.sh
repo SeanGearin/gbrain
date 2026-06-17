@@ -14,7 +14,7 @@
 # Env overrides:
 #   SHARDS=N                     same as --shards
 #   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 7200)
-#   GBRAIN_TEST_MAX_CONCURRENCY  passed through to bun test (default 4)
+#   GBRAIN_TEST_MAX_CONCURRENCY  per-shard bun test cap (default 1)
 #
 # Output files (workspace-local; falls back to /tmp if .context/ unwritable):
 #   .context/test-failures.log   failure blocks (cleared at start)
@@ -70,7 +70,18 @@ if [ -z "${SHARDS_OVERRIDE:-}" ] && [ -z "${SHARDS:-}" ] && [ "$N" -gt 4 ]; then
   N=4
 fi
 
-INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
+INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-1}}"
+if ! printf '%s' "$INTRA_CONC" | grep -qE '^[0-9]+$' || [ "$INTRA_CONC" -lt 1 ]; then
+  echo "ERROR: invalid max concurrency: $INTRA_CONC" >&2
+  exit 2
+fi
+# v0.42.23 harness hardening: cap the default effective file concurrency at
+# the wrapper level. Bun cannot express this in bunfig.toml, and PGLite-heavy
+# test files can starve setup hooks when the sharded runner multiplies Bun's
+# per-process file concurrency across several shard processes. Keep the
+# default conservative: up to 4 shard processes, one file at a time in each.
+# Faster machines can opt in via --max-concurrency N / GBRAIN_TEST_MAX_CONCURRENCY.
+EFFECTIVE_CONC=$((N * INTRA_CONC))
 # v0.42.23 harness hardening: keep a hard cap, but make it a true runaway
 # guard rather than a normal-suite wallclock. On slower local machines the
 # previous 1500s cap killed active shards while they were still passing tests
@@ -107,7 +118,7 @@ elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
 fi
 
 START_TS=$(date +%s)
-echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC | timeout=${SHARD_TIMEOUT}s | logs=$LOG_DIR" >&2
+echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC | effective-file-concurrency=$EFFECTIVE_CONC | timeout=${SHARD_TIMEOUT}s | logs=$LOG_DIR" >&2
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "[unit-parallel] dry-run: would spawn $N shards with the above settings."

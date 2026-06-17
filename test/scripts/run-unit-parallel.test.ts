@@ -83,6 +83,17 @@ function runWrapper(extraArgs: string[] = []): { code: number; stdout: string; s
 }
 
 describe('run-unit-parallel.sh exit-code propagation (a)', () => {
+  it('defaults to one active bun test file per shard', () => {
+    const r = spawnSync(
+      'bash',
+      [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2', '--dry-run'],
+      { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('--max-concurrency=1');
+    expect(r.stderr).toContain('effective-file-concurrency=2');
+  });
+
   it('exits non-zero when any shard contains a failing test', () => {
     const r = runWrapper();
     expect(r.code).not.toBe(0);

@@ -53,7 +53,7 @@ docs/                     Architecture docs
 
 ```bash
 # Inner edit loop (~85s on a Mac dev box, 3700+ unit tests)
-bun run test                      # parallel 8-shard fan-out + serial post-pass
+bun run test                      # canonical capped unit wrapper + serial post-pass
 bun test test/markdown.test.ts    # specific unit test
 
 # Pre-push gate (matches what CI runs on shard 1 + typecheck)
@@ -90,7 +90,7 @@ trailing-newline and exports-count checks.
 
 ### Writing tests that survive the parallel loop
 
-`bun run test` shards 92+ unit-test files across 8 worker processes. Files in the
+`bun run test` shards unit-test files through the capped wrapper. Files in the
 same shard share a process, so process-global state leaks between them. Four
 lint rules (`scripts/check-test-isolation.sh`, R1-R4) enforce isolation:
 

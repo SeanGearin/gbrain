@@ -9,7 +9,7 @@ Seven test command tiers, each with a clear scope:
 
 | Command | What it runs | Wallclock | When to use |
 |---|---|---|---|
-| `bun run test` | Parallel unit-test fast loop. 4-shard local fan-out via `scripts/run-unit-parallel.sh`, then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. | varies by machine and PGLite migration load | Inner edit loop. Default. |
+| `bun run test` | Canonical full unit command. 4-shard local fan-out via `scripts/run-unit-parallel.sh`, capped at one active Bun test file per shard by default (effective file concurrency: 4), then a serial pass over `*.serial.test.ts`. Excludes `*.slow.test.ts` and `test/e2e/*`. No pre-checks, no typecheck. | varies by machine and PGLite migration load | Inner edit loop. Default. |
 | `bun run verify` | CI's authoritative pre-test gate set: `check:privacy && check:jsonb && check:progress && check:wasm && bun run typecheck`. The 4 checks `.github/workflows/test.yml` runs on shard 1 + typecheck. Single source of truth — CI literally calls `bun run verify`. | ~12s (wasm-compile dominates) | Before pushing; before `/ship`. |
 | `bun run test:full` | `verify && bun run test && bun run test:slow && [smart e2e]`. The local equivalent of "everything CI runs." Smart e2e: runs e2e only when `DATABASE_URL` is set; else loud skip notice to stderr. | ~3-5min depending on slow + e2e | Pre-merge sanity, before opening a PR. |
 | `bun run test:slow` | Just the `*.slow.test.ts` set (intentional cold-path correctness checks). | seconds-to-minutes | When touching slow-path code. |
@@ -18,13 +18,14 @@ Seven test command tiers, each with a clear scope:
 | `bun run test:e2e` | Real Postgres E2E. Requires Docker + `DATABASE_URL`. Sequential. | ~5-10min | Pre-ship; nightly. |
 | `bun run check:all` | All 7 historical pre-checks (privacy + jsonb + progress + no-legacy-getconnection + trailing-newline + wasm + exports-count). Superset of `verify`. | ~10s | Local-only sweep. The 4 not in `verify` are nice-to-haves. |
 
-Direct `bun test` is configured in `bunfig.toml` to mean the same default unit tier:
-it preloads `test/helpers/hermetic-preload.ts`, ignores nested local worktrees,
+`bun run test` is the canonical default because the wrapper can cap effective
+file-level concurrency. Direct `bun test` is best-effort: `bunfig.toml` still
+preloads `test/helpers/hermetic-preload.ts`, ignores nested local worktrees,
 `test/e2e/**`, `*.integration.test.ts`, `*.slow.test.ts`, and `*.serial.test.ts`,
-and strips live DB/remote env unless a named integration runner opts in. Use the
-named commands above for integration, E2E, slow, and serial groups. The default
-also enables Bun's `test.smol` mode so the PGLite-heavy unit tier does not
-exhaust the WASM runtime under Bun's default 20-way file concurrency.
+strips live DB/remote env unless a named integration runner opts in, and enables
+Bun's `test.smol` mode. Bun does not expose a supported `--max-concurrency`
+setting in `bunfig.toml`, so use the named commands above for normal local
+validation and for integration, E2E, slow, and serial groups.
 
 The hermetic preload also calls Bun's `setDefaultTimeout()` with
 `GBRAIN_TEST_TIMEOUT_MS` (default 120000ms) because `bunfig.toml` does not support
@@ -32,7 +33,10 @@ the CLI `--timeout` flag. It serializes `PGLiteEngine.initSchema()` during tests
 so migration-heavy files do not starve each other's setup hooks under Bun's
 default 20-way file concurrency. Named runners can still pass explicit timeouts.
 
-`bun run test` keeps a hard per-shard wallclock cap via
+`bun run test` keeps a low default concurrency cap via
+`GBRAIN_TEST_MAX_CONCURRENCY` (default 1 per shard; with the default 4 shards,
+effective file concurrency is 4). Override only when the machine can sustain
+more concurrent PGLite setup hooks. It also keeps a hard per-shard wallclock cap via
 `GBRAIN_TEST_SHARD_TIMEOUT` (default 7200s). The cap is a runaway guard, not a
 normal pass/fail budget; slow but active shards should continue rather than be
 false-killed while replaying PGLite migrations.
@@ -57,7 +61,7 @@ If a shard wedges (per-shard `GBRAIN_TEST_SHARD_TIMEOUT` cap, default 7200s), th
 
 ### File taxonomy
 
-- `*.test.ts` → fast loop (parallel 8-shard fan-out).
+- `*.test.ts` → fast loop (`bun run test`, default effective file concurrency 4).
 - `*.slow.test.ts` → run via `bun run test:slow` only (intentional cold-path tests; would dominate the fast loop's wallclock).
 - `*.serial.test.ts` → run via `bun run test:serial` after the parallel pass completes; uses `--max-concurrency=1`. Quarantine for tests that share file-wide state and race when run alongside other files in the same `bun test` process. Currently includes `test/brain-registry.serial.test.ts`, `test/reconcile-links.serial.test.ts`, `test/core/cycle.serial.test.ts`, `test/embed.serial.test.ts`, `test/orphans.serial.test.ts`, and `test/sync-parallel.serial.test.ts`. **Do not put the parallelism back on a serial file unless you've fixed the contention root cause** (it just re-introduces the flake).
 - `*.integration.test.ts` → run via `bun run test:integration` only. Use for local fixtures that need non-unit resources, such as `test/http-transport.integration.test.ts`, `test/mcp-client.integration.test.ts`, or `test/init-mcp-only.integration.test.ts` binding a local HTTP server. Keep them out of the default unit loop so sandbox or host socket policy does not fail unrelated unit validation.

@@ -1,12 +1,13 @@
 [test]
 # PGLite-heavy files otherwise run under Bun's default 20-way concurrency and
-# can exhaust the WASM runtime on developer machines. Bun's supported test
-# memory knob keeps plain `bun test` hermetic without moving DB-backed unit
-# coverage out of the default tier.
+# can exhaust the WASM runtime on developer machines. Bun does not expose a
+# supported max-concurrency setting here, so plain `bun test` is best-effort;
+# `bun run test` is the canonical capped full unit command.
 smol = true
 
-# Direct `bun test` should match the repo's default unit tier. E2E, slow,
-# and serial quarantines have named runners (`bun run test:e2e`,
+# Direct `bun test` keeps the same file exclusions and hermetic preload as the
+# default unit tier, but not the wrapper-level concurrency cap. E2E, slow, and
+# serial quarantines have named runners (`bun run test:e2e`,
 # `bun run test:slow`, `bun run test:serial`) so the default path stays
 # hermetic and fast.
 pathIgnorePatterns = [
