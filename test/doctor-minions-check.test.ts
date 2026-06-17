@@ -27,9 +27,16 @@ let origHome: string | undefined;
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
   // Strip DATABASE_URL so doctor runs filesystem-only for these tests.
   // Half-migrated checks run in the filesystem section; no DB needed.
-  const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
+  const env = {
+    ...process.env,
+    HOME: tmp,
+    GBRAIN_HOME: join(tmp, '.gbrain'),
+  } as Record<string, string | undefined>;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
+  delete env.GBRAIN_DIRECT_DATABASE_URL;
+  delete env.GBRAIN_REMOTE_CLIENT_SECRET;
+  delete env.GBRAIN_TEST_ALLOW_REMOTE_DOCTOR;
   try {
     const stdout = execFileSync('bun', ['run', CLI, ...args], {
       env: env as Record<string, string>,

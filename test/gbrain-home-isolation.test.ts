@@ -16,7 +16,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, existsSync, readdirSync, statSync, rmSync } from 'fs';
-import { homedir, tmpdir } from 'os';
+import { tmpdir } from 'os';
 import { join } from 'path';
 
 // Save original env so we don't leak between tests.
@@ -40,17 +40,22 @@ describe('GBRAIN_HOME write-side isolation', () => {
     }
   });
 
-  test('configDir() falls back to homedir when GBRAIN_HOME unset', async () => {
+  test('configDir() honors HOME before homedir when GBRAIN_HOME unset', async () => {
+    const tmp = fresh();
+    const origHome = process.env.HOME;
     delete process.env.GBRAIN_HOME;
+    process.env.HOME = tmp;
     try {
       const { configDir } = await import('../src/core/config.ts');
-      // Contract: when GBRAIN_HOME is unset, configDir() === os.homedir()/.gbrain.
-      // Asserting against os.homedir() (rather than a "not /tmp/" sentinel) keeps
-      // this test correct under safety wrappers that redirect HOME=/tmp/... — the
-      // behavior we care about is that the fallback path equals homedir().
-      expect(configDir()).toBe(join(homedir(), '.gbrain'));
+      // Contract: when GBRAIN_HOME is unset, configDir() honors the active HOME
+      // env before falling back to os.homedir(). This keeps test wrappers from
+      // reaching the operator's real ~/.gbrain when they redirect HOME.
+      expect(configDir()).toBe(join(tmp, '.gbrain'));
     } finally {
+      if (origHome !== undefined) process.env.HOME = origHome;
+      else delete process.env.HOME;
       if (ORIG_GBRAIN_HOME !== undefined) process.env.GBRAIN_HOME = ORIG_GBRAIN_HOME;
+      rmSync(tmp, { recursive: true, force: true });
     }
   });
 

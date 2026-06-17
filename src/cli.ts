@@ -1142,7 +1142,10 @@ async function handleCliOnly(command: string, args: string[]) {
     // outbound-HTTP probe set in `src/core/doctor-remote.ts` and return
     // before any local-engine work.
     const cfgForDoctor = loadConfig();
-    if (isThinClient(cfgForDoctor)) {
+    const allowRemoteDoctor =
+      process.env.GBRAIN_TEST_MODE !== '1' ||
+      process.env.GBRAIN_TEST_ALLOW_REMOTE_DOCTOR === '1';
+    if (isThinClient(cfgForDoctor) && allowRemoteDoctor) {
       const { runRemoteDoctor } = await import('./core/doctor-remote.ts');
       await runRemoteDoctor(cfgForDoctor!, args);
       return;

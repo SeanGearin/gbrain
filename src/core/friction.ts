@@ -329,7 +329,7 @@ export function renderSummary(runId: string, opts: { format?: 'md' | 'json' } = 
 
 /** Replace homedir/cwd segments in user-visible string fields with placeholders. */
 export function redactEntry(entry: FrictionEntry): FrictionEntry {
-  const home = homedir();
+  const home = process.env.HOME || homedir();
   const cwd = entry.cwd;
   const transform = (s: string | undefined): string | undefined => {
     if (!s) return s;

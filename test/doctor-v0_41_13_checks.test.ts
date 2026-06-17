@@ -18,7 +18,10 @@
  */
 
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 interface DoctorCheck {
   name: string;
@@ -33,27 +36,41 @@ interface DoctorEnvelope {
 }
 
 function runDoctor(): DoctorEnvelope {
-  const result = spawnSync(
-    process.execPath, // bun
-    ['src/cli.ts', 'doctor', '--json', '--fast'],
-    {
-      cwd: process.cwd(),
-      encoding: 'utf8',
-      timeout: 60000,
-    },
-  );
-  if (result.error) throw result.error;
-  // Doctor's JSON envelope is the LAST line in stdout (CLI may print
-  // banners on stderr; --json sends the envelope to stdout).
-  const stdout = result.stdout ?? '';
-  const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
-  const jsonLine = lines.reverse().find((l) => l.trim().startsWith('{'));
-  if (!jsonLine) {
-    throw new Error(
-      `No JSON envelope found in doctor output. stdout=${stdout.slice(0, 500)} stderr=${(result.stderr ?? '').slice(0, 500)}`,
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-doctor-checks-home-'));
+  const gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-doctor-checks-gbrain-'));
+  try {
+    const env = { ...process.env, HOME: home, GBRAIN_HOME: gbrainHome } as Record<string, string | undefined>;
+    delete env.DATABASE_URL;
+    delete env.GBRAIN_DATABASE_URL;
+    delete env.GBRAIN_DIRECT_DATABASE_URL;
+    delete env.GBRAIN_REMOTE_CLIENT_SECRET;
+    delete env.GBRAIN_TEST_ALLOW_REMOTE_DOCTOR;
+    const result = spawnSync(
+      process.execPath, // bun
+      ['src/cli.ts', 'doctor', '--json', '--fast'],
+      {
+        cwd: process.cwd(),
+        env: env as Record<string, string>,
+        encoding: 'utf8',
+        timeout: 60000,
+      },
     );
+    if (result.error) throw result.error;
+    // Doctor's JSON envelope is the LAST line in stdout (CLI may print
+    // banners on stderr; --json sends the envelope to stdout).
+    const stdout = result.stdout ?? '';
+    const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
+    const jsonLine = lines.reverse().find((l) => l.trim().startsWith('{'));
+    if (!jsonLine) {
+      throw new Error(
+        `No JSON envelope found in doctor output. stdout=${stdout.slice(0, 500)} stderr=${(result.stderr ?? '').slice(0, 500)}`,
+      );
+    }
+    return JSON.parse(jsonLine) as DoctorEnvelope;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(gbrainHome, { recursive: true, force: true });
   }
-  return JSON.parse(jsonLine) as DoctorEnvelope;
 }
 
 describe('doctor — v0.41.16.0 new checks emit', () => {

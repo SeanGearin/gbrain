@@ -108,4 +108,4 @@ fi
 
 # Convert newline-separated file list to argv. xargs handles the
 # whitespace correctly without word-splitting on spaces in paths.
-printf '%s\n' "$SHARD_FILES" | xargs bun test --timeout=60000
+printf '%s\n' "$SHARD_FILES" | xargs bun test --path-ignore-patterns "" --timeout=60000

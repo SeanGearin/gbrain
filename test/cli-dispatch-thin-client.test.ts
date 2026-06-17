@@ -57,7 +57,7 @@ function seedLocalPGLiteConfig() {
 
 interface RunResult { exitCode: number; stdout: string; stderr: string; }
 
-async function run(args: string[]): Promise<RunResult> {
+async function run(args: string[], extraEnv: Record<string, string> = {}): Promise<RunResult> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
@@ -66,6 +66,7 @@ async function run(args: string[]): Promise<RunResult> {
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
   delete env.GBRAIN_REMOTE_CLIENT_SECRET;
+  Object.assign(env, extraEnv);
   const proc = Bun.spawn({
     cmd: ['bun', 'run', CLI, ...args],
     env,
@@ -144,7 +145,7 @@ describe('thin-client dispatch guard does NOT refuse safe commands', () => {
 describe('thin-client doctor routes to runRemoteDoctor', () => {
   test('`gbrain doctor` runs remote checks (not DB-bound checks) when remote_mcp is set', async () => {
     seedThinClientConfig();
-    const r = await run(['doctor', '--json']);
+    const r = await run(['doctor', '--json'], { GBRAIN_TEST_ALLOW_REMOTE_DOCTOR: '1' });
     // Doctor will likely fail because brain-host.example isn't reachable —
     // but that's irrelevant. What matters is it ran the THIN-CLIENT doctor,
     // not the local-DB doctor. Fingerprint: the remote doctor's JSON output

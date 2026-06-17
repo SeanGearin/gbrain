@@ -13,7 +13,7 @@
 #
 # Env overrides:
 #   SHARDS=N                     same as --shards
-#   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 600)
+#   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 7200)
 #   GBRAIN_TEST_MAX_CONCURRENCY  passed through to bun test (default 4)
 #
 # Output files (workspace-local; falls back to /tmp if .context/ unwritable):
@@ -71,14 +71,12 @@ if [ -z "${SHARDS_OVERRIDE:-}" ] && [ -z "${SHARDS:-}" ] && [ "$N" -gt 4 ]; then
 fi
 
 INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
-# v0.40.10 flake-hardening: bump per-shard cap 600 → 1500 (was 900). At
-# 4-shard default each shard runs 159 files / ~2420 tests with internal
-# wallclock 960-1020s. The 900s value (sized for 8-shard's ~80 files /
-# 1100 tests at 620-770s) false-killed shard 1 at 900s even though it
-# had completed in 968s. 1500s cap gives ~55% headroom over observed
-# 4-shard wallclock; real hangs still hit it. Override via
-# GBRAIN_TEST_SHARD_TIMEOUT=N.
-SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-1500}"
+# v0.42.23 harness hardening: keep a hard cap, but make it a true runaway
+# guard rather than a normal-suite wallclock. On slower local machines the
+# previous 1500s cap killed active shards while they were still passing tests
+# and replaying PGLite migrations, which made `bun run test` look wedged when
+# it was only slow. Override via GBRAIN_TEST_SHARD_TIMEOUT=N for tighter CI jobs.
+SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-7200}"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output directories. Prefer workspace-local .context/, fall back to /tmp.

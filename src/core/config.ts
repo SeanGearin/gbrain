@@ -893,7 +893,13 @@ export function configDir(): string {
     }
     return join(trimmed, '.gbrain');
   }
-  return join(homedir(), '.gbrain');
+  // Prefer HOME over os.homedir() so test/bootstrap wrappers that redirect
+  // HOME before project modules load cannot fall through to the operator's
+  // real ~/.gbrain. If HOME is absent or non-absolute, preserve the legacy
+  // os.homedir() fallback.
+  const homeOverride = process.env.HOME?.trim();
+  const home = homeOverride && isAbsolute(homeOverride) ? homeOverride : homedir();
+  return join(home, '.gbrain');
 }
 
 export function configPath(): string {

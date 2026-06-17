@@ -9,9 +9,9 @@
  *   - --quiet → no stdout, same exit code.
  *   - --help → prints usage, exits 0.
  *
- * Subprocess invocation against temp $HOME so each test sees clean fixture
- * state. DATABASE_URL / GBRAIN_DATABASE_URL stripped so the report runs
- * filesystem-only (the checks we care about live there).
+ * Subprocess invocation against temp $HOME so each test sees clean legacy
+ * ~/.gbrain fixture state. GBRAIN_HOME is cleared because the preferences
+ * migration ledger treats it as the .gbrain directory itself.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -27,8 +27,10 @@ let origHome: string | undefined;
 
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
   const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
+  delete env.GBRAIN_HOME;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
+  delete env.GBRAIN_REMOTE_CLIENT_SECRET;
   try {
     const stdout = execFileSync('bun', ['run', CLI, ...args], {
       env: env as Record<string, string>,

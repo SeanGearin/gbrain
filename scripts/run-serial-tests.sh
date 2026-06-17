@@ -41,7 +41,7 @@ echo "[serial-tests] running ${#files[@]} file(s), one bun process per file"
 fail_count=0
 failed_files=()
 for f in "${files[@]}"; do
-  if ! bun test --max-concurrency=1 --timeout=60000 "$f"; then
+  if ! bun test --path-ignore-patterns "" --max-concurrency=1 --timeout=60000 "$f"; then
     fail_count=$((fail_count + 1))
     failed_files+=("$f")
   fi

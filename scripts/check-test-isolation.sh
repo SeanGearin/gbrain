@@ -22,6 +22,8 @@
 # Scope:
 #  - Recursively scans `test/**/*.test.ts`.
 #  - Skips `*.serial.test.ts` entirely (the quarantine escape hatch).
+#  - Skips `*.integration.test.ts` (local resource fixtures run in their
+#    named runner, not in the parallel unit pool).
 #  - Skips `test/e2e/**` (E2E runs sequentially in its own runner; not in
 #    the parallel pool).
 #
@@ -74,6 +76,7 @@ is_allowlisted() {
 # bash 3.2 (macOS default) and bash 4+; no mapfile.
 FILE_LIST="$(find "$TARGET_DIR" -name '*.test.ts' \
   -not -name '*.serial.test.ts' \
+  -not -name '*.integration.test.ts' \
   -not -path "*/e2e/*" \
   -type f 2>/dev/null | sort)"
 

@@ -56,9 +56,10 @@ describe('run-serial-tests.sh contract', () => {
     }
   });
 
-  it('passes --max-concurrency=1 to bun test', () => {
+  it('passes serial runner flags to bun test', () => {
     const src = readFileSync(SERIAL_SH, 'utf-8');
-    expect(src).toMatch(/bun test\s+--max-concurrency=1/);
+    expect(src).toMatch(/bun test\b[^\n]*--path-ignore-patterns ""/);
+    expect(src).toMatch(/bun test\b[^\n]*--max-concurrency=1/);
   });
 
   it('disjoint from run-unit-shard.sh (a file is never in both passes)', () => {

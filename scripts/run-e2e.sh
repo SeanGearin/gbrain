@@ -64,6 +64,8 @@ trap 'rm -rf "$E2E_TMP_HOME"' EXIT
 
 export HOME="$E2E_TMP_HOME"
 export GBRAIN_HOME="$E2E_TMP_HOME"
+export GBRAIN_TEST_ALLOW_DATABASE_URL=1
+export GBRAIN_TEST_ALLOW_REMOTE_DOCTOR=1
 mkdir -p "$E2E_TMP_HOME/.gbrain"
 
 # --dry-run-list: print the resolved file list (one per line) and exit. Used
@@ -156,7 +158,7 @@ for f in "${files[@]}"; do
   else
     TIMEOUT_CMD=""
   fi
-  if output=$($TIMEOUT_CMD bun test --timeout=60000 "$f" 2>&1); then
+  if output=$($TIMEOUT_CMD bun test --path-ignore-patterns "" --timeout=60000 "$f" 2>&1); then
     pass_files=$((pass_files + 1))
     # Extract pass/fail counts from bun's summary (e.g., "123 pass")
     p=$(echo "$output" | grep -oE '[0-9]+ pass' | tail -1 | grep -oE '[0-9]+' || echo 0)
