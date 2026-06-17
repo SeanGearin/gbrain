@@ -17,17 +17,33 @@
  *      to_page_id` ONLY (postgres-engine.ts:2381 / pglite parity) — a single
  *      direction would be invisible when the walk seeds from the other endpoint.
  *
- * COST — per fact: 0 chat-model calls, 0 embedding calls. Pure SQL: N slug
- * string-ops + ≤N page upserts + 1 batched edge insert. Passes the zero-LLM-
- * per-fact economic gate by construction (the customer's own model already paid
- * for the cognition that produced the arrays; turning them into a graph is DB
- * work). This module imports nothing from the AI gateway.
+ * COST — per fact: 0 chat-model calls, 0 embedding calls. Pure SQL + a pure
+ * text-split: N slug string-ops + ≤N page upserts + ≤N stub-chunk upserts +
+ * 1 batched edge insert. Passes the zero-LLM-per-fact economic gate by
+ * construction (the customer's own model already paid for the cognition that
+ * produced the arrays; turning them into a graph is DB work). This module
+ * imports nothing from the AI gateway — `chunkText` is a pure local splitter.
+ *
+ * SEARCHABILITY (findings 2026-06-17 — the search_brain-empty root cause).
+ *   `search_brain`/`query` is hybrid search over `content_chunks`. A stub
+ *   created via the low-level `putPage` alone produces a page row with ZERO
+ *   chunks, so the entity is invisible to semantic search even though `recall`
+ *   (facts table) and `brain_check` (page count) see it. Fix: every NEW stub
+ *   also gets its `compiled_truth` chunked into `content_chunks` here, the SAME
+ *   chunkText→upsertChunks pair the authored put_page path uses (import-file.ts).
+ *   Chunks land with NULL embedding — the `chunk_search_vector_trigger` makes
+ *   them keyword-searchable immediately; the existing `embed --stale` pass fills
+ *   the vector arm later. This keeps the "0 embedding calls here" contract (the
+ *   embed is deferred + external, exactly as `reindex` defers it), so the
+ *   tenant-plane FLAG-C discipline is untouched.
  *
  * TENANT-PLANE DISCIPLINE (CC packet "where the real care goes"):
- *   - LOW-LEVEL direct writes only — `engine.putPage` / `engine.addLinksBatch`,
- *     NOT the `put_page` OP. The op's post-write hooks (auto_link, write-through
- *     render) are the FLAG-C config-read / embedding surface the b7 series keeps
- *     OFF the tenant plane; these engine methods are plain upserts/inserts.
+ *   - LOW-LEVEL direct writes only — `engine.putPage` / `engine.upsertChunks` /
+ *     `engine.addLinksBatch`, NOT the `put_page` OP. The op's post-write hooks
+ *     (auto_link, write-through render) are the FLAG-C config-read / embedding
+ *     surface the b7 series keeps OFF the tenant plane; these engine methods are
+ *     plain upserts/inserts called inside the caller's tx — the same pair
+ *     `importFromContent` runs inside its own transaction (import-file.ts:766/816).
  *   - CONFIG-FREE — no getConfig. Runs inside the caller's withSourceScope tx
  *     under the NOBYPASSRLS gbrain_tenant role; a raw config read there aborts
  *     the whole tx (the FLAG-C class).
@@ -55,6 +71,8 @@
  */
 
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import type { ChunkInput } from '../types.ts';
+import { chunkText, MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
 
@@ -111,6 +129,13 @@ export interface ConstructInput {
 export interface ConstructResult {
   /** Entity stub pages newly created this call (pre-existing pages are reused, not re-created). */
   pagesCreated: number;
+  /**
+   * content_chunks rows written for newly-created stubs this call, so the
+   * entities are reachable by `search_brain`/`query`. 0 when no new stub was
+   * minted (existing pages keep their own chunks; we never re-chunk them).
+   * Chunks land NULL-embedding; `embed --stale` fills the vector arm.
+   */
+  chunksCreated: number;
   /** Co-occurrence edge rows newly inserted (ON CONFLICT DO NOTHING → 0 on resend). */
   edgesCreated: number;
 }
@@ -146,7 +171,7 @@ export async function constructGraphFromClaim(
   for (const name of input.entities ?? []) {
     refs.push({ name, type: personSurfaces.has(surfaceKey(name)) ? 'person' : 'company' });
   }
-  if (refs.length === 0) return { pagesCreated: 0, edgesCreated: 0 };
+  if (refs.length === 0) return { pagesCreated: 0, chunksCreated: 0, edgesCreated: 0 };
 
   // 2. Each ref → canonical slug; ensure a stub page exists (create only when
   //    absent — never clobber an already-enriched page). Dedup slugs preserving
@@ -157,6 +182,7 @@ export async function constructGraphFromClaim(
   const slugs: string[] = [];
   const seen = new Set<string>();
   let pagesCreated = 0;
+  let chunksCreated = 0;
   for (const ref of refs) {
     if (slugs.length >= MAX_ENTITIES_PER_FACT) break;
     const resolved = await resolveConstructSlug(engine, sourceId, ref.name, ref.type);
@@ -164,13 +190,17 @@ export async function constructGraphFromClaim(
     const { slug, shouldCreateStub } = resolved;
     if (seen.has(slug)) continue;
     seen.add(slug);
-    if (shouldCreateStub && await ensureStub(engine, sourceId, slug, ref.name, ref.type)) pagesCreated += 1;
+    if (shouldCreateStub) {
+      const stub = await ensureStub(engine, sourceId, slug, ref.name, ref.type);
+      if (stub.pageCreated) pagesCreated += 1;
+      chunksCreated += stub.chunksCreated;
+    }
     slugs.push(slug);
   }
 
   // 3. Bidirectional co-occurrence edges across every distinct pair. A single
   //    entity in the claim produces a page but no edge (nothing to connect).
-  if (slugs.length < 2) return { pagesCreated, edgesCreated: 0 };
+  if (slugs.length < 2) return { pagesCreated, chunksCreated, edgesCreated: 0 };
   const context = input.claimText.slice(0, 500);
   const links: LinkBatchInput[] = [];
   for (let i = 0; i < slugs.length; i++) {
@@ -180,7 +210,7 @@ export async function constructGraphFromClaim(
     }
   }
   const edgesCreated = await engine.addLinksBatch(links); // gbrain-allow-direct-insert: deterministic save_facts graph construct — co-occurrence edges from a client-extracted fact; low-level batch insert inside the withSourceScope tx, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
-  return { pagesCreated, edgesCreated };
+  return { pagesCreated, chunksCreated, edgesCreated };
 }
 
 /**
@@ -236,6 +266,11 @@ function surfaceKey(name: string): string {
  * rewrites the page.
  *
  * Deliberately minimal content: a graph anchor, not a profile.
+ *
+ * Also writes the stub's content_chunks so the entity is reachable by
+ * `search_brain`/`query` (see the SEARCHABILITY note in the module header).
+ * Returns whether a page was created and how many chunks were written (0 when
+ * the page already existed — we never re-chunk an existing page here).
  */
 async function ensureStub(
   engine: BrainEngine,
@@ -243,26 +278,63 @@ async function ensureStub(
   slug: string,
   name: string,
   type: 'person' | 'company',
-): Promise<boolean> {
+): Promise<{ pageCreated: boolean; chunksCreated: number }> {
   // Source-scoped existence check (hides soft-deleted by default). On Postgres
   // this is also RLS-confined to the tenant; here it keeps PGLite (no RLS)
   // honest about which source owns the page.
-  if (await engine.getPage(slug, { sourceId })) return false;
+  if (await engine.getPage(slug, { sourceId })) return { pageCreated: false, chunksCreated: 0 };
   const label = type === 'person' ? 'Person' : 'Company';
+  const compiledTruth = `# ${name}\n\n**Type:** ${label}\n\n## Summary\n\n*Stub page. Created from a saved fact.*\n\n## Timeline\n`;
   await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts graph construct — entity stub from a client-extracted fact; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
     slug,
     {
       title: name,
       type,
-      compiled_truth: `# ${name}\n\n**Type:** ${label}\n\n## Summary\n\n*Stub page. Created from a saved fact.*\n\n## Timeline\n`,
+      compiled_truth: compiledTruth,
       timeline: '',
+      // Stamp the current chunker version so the stub is recorded as chunked at
+      // v${MARKDOWN_CHUNKER_VERSION} (matching authored pages) and a later
+      // `reindex` sweep does not treat it as stale. Mirrors import-file.ts:766.
+      chunker_version: MARKDOWN_CHUNKER_VERSION,
       // Raw object — putPage passes it through sql.json(); never JSON.stringify
       // into a ::jsonb cast (postgres.js double-encodes; the project invariant).
       frontmatter: { source: 'mcp:save_facts' },
     },
     { sourceId },
   );
-  return true;
+  const chunksCreated = await writeStubChunks(engine, sourceId, slug, compiledTruth);
+  return { pageCreated: true, chunksCreated };
+}
+
+/**
+ * Chunk a freshly-created stub's compiled_truth into content_chunks so it is
+ * reachable by hybrid search. Same chunkText→upsertChunks pair the authored
+ * put_page path runs inside its transaction (import-file.ts:643/816), called
+ * here on the tenant-plane withSourceScope tx engine.
+ *
+ * FLAG-C-safe by construction: `chunkText` is a pure local splitter (no config,
+ * no AI gateway) and `upsertChunks` is plain SQL (SELECT page id → DELETE →
+ * INSERT) — the SAME batchRetry-wrapped low-level write construct already uses
+ * for `addLinksBatch`, with no getConfig anywhere on the path. Chunks land with
+ * NO embedding: `chunk_search_vector_trigger` makes them keyword-searchable at
+ * once, and the existing `embed --stale` pass fills the vector arm later (the
+ * deferred-embed contract `reindex` relies on). Keeps the module's "0 embedding
+ * calls" cost contract intact.
+ */
+async function writeStubChunks(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  compiledTruth: string,
+): Promise<number> {
+  const chunks: ChunkInput[] = chunkText(compiledTruth).map((c, i) => ({
+    chunk_index: i,
+    chunk_text: c.text,
+    chunk_source: 'compiled_truth',
+  }));
+  if (chunks.length === 0) return 0;
+  await engine.upsertChunks(slug, chunks, { sourceId }); // gbrain-allow-direct-insert: deterministic save_facts graph construct — stub chunks from a client-extracted fact; low-level upsert (NULL embedding, trigger-built search_vector), NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
+  return chunks.length;
 }
 
 /** One directed co-occurrence edge, source-qualified on both endpoints. */
