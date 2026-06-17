@@ -102,6 +102,8 @@ export interface ConstructInput {
   people?: string[];
   /** Surface forms of non-person entities (companies, orgs) (→ companies/ pages). */
   entities?: string[];
+  /** Surface forms that were listed as people anywhere in the surrounding batch. */
+  personSurfaceHints?: string[];
   /** The fact's sanitized claim text, stamped as each edge's context. */
   claimText: string;
 }
@@ -127,10 +129,23 @@ export async function constructGraphFromClaim(
   input: ConstructInput,
 ): Promise<ConstructResult> {
   // 1. Ordered (name, type) refs — people first, then companies, matching the
-  //    cap's documented truncation order.
+  //    cap's documented truncation order. Person membership wins across the
+  //    surrounding batch: if a surface ever appeared in people[], later
+  //    entities[] mentions of the same surface are still people.
+  const personSurfaces = new Set<string>();
+  for (const name of input.personSurfaceHints ?? []) {
+    const key = surfaceKey(name);
+    if (key) personSurfaces.add(key);
+  }
+  for (const name of input.people ?? []) {
+    const key = surfaceKey(name);
+    if (key) personSurfaces.add(key);
+  }
   const refs: Array<{ name: string; type: 'person' | 'company' }> = [];
   for (const name of input.people ?? []) refs.push({ name, type: 'person' });
-  for (const name of input.entities ?? []) refs.push({ name, type: 'company' });
+  for (const name of input.entities ?? []) {
+    refs.push({ name, type: personSurfaces.has(surfaceKey(name)) ? 'person' : 'company' });
+  }
   if (refs.length === 0) return { pagesCreated: 0, edgesCreated: 0 };
 
   // 2. Each ref → canonical slug; ensure a stub page exists (create only when
@@ -203,6 +218,10 @@ function fallbackStubSlug(name: string, type: 'person' | 'company'): string | nu
   const slug = slugifyEntity(name, type);
   const body = slug.slice(slug.indexOf('/') + 1);
   return body ? slug : null;
+}
+
+function surfaceKey(name: string): string {
+  return name.trim().toLowerCase();
 }
 
 /**

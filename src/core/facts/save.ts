@@ -133,18 +133,27 @@ function buildContext(c: ValidClaim): string | null {
  * A claim's primary subject for entity_slug, or null when there isn't a
  * single one. Conservative by design: exactly one person → that person
  * (a claim naming one person is about that person, even when companies are
- * also mentioned); no people and exactly one entity → that entity. Multiple
- * people or multiple entities is relationship-class — two endpoints, no
- * single subject — and entity_slug NULL is the correct value there (the
- * surface forms stay recoverable via `context`). A "subject" longer than
- * 200 chars isn't a name; skip rather than resolve garbage.
+ * also mentioned); no people and exactly one entity → that entity, unless the
+ * same surface was listed as a person elsewhere in the batch. Multiple people
+ * or multiple entities is relationship-class — two endpoints, no single
+ * subject — and entity_slug NULL is the correct value there (the surface forms
+ * stay recoverable via `context`). A "subject" longer than 200 chars isn't a
+ * name; skip rather than resolve garbage.
  */
-function primarySubject(c: ValidClaim): { raw: string; type: 'person' | 'company' } | null {
+function primarySubject(
+  c: ValidClaim,
+  personSurfaceKeys: ReadonlySet<string> = new Set(),
+): { raw: string; type: 'person' | 'company' } | null {
   const people = (c.people ?? []).map(s => s.trim()).filter(Boolean);
   const entities = (c.entities ?? []).map(s => s.trim()).filter(Boolean);
   let subject: { raw: string; type: 'person' | 'company' } | null = null;
   if (people.length === 1) subject = { raw: people[0], type: 'person' };
-  else if (people.length === 0 && entities.length === 1) subject = { raw: entities[0], type: 'company' };
+  else if (people.length === 0 && entities.length === 1) {
+    subject = {
+      raw: entities[0],
+      type: personSurfaceKeys.has(surfaceKey(entities[0])) ? 'person' : 'company',
+    };
+  }
   if (subject !== null && subject.raw.length > 200) return null;
   return subject;
 }
@@ -234,6 +243,8 @@ export async function runSaveFacts(
   // the keyless production box → Layer 1 only, and we MUST NOT error for it.
   const embeddingsOn = isAvailable('embedding');
   const dedup_mode: 'trgm' | 'cosine+trgm' = embeddingsOn ? 'cosine+trgm' : 'trgm';
+  const personSurfaceHints = collectPersonSurfaceHints(claims.map(({ claim }) => claim));
+  const personSurfaceKeys = new Set(personSurfaceHints.map(surfaceKey).filter(Boolean));
 
   let inserted = 0;
   let duplicate = 0;
@@ -304,7 +315,7 @@ export async function runSaveFacts(
     // ever travel as parameterized SQL values; the written slug is either an
     // existing same-source page slug or typed slugify output
     // (people/[a-z0-9-] / companies/[a-z0-9-]).
-    const subject = primarySubject(c);
+    const subject = primarySubject(c, personSurfaceKeys);
     const entitySlug = subject
       ? await resolvePrimaryEntitySlug(ctx.engine, ctx.sourceId, subject)
       : null;
@@ -339,6 +350,7 @@ export async function runSaveFacts(
       await constructGraphFromClaim(ctx.engine, ctx.sourceId, {
         people: c.people,
         entities: c.entities,
+        personSurfaceHints,
         claimText: cleaned,
       });
     } else {
@@ -347,4 +359,22 @@ export async function runSaveFacts(
   }
 
   return { inserted, duplicate, dropped, fact_ids, dedup_mode };
+}
+
+function collectPersonSurfaceHints(claims: ValidClaim[]): string[] {
+  const hints: string[] = [];
+  const seen = new Set<string>();
+  for (const claim of claims) {
+    for (const name of claim.people ?? []) {
+      const key = surfaceKey(name);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      hints.push(name);
+    }
+  }
+  return hints;
+}
+
+function surfaceKey(name: string): string {
+  return name.trim().toLowerCase();
 }
