@@ -5,7 +5,7 @@
 
 import { lstatSync, realpathSync } from 'fs';
 import { resolve, relative, sep } from 'path';
-import type { BrainEngine } from './engine.ts';
+import type { BrainEngine, EntitySplitLinkMove } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
@@ -45,6 +45,7 @@ import {
   LIST_SKILLS_DESCRIPTION,
   GET_SKILL_DESCRIPTION,
 } from './operations-descriptions.ts';
+import { logEntitySplitEvent } from './entities/split-audit.ts';
 
 // --- Types ---
 
@@ -1248,6 +1249,236 @@ const purge_deleted_pages: Operation = {
     return { status: 'purged', count: result.count, slugs: result.slugs };
   },
   cliHints: { name: 'purge-deleted' },
+};
+
+type EntitySplitTargetState = 'existing' | 'restored' | 'created';
+
+function parsePositiveIntListParam(value: unknown, name: string, required = false): number[] {
+  if (value === undefined || value === null) {
+    if (required) throw new OperationError('invalid_params', `${name} is required`);
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new OperationError('invalid_params', `${name} must be an array of positive integer ids`);
+  }
+  const ids: number[] = [];
+  for (const raw of value) {
+    const id = Number(raw);
+    if (!Number.isInteger(id) || id <= 0) {
+      throw new OperationError('invalid_params', `${name} must contain only positive integer ids`);
+    }
+    ids.push(id);
+  }
+  return [...new Set(ids)];
+}
+
+function parseStringListParam(value: unknown, name: string): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new OperationError('invalid_params', `${name} must be an array of strings`);
+  }
+  const out: string[] = [];
+  for (const raw of value) {
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new OperationError('invalid_params', `${name} must contain only non-empty strings`);
+    }
+    out.push(raw.trim());
+  }
+  return [...new Set(out)];
+}
+
+function parseNullableStringProperty(
+  raw: Record<string, unknown>,
+  key: 'link_type' | 'link_source',
+): { present: boolean; value?: string | null } {
+  if (!Object.prototype.hasOwnProperty.call(raw, key)) return { present: false };
+  const value = raw[key];
+  if (value === null) return { present: true, value: null };
+  if (typeof value !== 'string') {
+    throw new OperationError('invalid_params', `${key} must be a string or null`);
+  }
+  return { present: true, value };
+}
+
+function parseEntitySplitLinkMoves(value: unknown): EntitySplitLinkMove[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new OperationError('invalid_params', 'link_moves must be an array');
+  }
+  return value.map((raw, index) => {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new OperationError('invalid_params', `link_moves[${index}] must be an object`);
+    }
+    const record = raw as Record<string, unknown>;
+    const direction = record.direction;
+    if (direction !== 'outgoing' && direction !== 'incoming') {
+      throw new OperationError('invalid_params', `link_moves[${index}].direction must be "outgoing" or "incoming"`);
+    }
+    if (typeof record.other_slug !== 'string' || record.other_slug.trim() === '') {
+      throw new OperationError('invalid_params', `link_moves[${index}].other_slug must be a non-empty string`);
+    }
+    const out: EntitySplitLinkMove = {
+      direction,
+      other_slug: record.other_slug.trim(),
+    };
+    const linkType = parseNullableStringProperty(record, 'link_type');
+    if (linkType.present) out.link_type = linkType.value;
+    const linkSource = parseNullableStringProperty(record, 'link_source');
+    if (linkSource.present) out.link_source = linkSource.value;
+    return out;
+  });
+}
+
+function titleFromSlug(slug: string): string {
+  const leaf = slug.split('/').filter(Boolean).pop() ?? slug;
+  return leaf
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase()) || slug;
+}
+
+const split_entity: Operation = {
+  name: 'split_entity',
+  description: 'Operator-only correction for an over-merged entity. Requires explicit fact_ids; no LLM or surface-form guessing. Creates/restores the target page if needed, then moves selected facts, links, timeline rows, and aliases within the current source.',
+  params: {
+    from_slug: { type: 'string', required: true, description: 'Over-merged source slug A' },
+    to_slug: { type: 'string', required: true, description: 'Restored/split-out target slug B' },
+    fact_ids: { type: 'array', required: true, description: 'Active fact ids currently assigned to from_slug that should move to to_slug', items: { type: 'number' } },
+    link_moves: {
+      type: 'array',
+      description: 'Optional selected edge moves. Each object has direction outgoing|incoming, other_slug, and optional link_type/link_source filters.',
+      items: { type: 'object' },
+    },
+    timeline_ids: { type: 'array', description: 'Optional timeline_entries ids currently on from_slug to move to to_slug', items: { type: 'number' } },
+    page_aliases_to_move: { type: 'array', description: 'Optional page_aliases.alias_norm values to re-point from from_slug to to_slug', items: { type: 'string' } },
+    slug_aliases_to_remove: { type: 'array', description: 'Optional slug_aliases.alias_slug values currently redirecting to from_slug to delete', items: { type: 'string' } },
+    to_title: { type: 'string', description: 'Title to use when the target page must be created' },
+    to_type: { type: 'string', description: 'Page type to use when the target page must be created; defaults to from_slug page type' },
+    reason: { type: 'string', description: 'Short operator reason recorded in fact context and audit JSONL' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    const fromSlug = String(p.from_slug ?? '').trim();
+    const toSlug = String(p.to_slug ?? '').trim();
+    validatePageSlug(fromSlug);
+    validatePageSlug(toSlug);
+    if (fromSlug === toSlug) {
+      throw new OperationError('invalid_params', 'from_slug and to_slug must be different');
+    }
+    const factIds = parsePositiveIntListParam(p.fact_ids, 'fact_ids', true);
+    if (factIds.length === 0) {
+      throw new OperationError('invalid_params', 'fact_ids must contain at least one selected fact id');
+    }
+    const linkMoves = parseEntitySplitLinkMoves(p.link_moves);
+    const timelineIds = parsePositiveIntListParam(p.timeline_ids, 'timeline_ids');
+    const pageAliasesToMove = parseStringListParam(p.page_aliases_to_move, 'page_aliases_to_move');
+    const slugAliasesToRemove = parseStringListParam(p.slug_aliases_to_remove, 'slug_aliases_to_remove');
+    const sourceId = ctx.sourceId ?? 'default';
+    const reason = typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim() : null;
+
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'split_entity',
+        source_id: sourceId,
+        from_slug: fromSlug,
+        to_slug: toSlug,
+        fact_ids: factIds,
+        link_moves: linkMoves,
+        timeline_ids: timelineIds,
+        page_aliases_to_move: pageAliasesToMove,
+        slug_aliases_to_remove: slugAliasesToRemove,
+      };
+    }
+
+    const sourceOpts = { sourceId };
+    const fromPage = await ctx.engine.getPage(fromSlug, sourceOpts);
+    if (!fromPage) {
+      throw new OperationError('page_not_found', `Page not found: ${fromSlug}`, 'Check from_slug and the active source.');
+    }
+    const selectedFacts = await ctx.engine.executeRaw<{ id: number }>(
+      `SELECT id
+         FROM facts
+        WHERE source_id = $1
+          AND entity_slug = $2
+          AND expired_at IS NULL
+          AND id = ANY($3::bigint[])`,
+      [sourceId, fromSlug, factIds],
+    );
+    if (selectedFacts.length !== factIds.length) {
+      throw new OperationError(
+        'invalid_params',
+        'Every fact_id must be an active fact currently assigned to from_slug in the selected source.',
+      );
+    }
+    if (timelineIds.length > 0) {
+      const selectedTimeline = await ctx.engine.executeRaw<{ id: number }>(
+        `SELECT id
+           FROM timeline_entries
+          WHERE page_id = $1
+            AND id = ANY($2::bigint[])`,
+        [fromPage.id, timelineIds],
+      );
+      if (selectedTimeline.length !== timelineIds.length) {
+        throw new OperationError(
+          'invalid_params',
+          'Every timeline_id must belong to from_slug in the selected source.',
+        );
+      }
+    }
+
+    let targetState: EntitySplitTargetState = 'existing';
+    const existingTarget = await ctx.engine.getPage(toSlug, { ...sourceOpts, includeDeleted: true });
+    if (existingTarget?.deleted_at) {
+      await ctx.engine.restorePage(toSlug, sourceOpts);
+      targetState = 'restored';
+    } else if (!existingTarget) {
+      const title = typeof p.to_title === 'string' && p.to_title.trim() ? p.to_title.trim() : titleFromSlug(toSlug);
+      const type = typeof p.to_type === 'string' && p.to_type.trim()
+        ? (p.to_type.trim() as PageType)
+        : fromPage.type;
+      await ctx.engine.putPage(toSlug, {
+        type,
+        title,
+        compiled_truth: `# ${title}\n\nEntity restored by split_entity from ${fromSlug}. Fill in canonical notes during the next source sync.\n`,
+        timeline: '',
+        frontmatter: { entity_split_from: fromSlug },
+      }, sourceOpts);
+      targetState = 'created';
+    }
+
+    const result = await ctx.engine.splitEntity({
+      source_id: sourceId,
+      from_slug: fromSlug,
+      to_slug: toSlug,
+      fact_ids: factIds,
+      link_moves: linkMoves,
+      timeline_ids: timelineIds,
+      page_aliases_to_move: pageAliasesToMove,
+      slug_aliases_to_remove: slugAliasesToRemove,
+      reason,
+    });
+
+    logEntitySplitEvent({
+      source_id: sourceId,
+      from_slug: fromSlug,
+      to_slug: toSlug,
+      fact_ids_moved: result.fact_ids_moved,
+      links_moved: result.links_moved,
+      links_deduped: result.links_deduped,
+      timeline_ids_moved: result.timeline_ids_moved,
+      page_aliases_moved: result.page_aliases_moved,
+      page_aliases_deduped: result.page_aliases_deduped,
+      slug_aliases_removed: result.slug_aliases_removed,
+      target_state: targetState,
+      ...(reason ? { reason } : {}),
+    });
+
+    return { status: 'ok', target_state: targetState, ...result };
+  },
 };
 
 const LIST_PAGES_SORT_VALUES = ['updated_desc', 'updated_asc', 'created_desc', 'slug'] as const;
@@ -4782,7 +5013,7 @@ export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
-  restore_page, purge_deleted_pages,
+  restore_page, purge_deleted_pages, split_entity,
   // Search
   search, query,
   // v0.36 Phase 2: image-as-query

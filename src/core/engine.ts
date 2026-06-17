@@ -163,6 +163,40 @@ export interface LinkBatchInput {
   link_kind?: string;
 }
 
+export type EntitySplitLinkDirection = 'outgoing' | 'incoming';
+
+export interface EntitySplitLinkMove {
+  direction: EntitySplitLinkDirection;
+  other_slug: string;
+  link_type?: string | null;
+  link_source?: string | null;
+}
+
+export interface EntitySplitInput {
+  source_id: string;
+  from_slug: string;
+  to_slug: string;
+  fact_ids: number[];
+  link_moves?: EntitySplitLinkMove[];
+  timeline_ids?: number[];
+  page_aliases_to_move?: string[];
+  slug_aliases_to_remove?: string[];
+  reason?: string | null;
+}
+
+export interface EntitySplitResult {
+  source_id: string;
+  from_slug: string;
+  to_slug: string;
+  fact_ids_moved: number[];
+  links_moved: number;
+  links_deduped: number;
+  timeline_ids_moved: number[];
+  page_aliases_moved: number;
+  page_aliases_deduped: number;
+  slug_aliases_removed: string[];
+}
+
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
 export interface TimelineBatchInput {
   slug: string;
@@ -1953,6 +1987,19 @@ export interface BrainEngine {
     canonicalSlug: string,
     sourceId: string,
   ): Promise<{ migrated: number }>;
+
+  /**
+   * Operator-driven correction for an over-merged entity. Moves only the
+   * explicit fact ids and graph/history rows selected by the caller from
+   * `from_slug` to `to_slug` within one source. This is zero-LLM by design:
+   * the data model does not retain the original resolver surface form for a
+   * fact, so the engine must not guess which rows belong to the restored
+   * entity. Fact ids and row ids are preserved; when a moved fact was derived
+   * from the old entity's facts fence, its `source_markdown_slug` is cleared
+   * so a later reconcile of that old fence cannot hard-delete the corrected
+   * row.
+   */
+  splitEntity(input: EntitySplitInput): Promise<EntitySplitResult>;
 
   // Config
   getConfig(key: string): Promise<string | null>;
