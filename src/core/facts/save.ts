@@ -130,32 +130,137 @@ function buildContext(c: ValidClaim): string | null {
 }
 
 /**
- * A claim's primary subject for entity_slug, or null when there isn't a
- * single one. Conservative by design: exactly one person → that person
- * (a claim naming one person is about that person, even when companies are
- * also mentioned); no people and exactly one entity → that entity, unless the
- * same surface was listed as a person elsewhere in the batch. Multiple people
- * or multiple entities is relationship-class — two endpoints, no single
- * subject — and entity_slug NULL is the correct value there (the surface forms
- * stay recoverable via `context`). A "subject" longer than 200 chars isn't a
- * name; skip rather than resolve garbage.
+ * A claim's PRIMARY SUBJECT for entity_slug — the entity the claim is
+ * principally ABOUT — or null only when the claim names no entity at all.
+ *
+ * Rule: the GRAMMATICAL SUBJECT, approximated by LEADING MENTION. Among the
+ * claim's candidate entities (people[] ∪ entities[]), the one whose surface
+ * form appears EARLIEST in the claim text is the subject. A single-clause
+ * structured fact's grammatical subject is, in practice, the first entity it
+ * names: "Boltline is trying to land a deal" is about Boltline; "Reggie Salas
+ * is the founder of Boltline" is about Reggie; "Strider is a sportswear giant …
+ * Selene's employer" is about Strider.
+ *
+ * This REPLACES the prior "exactly one person → that person, else single entity,
+ * else NULL" rule, whose blind spot was company-about claims that co-mention a
+ * person. The rule only ever looked at entities[] when people[] was empty — but
+ * a company-about claim almost always names a person too ("Boltline … wants
+ * Marcus's help"), so the company lost to the person (1 person) or the claim
+ * dropped to NULL (2+ people). A sparse company like Boltline therefore never
+ * accumulated facts at its own node and went dark in entity-keyed recall and in
+ * search ranking, while only densely cross-referenced hubs surfaced — masking
+ * the gap. Leading mention anchors each claim where it belongs and never drops
+ * a claim that names an entity into the NULL consolidation/recall black hole.
+ *
+ * Type (person vs company) follows the array the winner came from, with
+ * batch-wide person membership winning — a surface ever listed in people[] is a
+ * person even where another claim lists it under entities[]. This is the SAME
+ * typing constructGraphFromClaim applies, so a fact's entity_slug equals the
+ * graph stub's slug by construction (resolvePrimaryEntitySlug + the construct
+ * both mint via slugifyEntity(raw, type)).
+ *
+ * Fallbacks, in order: a claim with one candidate takes it. When no surface
+ * form can be located in the claim text (surface ≠ spoken form, e.g. a
+ * pronoun-only restatement), fall back to the first person, else the first
+ * entity — never NULL while any candidate exists. NULL remains correct only
+ * when the claim names no people and no entities (e.g. "the renovation budget
+ * is 40k"). A subject longer than 200 chars isn't a name; skip it.
+ *
+ * Known edge: a fronted adverbial/prepositional phrase ("At Strider, Selene
+ * leads marketing") makes the object the leading mention. The structured seed
+ * corpus is subject-first, so this is rare, and it degrades to a genuinely
+ * co-mentioned entity (a real, related node) — never to NULL.
  */
 function primarySubject(
   c: ValidClaim,
+  claimText: string,
   personSurfaceKeys: ReadonlySet<string> = new Set(),
 ): { raw: string; type: 'person' | 'company' } | null {
-  const people = (c.people ?? []).map(s => s.trim()).filter(Boolean);
-  const entities = (c.entities ?? []).map(s => s.trim()).filter(Boolean);
-  let subject: { raw: string; type: 'person' | 'company' } | null = null;
-  if (people.length === 1) subject = { raw: people[0], type: 'person' };
-  else if (people.length === 0 && entities.length === 1) {
-    subject = {
-      raw: entities[0],
-      type: personSurfaceKeys.has(surfaceKey(entities[0])) ? 'person' : 'company',
-    };
+  type Candidate = { raw: string; type: 'person' | 'company' };
+  const candidates: Candidate[] = [];
+  const seen = new Set<string>();
+  // people first, then entities — fixes both the cap's truncation order and the
+  // "first candidate wins on a positional tie" fallback below.
+  const push = (raw: string, type: 'person' | 'company') => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    // A "subject" longer than 200 chars isn't a name — skip it at intake so an
+    // over-long surface can never win leading mention and force the whole claim
+    // to NULL; a shorter, valid co-candidate still anchors the fact.
+    if (trimmed.length > 200) return;
+    const key = surfaceKey(trimmed);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ raw: trimmed, type });
+  };
+  for (const name of c.people ?? []) push(name, 'person');
+  for (const name of c.entities ?? []) {
+    push(name, personSurfaceKeys.has(surfaceKey(name)) ? 'person' : 'company');
   }
-  if (subject !== null && subject.raw.length > 200) return null;
-  return subject;
+
+  if (candidates.length === 0) return null;
+
+  let chosen: Candidate;
+  if (candidates.length === 1) {
+    chosen = candidates[0];
+  } else {
+    const haystack = claimText.toLowerCase();
+    let best: Candidate | null = null;
+    let bestIdx = Number.POSITIVE_INFINITY;
+    for (const cand of candidates) {
+      const idx = earliestMention(haystack, cand.raw);
+      if (idx >= 0 && idx < bestIdx) {
+        bestIdx = idx;
+        best = cand;
+      }
+    }
+    // No surface located in the text → first person, else first entity.
+    chosen = best ?? candidates[0];
+  }
+
+  return chosen;
+}
+
+/**
+ * Earliest case-insensitive, word-boundary occurrence of an entity surface form
+ * in the (already-lowercased) claim text, or -1. Tries the full surface first,
+ * then each whitespace token of length ≥ 3 — the seed lists full names
+ * ("Reggie Salas") while claim text often uses the first name ("Reggie"), so
+ * token matching is what makes leading mention fire. Word-boundary matching
+ * stops a short token from matching inside an unrelated word ("line" inside
+ * "Boltline", "pace" inside "space").
+ */
+function earliestMention(haystackLower: string, surface: string): number {
+  const s = surface.toLowerCase().trim();
+  if (!s) return -1;
+  let best = -1;
+  const consider = (needle: string) => {
+    const idx = boundedIndexOf(haystackLower, needle);
+    if (idx >= 0 && (best < 0 || idx < best)) best = idx;
+  };
+  consider(s);
+  for (const token of s.split(/\s+/)) {
+    if (token.length >= 3) consider(token);
+  }
+  return best;
+}
+
+/** indexOf, but the match must be flanked by non-alphanumeric chars (or ends). */
+function boundedIndexOf(haystack: string, needle: string): number {
+  if (!needle || needle.length > haystack.length) return -1;
+  for (let from = 0; from <= haystack.length - needle.length; ) {
+    const idx = haystack.indexOf(needle, from);
+    if (idx < 0) return -1;
+    const before = idx === 0 ? '' : haystack[idx - 1];
+    const after = idx + needle.length >= haystack.length ? '' : haystack[idx + needle.length];
+    if (!isAlphaNum(before) && !isAlphaNum(after)) return idx;
+    from = idx + 1;
+  }
+  return -1;
+}
+
+function isAlphaNum(ch: string): boolean {
+  return ch !== '' && /[a-z0-9]/.test(ch);
 }
 
 async function resolvePrimaryEntitySlug(
@@ -315,7 +420,7 @@ export async function runSaveFacts(
     // ever travel as parameterized SQL values; the written slug is either an
     // existing same-source page slug or typed slugify output
     // (people/[a-z0-9-] / companies/[a-z0-9-]).
-    const subject = primarySubject(c, personSurfaceKeys);
+    const subject = primarySubject(c, cleaned, personSurfaceKeys);
     const entitySlug = subject
       ? await resolvePrimaryEntitySlug(ctx.engine, ctx.sourceId, subject)
       : null;

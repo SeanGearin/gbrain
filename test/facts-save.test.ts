@@ -32,7 +32,7 @@ let engine: PGLiteEngine;
 const TEST_SOURCES = [
   'tenant-a', 'tenant-dedup', 'tenant-near', 'tenant-batchdup',
   'tenant-validate', 'tenant-atomic', 'tenant-x', 'tenant-y',
-  'tenant-entity', 'tenant-rel', 'tenant-restricted',
+  'tenant-entity', 'tenant-rel', 'tenant-restricted', 'tenant-seed',
 ];
 
 beforeAll(async () => {
@@ -380,7 +380,8 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     expect(await recallByEntity('tenant-entity', 'Zinnia')).toContain(factId);
   });
 
-  test('single person wins over co-mentioned entities; single entity resolves when no people', async () => {
+  test('person-subject claim anchors to the leading person; pure company claim to the company', async () => {
+    // Carla is both the only person AND the grammatical subject ("Carla joined …").
     const person = await runSaveFacts(
       [{ claim: 'Carla joined Acme Corp as CTO', provenance: 'user_stated', people: ['Carla'], entities: ['Acme Corp'] }],
       { engine, sourceId: 'tenant-entity' },
@@ -396,7 +397,12 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     expect((await readFactRaw(entity.fact_ids[0])).entity_slug).toBe('companies/acme-corp');
   });
 
-  test('relationship-class claim (two people) saves cleanly with NULL entity_slug — no crash, no false stamp', async () => {
+  test('relationship-class claim anchors to the leading (principal) subject, not NULL; the other party stays recoverable', async () => {
+    // Leading-mention rule: "Ann introduced Bob …" is principally about Ann's
+    // action. The prior rule dropped 2+-person claims to NULL — the bug that put
+    // every multi-person Boltline claim into the recall/search black hole. Now
+    // the claim anchors to its grammatical subject and Bob remains recoverable
+    // via `context` AND a co-occurrence graph edge.
     const saved = await runSaveFacts(
       [{ claim: 'Ann introduced Bob to the team', provenance: 'user_stated', people: ['Ann', 'Bob'] }],
       { engine, sourceId: 'tenant-rel' },
@@ -405,8 +411,9 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     expect(saved.inserted).toBe(1);
 
     const row = await readFactRaw(saved.fact_ids[0]);
-    expect(row.entity_slug).toBeNull();
-    // Surface forms stay recoverable via context even when no single subject.
+    expect(row.entity_slug).toBe('people/ann');
+    // The co-mentioned party stays recoverable via context even though the
+    // single entity_slug column can only name the principal subject.
     expect(row.context).toContain('Ann');
     expect(row.context).toContain('Bob');
   });
@@ -418,6 +425,155 @@ describe('save_facts — entity_slug at save time (v1.1 recall-miss fix)', () =>
     );
     if ('error' in saved) throw new Error('unexpected validation error');
     expect((await readFactRaw(saved.fact_ids[0])).entity_slug).toBeNull();
+  });
+});
+
+describe('save_facts — leading-mention primary-subject (Boltline regression)', () => {
+  // The exact failure the entity_slug v1.x fix targets. These claims are copied
+  // verbatim from the Marcus demo seed packet (Batches 3/4/7). Under the prior
+  // "person wins / else NULL" rule EVERY one anchored to a co-mentioned person
+  // or to NULL — never to companies/boltline — so search_brain "Boltline"
+  // returned nothing of Boltline's own facts. Leading mention anchors a claim
+  // to whichever entity (person or company) the claim text names FIRST.
+  //
+  // No pages pre-exist in tenant-seed, so the resolver falls to the typed
+  // graph-fallback slug — the SAME slug constructGraphFromClaim mints — which is
+  // exactly the production cold-tenant ordering (facts resolved before the page
+  // graph is enriched).
+
+  async function slugOf(claim: object): Promise<string | null> {
+    const saved = await runSaveFacts([{ provenance: 'user_stated', ...claim }], {
+      engine,
+      sourceId: 'tenant-seed',
+    });
+    if ('error' in saved) throw new Error(`unexpected validation error: ${saved.detail}`);
+    return (await readFactRaw(saved.fact_ids[0])).entity_slug;
+  }
+
+  test('company-leading claim with a co-mentioned person → companies/boltline (the core fix)', async () => {
+    expect(
+      await slugOf({
+        claim:
+          "Boltline is trying to land its first league partnership and wants Marcus's help structuring the deal without overpaying.",
+        people: ['Reggie Salas', 'Marcus Vale'],
+        entities: ['Boltline'],
+      }),
+    ).toBe('companies/boltline');
+  });
+
+  test('"The Boltline engagement is one of Marcus\'s …" → companies/boltline (company leads after an article)', async () => {
+    expect(
+      await slugOf({
+        claim: "The Boltline engagement is one of Marcus's two active advisory deals.",
+        people: ['Marcus Vale'],
+        entities: ['Boltline'],
+      }),
+    ).toBe('companies/boltline');
+  });
+
+  test('"Boltline is Reggie Salas\'s … startup …" → companies/boltline (company first, two people listed)', async () => {
+    expect(
+      await slugOf({
+        claim: "Boltline is Reggie Salas's daily-fantasy and betting startup and Marcus's first active advisory deal.",
+        people: ['Reggie Salas', 'Marcus Vale'],
+        entities: ['Boltline'],
+      }),
+    ).toBe('companies/boltline');
+  });
+
+  test('person-leading Boltline claim still anchors to the person (defensible) — "Reggie Salas is the founder of Boltline"', async () => {
+    expect(
+      await slugOf({
+        claim: 'Reggie Salas is the founder of Boltline, a daily-fantasy and sports-betting upstart.',
+        people: ['Reggie Salas'],
+        entities: ['Boltline'],
+      }),
+    ).toBe('people/reggie-salas');
+  });
+
+  test('first-name-only claim text matches a full-name surface form → people/reggie-salas', async () => {
+    // people[]="Reggie Salas" but the text says only "Reggie" — token matching
+    // is what makes leading mention fire on the real seed corpus.
+    expect(
+      await slugOf({
+        claim: 'Reggie is sitting on the proposal because budget approval stalled internally at Boltline.',
+        people: ['Reggie Salas'],
+        entities: ['Boltline'],
+      }),
+    ).toBe('people/reggie-salas');
+  });
+
+  test('framing decides person-vs-company: "Selene is CMO at Strider" → person; "Strider is a giant …" → company', async () => {
+    expect(
+      await slugOf({
+        claim: 'Selene Marchetti is the CMO at Strider, the sportswear giant from the Halftime Capsule.',
+        people: ['Selene Marchetti'],
+        entities: ['Strider', 'Halftime Capsule'],
+      }),
+    ).toBe('people/selene-marchetti');
+
+    expect(
+      await slugOf({
+        claim: "Strider is a sportswear giant, partner on the Halftime Capsule and Selene Marchetti's employer.",
+        people: ['Selene Marchetti'],
+        entities: ['Strider', 'Halftime Capsule'],
+      }),
+    ).toBe('companies/strider');
+  });
+
+  test('person-subject self facts stay on the person — "Marcus is now building Sightline"', async () => {
+    expect(
+      await slugOf({
+        claim: 'Marcus is now building Sightline, a deal-intelligence AI for sports and entertainment partnerships.',
+        people: ['Marcus Vale'],
+        entities: ['Sightline'],
+      }),
+    ).toBe('people/marcus-vale');
+  });
+
+  test('pure-company supporting claim with no people → companies/meridian-line-ventures', async () => {
+    expect(
+      await slugOf({
+        claim: 'Meridian Line Ventures is a sports and consumer focused venture fund.',
+        people: [],
+        entities: ['Meridian Line Ventures'],
+      }),
+    ).toBe('companies/meridian-line-ventures');
+  });
+
+  test('word-boundary safety: a short surface token does not match inside an unrelated word', async () => {
+    // "Eli" must not match inside "Selene"; the leading subject is Selene.
+    expect(
+      await slugOf({
+        claim: 'Selene mentioned that Eli would attend.',
+        people: ['Selene Marchetti', 'Eli Vale'],
+        entities: [],
+      }),
+    ).toBe('people/selene-marchetti');
+  });
+
+  test('no surface form present in text → falls back to the first person (never NULL while a candidate exists)', async () => {
+    expect(
+      await slugOf({
+        claim: 'He closed the deal yesterday.',
+        people: ['Marcus Vale'],
+        entities: ['Sightline'],
+      }),
+    ).toBe('people/marcus-vale');
+  });
+
+  test('an over-long (>200 char) leading surface is skipped, not anchored — a valid short candidate still wins (never NULL)', async () => {
+    // Adversarial: a garbage 250-char "entity" mentioned earliest must NOT force
+    // the claim to NULL; the real person co-candidate anchors it. ClaimSchema
+    // caps claim TEXT at 500 but not per-entity length, so this is reachable.
+    const longName = 'X'.repeat(250);
+    expect(
+      await slugOf({
+        claim: `The ${'X'.repeat(250)} initiative is led by Alice.`,
+        people: ['Alice'],
+        entities: [longName],
+      }),
+    ).toBe('people/alice');
   });
 });
 
