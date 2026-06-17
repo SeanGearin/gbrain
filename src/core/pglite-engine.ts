@@ -2111,6 +2111,56 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 
+  async searchFactsVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
+    const limit = clampSearchLimit(opts?.limit);
+    if (opts?.limit && opts.limit > MAX_SEARCH_LIMIT) {
+      console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
+    }
+    const vecStr = '[' + Array.from(embedding).join(',') + ']';
+    const params: unknown[] = [vecStr];
+
+    // Source isolation — parity with searchVector's P0-leak-seal (#861): explicit
+    // source_id filter (PGLite has no RLS, so this is the sole isolation layer
+    // here; on Postgres it sits on top of the gbrain_tenant RLS backstop). A
+    // tenant's search must never surface another tenant's facts.
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND source_id = $${params.length}`;
+    }
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+
+    // Predicate matches idx_facts_embedding_hnsw (embedding IS NOT NULL AND
+    // expired_at IS NULL). Each fact → a SearchResult carrying the fact text as
+    // chunk_text and a NEGATIVE synthetic chunk_id (never collides with a
+    // content_chunks id; cosineReScore/getEmbeddingsByChunkIds skip it).
+    const { rows } = await this.db.query(
+      `SELECT
+         COALESCE(entity_slug, 'facts/' || id) AS slug,
+         0 AS page_id,
+         COALESCE(entity_slug, 'fact') AS title,
+         'fact' AS type,
+         fact AS chunk_text,
+         'compiled_truth' AS chunk_source,
+         (-id)::int AS chunk_id,
+         0 AS chunk_index,
+         1 - (embedding <=> $1::vector) AS score,
+         false AS stale,
+         source_id
+       FROM facts
+       WHERE embedding IS NOT NULL AND expired_at IS NULL
+         ${sourceClause}
+       ORDER BY embedding <=> $1::vector, id ASC
+       LIMIT ${limitParam}`,
+      params
+    );
+    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+  }
+
   async getEmbeddingsByChunkIds(
     ids: number[],
     column: string = 'embedding',

@@ -675,6 +675,14 @@ export interface HybridSearchOpts extends SearchOpts {
   expandFn?: (query: string) => Promise<string[]>;
   /** Override default RRF K constant (default: 60). Lower values boost top-ranked results more. */
   rrfK?: number;
+  /**
+   * Facts-vector arm (C): when not explicitly false, hybrid search ALSO
+   * vector-searches the `facts` table (reusing the chunk arm's query embedding,
+   * no added inference) and fuses fact hits into RRF alongside keyword +
+   * chunk-vector — so search surfaces remembered fact substance, not only
+   * entity-page chunks. Default ON; pass `false` to restrict to page chunks.
+   */
+  factsArm?: boolean;
   /** Override dedup pipeline parameters. */
   dedupOpts?: {
     cosineThreshold?: number;
@@ -1087,6 +1095,10 @@ export async function hybridSearch(
   let queryEmbedding: Float32Array | null = null;
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
+  // Facts-vector arm (C): fact-table hits, fused into RRF below. Populated only
+  // on the text path (facts live in the text/zembed-1 space), reusing the SAME
+  // query embedding the chunk arm computed — no added embedding/model call.
+  let factsList: SearchResult[] = [];
 
   // Phase 3 unified routing: when on, route ALL queries through Voyage
   // multimodal-3 + embedding_multimodal column. Bypasses the dual-column
@@ -1194,6 +1206,21 @@ export async function hybridSearch(
       if (effectiveModality === 'both' && imageVectorList !== null) {
         vectorLists = [...vectorLists, imageVectorList];
       }
+
+      // Facts-vector arm (C): reuse the SAME text query embedding (embeddings[0],
+      // the zembed-1 vector the chunk arm just used) to vector-search the facts
+      // table — ZERO added inference, no new embed/model call. Source-scoped via
+      // searchOpts (sourceId/sourceIds thread the D9 P0-leak-seal) + the
+      // gbrain_tenant RLS backstop. Best-effort: a facts error must never break
+      // base chunk retrieval, so it is isolated from the vector-arm try above.
+      if (opts?.factsArm !== false && embeddings.length > 0) {
+        try {
+          factsList = await engine.searchFactsVector(embeddings[0], searchOpts);
+        } catch {
+          // Facts arm is additive; on any error fall back to chunks + keyword.
+          factsList = [];
+        }
+      }
     } catch {
       // Embedding failure is non-fatal, fall back to keyword-only
     }
@@ -1266,6 +1293,13 @@ export async function hybridSearch(
       ...vectorLists.map(list => ({ list, k: vectorK })),
       { list: keywordResults, k: keywordK },
     ];
+  // Facts-vector arm (C): fuse fact hits as another RRF input at vectorK (they
+  // are vector-ranked, same space as the chunk arm). Added last so it composes
+  // with every modality branch; empty when the arm is off / found nothing / not
+  // the text path, in which case it contributes nothing to the fusion.
+  if (factsList.length > 0) {
+    allLists.push({ list: factsList, k: vectorK });
+  }
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
 
   // Cosine re-scoring before dedup so semantically better chunks survive.

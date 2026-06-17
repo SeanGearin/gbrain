@@ -2267,6 +2267,58 @@ export class PostgresEngine implements BrainEngine {
     return rows.map(rowToSearchResult);
   }
 
+  async searchFactsVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
+    const limit = clampSearchLimit(opts?.limit);
+    if (opts?.limit && opts.limit > MAX_SEARCH_LIMIT) {
+      console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
+    }
+    const vecStr = '[' + Array.from(embedding).join(',') + ']';
+    const params: unknown[] = [vecStr];
+
+    // Source isolation — parity with searchVector's D9 P0-leak-seal: an explicit
+    // source_id filter ON TOP OF the gbrain_tenant RLS backstop on `facts`. A
+    // tenant's search must never surface another tenant's facts. (Tenant-plane
+    // callers always thread sourceId via searchOpts; absent it, RLS still binds.)
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND source_id = $${params.length}`;
+    }
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+
+    // The (embedding IS NOT NULL AND expired_at IS NULL) predicate matches
+    // idx_facts_embedding_hnsw so the HNSW index serves the ORDER BY. Each fact
+    // becomes a SearchResult: the fact text as chunk_text, the entity page (or a
+    // synthetic facts/<id>) as slug, and a NEGATIVE synthetic chunk_id that can
+    // never collide with a positive content_chunks id — so cosineReScore /
+    // getEmbeddingsByChunkIds leave fact rows untouched in the fused pipeline.
+    const rawQuery = `
+      SELECT
+        COALESCE(entity_slug, 'facts/' || id) AS slug,
+        0 AS page_id,
+        COALESCE(entity_slug, 'fact') AS title,
+        'fact' AS type,
+        fact AS chunk_text,
+        'compiled_truth' AS chunk_source,
+        (-id)::int AS chunk_id,
+        0 AS chunk_index,
+        1 - (embedding <=> $1::vector) AS score,
+        false AS stale,
+        source_id
+      FROM facts
+      WHERE embedding IS NOT NULL AND expired_at IS NULL
+        ${sourceClause}
+      ORDER BY embedding <=> $1::vector, id ASC
+      LIMIT ${limitParam}
+    `;
+    const rows = await this.runSearchWithTimeout(rawQuery, params);
+    return rows.map(rowToSearchResult);
+  }
+
   async getEmbeddingsByChunkIds(
     ids: number[],
     column: string = 'embedding',

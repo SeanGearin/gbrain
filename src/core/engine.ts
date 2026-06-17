@@ -987,6 +987,23 @@ export interface BrainEngine {
   searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
   searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]>;
   /**
+   * Vector search over the `facts` table (NOT content_chunks), so hybrid
+   * search can surface the user's actual remembered fact substance — not only
+   * entity-page chunks. Reuses the SAME query embedding the chunk-vector arm
+   * computed (the caller passes it in); this method runs NO embedding/model
+   * call of its own — it is a pure `embedding <=> $1` pgvector scan that matches
+   * the `idx_facts_embedding_hnsw` partial index (`embedding IS NOT NULL AND
+   * expired_at IS NULL`). Each fact maps to a SearchResult carrying the fact
+   * text as `chunk_text` and a NEGATIVE synthetic `chunk_id` (never collides
+   * with positive content_chunks ids; cosineReScore leaves it untouched).
+   *
+   * SOURCE-SCOPED / RLS-SAFE: applies the same explicit `source_id` filter as
+   * searchVector (the D9 P0-leak-seal) from opts.sourceId/sourceIds, on top of
+   * the gbrain_tenant RLS backstop on the facts table. A tenant's search can
+   * never surface another tenant's facts.
+   */
+  searchFactsVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]>;
+  /**
    * Hydrate embeddings for chunks already known by id. v0.36 (D9):
    * optional `column` parameter selects which content_chunks column to
    * fetch from (default 'embedding'). The dynamic-embedding-column
