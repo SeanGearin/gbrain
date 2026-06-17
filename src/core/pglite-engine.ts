@@ -15,6 +15,7 @@ import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
+  EntitySplitInput, EntitySplitResult,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
@@ -1092,6 +1093,217 @@ export class PGLiteEngine implements BrainEngine {
       [canonicalSlug, sourceId, phantomSlug],
     );
     return { migrated: rows.length };
+  }
+
+  async splitEntity(input: EntitySplitInput): Promise<EntitySplitResult> {
+    if (input.from_slug === input.to_slug) {
+      throw new Error('splitEntity: from_slug and to_slug must be different');
+    }
+    const factIds = [...new Set(input.fact_ids.filter((id) => Number.isInteger(id) && id > 0))];
+    const timelineIds = [...new Set((input.timeline_ids ?? []).filter((id) => Number.isInteger(id) && id > 0))];
+    const pageAliases = [...new Set((input.page_aliases_to_move ?? []).map((a) => a.trim()).filter(Boolean))];
+    const slugAliases = [...new Set((input.slug_aliases_to_remove ?? []).map((a) => a.trim()).filter(Boolean))];
+    const reason = input.reason?.trim();
+    const correctionNote = `entity_split: moved from ${input.from_slug} to ${input.to_slug}${reason ? `; reason: ${reason}` : ''}`;
+
+    return this.db.transaction(async (tx) => {
+      const pageRows = await tx.query<{ id: number; slug: string }>(
+        `SELECT id, slug
+           FROM pages
+          WHERE source_id = $1
+            AND slug = ANY($2::text[])
+            AND deleted_at IS NULL`,
+        [input.source_id, [input.from_slug, input.to_slug]],
+      );
+      const pageBySlug = new Map(pageRows.rows.map((row) => [row.slug, Number(row.id)]));
+      const fromPageId = pageBySlug.get(input.from_slug);
+      const toPageId = pageBySlug.get(input.to_slug);
+      if (fromPageId === undefined) {
+        throw new Error(`splitEntity: from_slug not found or deleted in source ${input.source_id}: ${input.from_slug}`);
+      }
+      if (toPageId === undefined) {
+        throw new Error(`splitEntity: to_slug not found or deleted in source ${input.source_id}: ${input.to_slug}`);
+      }
+
+      const factIdsMoved: number[] = [];
+      if (factIds.length > 0) {
+        const moved = await tx.query<{ id: number }>(
+          `UPDATE facts
+              SET entity_slug = $1,
+                  source_markdown_slug = CASE
+                    WHEN source_markdown_slug = $2 THEN NULL
+                    ELSE source_markdown_slug
+                  END,
+                  context = CASE
+                    WHEN context IS NULL OR context = '' THEN $5
+                    ELSE context || E'\n' || $5
+                  END
+            WHERE source_id = $3
+              AND entity_slug = $2
+              AND expired_at IS NULL
+              AND id = ANY($4::bigint[])
+            RETURNING id`,
+          [input.to_slug, input.from_slug, input.source_id, factIds, correctionNote],
+        );
+        factIdsMoved.push(...moved.rows.map((row) => Number(row.id)));
+        if (factIdsMoved.length !== factIds.length) {
+          throw new Error('splitEntity: every fact_id must be active on from_slug in the selected source');
+        }
+      }
+
+      let linksMoved = 0;
+      let linksDeduped = 0;
+      for (const move of input.link_moves ?? []) {
+        const direction = move.direction;
+        if (direction !== 'outgoing' && direction !== 'incoming') {
+          throw new Error(`splitEntity: invalid link move direction: ${String(direction)}`);
+        }
+        const otherSlug = move.other_slug?.trim();
+        if (!otherSlug) {
+          throw new Error('splitEntity: link move other_slug must be non-empty');
+        }
+        const ownColumn = direction === 'outgoing' ? 'from_page_id' : 'to_page_id';
+        const otherColumn = direction === 'outgoing' ? 'to_page_id' : 'from_page_id';
+        const where: string[] = [
+          `l.${ownColumn} = $1`,
+          'other.source_id = $2',
+          'other.slug = $3',
+        ];
+        const params: unknown[] = [fromPageId, input.source_id, otherSlug];
+        if (move.link_type !== undefined) {
+          params.push(move.link_type ?? '');
+          where.push(`l.link_type = $${params.length}`);
+        }
+        if (move.link_source !== undefined) {
+          params.push(move.link_source);
+          where.push(`l.link_source IS NOT DISTINCT FROM $${params.length}`);
+        }
+        const selected = await tx.query<{
+          id: number;
+          from_page_id: number;
+          to_page_id: number;
+          link_type: string;
+          link_source: string | null;
+          origin_page_id: number | null;
+        }>(
+          `SELECT l.id, l.from_page_id, l.to_page_id, l.link_type, l.link_source, l.origin_page_id
+             FROM links l
+             JOIN pages other ON other.id = l.${otherColumn}
+            WHERE ${where.join(' AND ')}`,
+          params,
+        );
+
+        for (const row of selected.rows) {
+          const newFromPageId = direction === 'outgoing' ? toPageId : Number(row.from_page_id);
+          const newToPageId = direction === 'incoming' ? toPageId : Number(row.to_page_id);
+          const newOriginPageId = row.origin_page_id === fromPageId ? toPageId : row.origin_page_id;
+          const duplicate = await tx.query<{ id: number }>(
+            `SELECT id
+               FROM links
+              WHERE from_page_id = $1
+                AND to_page_id = $2
+                AND link_type = $3
+                AND link_source IS NOT DISTINCT FROM $4
+                AND origin_page_id IS NOT DISTINCT FROM $5
+                AND id <> $6
+              LIMIT 1`,
+            [newFromPageId, newToPageId, row.link_type, row.link_source, newOriginPageId, row.id],
+          );
+          if (duplicate.rows.length > 0) {
+            await tx.query(`DELETE FROM links WHERE id = $1`, [row.id]);
+            linksDeduped++;
+          } else {
+            await tx.query(
+              `UPDATE links
+                  SET from_page_id = $1,
+                      to_page_id = $2,
+                      origin_page_id = $3
+                WHERE id = $4`,
+              [newFromPageId, newToPageId, newOriginPageId, row.id],
+            );
+            linksMoved++;
+          }
+        }
+      }
+
+      const timelineIdsMoved: number[] = [];
+      if (timelineIds.length > 0) {
+        const movedTimeline = await tx.query<{ id: number }>(
+          `UPDATE timeline_entries
+              SET page_id = $1
+            WHERE page_id = $2
+              AND id = ANY($3::bigint[])
+            RETURNING id`,
+          [toPageId, fromPageId, timelineIds],
+        );
+        timelineIdsMoved.push(...movedTimeline.rows.map((row) => Number(row.id)));
+        if (timelineIdsMoved.length !== timelineIds.length) {
+          throw new Error('splitEntity: every timeline_id must belong to from_slug in the selected source');
+        }
+      }
+
+      let pageAliasesMoved = 0;
+      let pageAliasesDeduped = 0;
+      for (const aliasNorm of pageAliases) {
+        const existingTarget = await tx.query<{ slug: string }>(
+          `SELECT slug
+             FROM page_aliases
+            WHERE source_id = $1
+              AND alias_norm = $2
+              AND slug = $3
+            LIMIT 1`,
+          [input.source_id, aliasNorm, input.to_slug],
+        );
+        if (existingTarget.rows.length > 0) {
+          const deleted = await tx.query<{ alias_norm: string }>(
+            `DELETE FROM page_aliases
+              WHERE source_id = $1
+                AND alias_norm = $2
+                AND slug = $3
+            RETURNING alias_norm`,
+            [input.source_id, aliasNorm, input.from_slug],
+          );
+          pageAliasesDeduped += deleted.rows.length;
+        } else {
+          const moved = await tx.query<{ alias_norm: string }>(
+            `UPDATE page_aliases
+                SET slug = $1
+              WHERE source_id = $2
+                AND alias_norm = $3
+                AND slug = $4
+            RETURNING alias_norm`,
+            [input.to_slug, input.source_id, aliasNorm, input.from_slug],
+          );
+          pageAliasesMoved += moved.rows.length;
+        }
+      }
+
+      let removedSlugAliases: string[] = [];
+      if (slugAliases.length > 0) {
+        const removed = await tx.query<{ alias_slug: string }>(
+          `DELETE FROM slug_aliases
+            WHERE source_id = $1
+              AND canonical_slug = $2
+              AND alias_slug = ANY($3::text[])
+          RETURNING alias_slug`,
+          [input.source_id, input.from_slug, slugAliases],
+        );
+        removedSlugAliases = removed.rows.map((row) => row.alias_slug);
+      }
+
+      return {
+        source_id: input.source_id,
+        from_slug: input.from_slug,
+        to_slug: input.to_slug,
+        fact_ids_moved: factIdsMoved,
+        links_moved: linksMoved,
+        links_deduped: linksDeduped,
+        timeline_ids_moved: timelineIdsMoved,
+        page_aliases_moved: pageAliasesMoved,
+        page_aliases_deduped: pageAliasesDeduped,
+        slug_aliases_removed: removedSlugAliases,
+      };
+    });
   }
 
   async listPages(filters?: PageFilters): Promise<Page[]> {
