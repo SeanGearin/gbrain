@@ -8,14 +8,13 @@ import { resolve, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
-import type { PageType } from './types.ts';
+import type { HybridSearchMeta, Page, PageType, SalienceResult, SearchResult, TimelineEntry } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
-import type { HybridSearchMeta } from './types.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
@@ -24,7 +23,6 @@ import { getContentFlag } from './quarantine.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
-import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
@@ -450,6 +448,51 @@ function stampEvidenceSafe(results: SearchResult[]): void {
   try { stampEvidence(results); } catch { /* non-fatal */ }
 }
 
+/**
+ * Customer tenant minimization boundary.
+ *
+ * The worker exposes customer tenants as source-bound, non-default OAuth
+ * clients with a single allowed source. Default/legacy remote callers are the
+ * operator plane and keep the full payload for tooling parity; local CLI
+ * callers also keep full rows.
+ */
+function isCustomerScopedRemoteRead(ctx: OperationContext): boolean {
+  if (ctx.remote !== true) return false;
+  const sourceId = ctx.auth?.sourceId;
+  if (!sourceId || sourceId === 'default') return false;
+  const allowed = ctx.auth?.allowedSources;
+  return allowed?.length === 1 && allowed[0] === sourceId;
+}
+
+function minimizeSearchResults(results: SearchResult[]): Array<Omit<SearchResult, 'page_id' | 'chunk_id' | 'source_id'>> {
+  return results.map(({ page_id: _pageId, chunk_id: _chunkId, source_id: _sourceId, ...rest }) => rest);
+}
+
+function minimizePagePayload<T extends Page & Record<string, unknown>>(
+  page: T,
+): Omit<T, 'id' | 'source_id' | 'source_kind' | 'source_uri' | 'ingested_via' | 'ingested_at'> {
+  const {
+    id: _id,
+    source_id: _sourceId,
+    source_kind: _sourceKind,
+    source_uri: _sourceUri,
+    ingested_via: _ingestedVia,
+    ingested_at: _ingestedAt,
+    ...rest
+  } = page;
+  return rest;
+}
+
+function minimizeSourceIdRows<T extends { source_id?: unknown }>(rows: T[]): Array<Omit<T, 'source_id'>> {
+  return rows.map(({ source_id: _sourceId, ...rest }) => rest);
+}
+
+function minimizeTimelineEntries(
+  entries: TimelineEntry[],
+): Array<Omit<TimelineEntry, 'id' | 'page_id'>> {
+  return entries.map(({ id: _id, page_id: _pageId, ...rest }) => rest);
+}
+
 /** T4 — shared eval-capture for the `search` op (keyword-only + cheap-hybrid paths). */
 function maybeCaptureSearch(
   ctx: OperationContext,
@@ -596,12 +639,13 @@ const get_page: Operation = {
     // it" signal it would get from search. The marker is also in frontmatter;
     // this is the clean, documented accessor.
     const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
-    return {
+    const response = {
       ...visibleBody,
       tags,
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
+    return isCustomerScopedRemoteRead(ctx) ? minimizePagePayload(response) : response;
   },
   scope: 'read',
   cliHints: { name: 'get', positional: ['slug'] },
@@ -1309,7 +1353,7 @@ const search: Operation = {
       await stampContentFlags(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
-      return results;
+      return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
     }
 
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
@@ -1326,7 +1370,7 @@ const search: Operation = {
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
-    return results;
+    return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
   },
   scope: 'read',
   cliHints: { name: 'search', positional: ['query'] },
@@ -1465,7 +1509,7 @@ const query: Operation = {
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
       });
-      return results;
+      return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
     }
 
     if (!queryText) {
@@ -1555,7 +1599,7 @@ const query: Operation = {
       );
     }
 
-    return results;
+    return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
   },
   scope: 'read',
   cliHints: { name: 'query', positional: ['query'] },
@@ -1970,7 +2014,8 @@ const get_timeline: Operation = {
   handler: async (ctx, p) => {
     // v0.31.8 (D20): thread ctx.sourceId.
     const sourceId = ctx.sourceId;
-    return ctx.engine.getTimeline(p.slug as string, sourceId ? { sourceId } : undefined);
+    const entries = await ctx.engine.getTimeline(p.slug as string, sourceId ? { sourceId } : undefined);
+    return isCustomerScopedRemoteRead(ctx) ? minimizeTimelineEntries(entries) : entries;
   },
   scope: 'read',
   cliHints: { name: 'timeline', positional: ['slug'] },
@@ -2997,12 +3042,17 @@ const get_recent_salience: Operation = {
   },
   handler: async (ctx, p) => {
     const recencyBias = p.recency_bias === 'on' ? 'on' : 'flat';
-    return ctx.engine.getRecentSalience({
+    const scope = ctx.remote === true ? sourceScopeOpts(ctx) : {};
+    const rows = await ctx.engine.getRecentSalience({
       days: typeof p.days === 'number' ? p.days : undefined,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       slugPrefix: typeof p.slugPrefix === 'string' ? p.slugPrefix : undefined,
       recency_bias: recencyBias,
+      ...scope,
     });
+    return isCustomerScopedRemoteRead(ctx)
+      ? minimizeSourceIdRows<SalienceResult>(rows)
+      : rows;
   },
   cliHints: { name: 'salience' },
 };
@@ -3071,13 +3121,14 @@ const find_experts: Operation = {
     const { loadActivePackBestEffort, expertTypesFromPack } = await import('./schema-pack/index.ts');
     const pack = await loadActivePackBestEffort(ctx);
     const types = pack ? expertTypesFromPack(pack.manifest) : [];
-    return findExperts(ctx.engine, {
+    const rows = await findExperts(ctx.engine, {
       topic,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       explain: p.explain === true,
       types: types as never,
       ...sourceScopeOpts(ctx),
     });
+    return isCustomerScopedRemoteRead(ctx) ? minimizeSourceIdRows(rows) : rows;
   },
   cliHints: { name: 'whoknows', positional: ['topic'] },
 };
@@ -3627,31 +3678,35 @@ const recall: Operation = {
       }
     }
 
-    return {
-      facts: rows.map(r => ({
-        id: r.id,
-        fact: r.fact,
-        kind: r.kind,
-        entity_slug: r.entity_slug,
-        visibility: r.visibility,
-        // v0.31.2: notability surfaced to recall consumers (CLI, MCP, admin).
-        // Pre-v46 brains return 'medium' via the row mapper's fallback so the
-        // contract stays total.
-        notability: r.notability,
-        valid_from: r.valid_from.toISOString(),
-        valid_until: r.valid_until?.toISOString() ?? null,
-        expired_at: r.expired_at?.toISOString() ?? null,
-        superseded_by: r.superseded_by,
-        consolidated_at: r.consolidated_at?.toISOString() ?? null,
-        consolidated_into: r.consolidated_into,
-        source: r.source,
-        source_session: r.source_session,
-        confidence: r.confidence,
-        created_at: r.created_at.toISOString(),
-      })),
+    const facts = rows.map(r => ({
+      id: r.id,
+      fact: r.fact,
+      kind: r.kind,
+      entity_slug: r.entity_slug,
+      visibility: r.visibility,
+      // v0.31.2: notability surfaced to recall consumers (CLI, MCP, admin).
+      // Pre-v46 brains return 'medium' via the row mapper's fallback so the
+      // contract stays total.
+      notability: r.notability,
+      valid_from: r.valid_from.toISOString(),
+      valid_until: r.valid_until?.toISOString() ?? null,
+      expired_at: r.expired_at?.toISOString() ?? null,
+      superseded_by: r.superseded_by,
+      consolidated_at: r.consolidated_at?.toISOString() ?? null,
+      consolidated_into: r.consolidated_into,
+      source: r.source,
+      source_session: r.source_session,
+      confidence: r.confidence,
+      created_at: r.created_at.toISOString(),
+    }));
+    const payload = {
+      facts: isCustomerScopedRemoteRead(ctx)
+        ? facts.map(({ source_session: _sourceSession, ...rest }) => rest)
+        : facts,
       total: rows.length,
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
     };
+    return payload;
   },
 };
 
