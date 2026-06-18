@@ -450,8 +450,9 @@ export async function materializeEntityPages(
   entitySlugs: Iterable<string>,
   opts?: { embedChunks?: EmbedChunksFn; embeddingSignature?: string | null },
 ): Promise<{ pagesMaterialized: number; chunksWritten: number }> {
-  let pagesMaterialized = 0;
-  let chunksWritten = 0;
+  // Phase 1 — resolve every entity that needs a rebuild (gate + idempotency
+  // skip), computing its new body + chunks. No writes yet.
+  const pending: Array<{ slug: string; page: Page; chunks: ChunkInput[] }> = [];
   const done = new Set<string>();
   for (const slug of entitySlugs) {
     if (!slug || done.has(slug)) continue;
@@ -467,45 +468,59 @@ export async function materializeEntityPages(
     const body = compileEntityBody(page.title, page.type, facts);
     if (body === page.compiled_truth) continue; // idempotent: identical body, skip rewrite + re-chunk
 
-    await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts materialize — entity body rebuilt from its own active facts; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
-      slug,
-      {
-        title: page.title,
-        type: page.type,
-        compiled_truth: body,
-        timeline: page.timeline ?? '',
-        chunker_version: MARKDOWN_CHUNKER_VERSION,
-        frontmatter: page.frontmatter, // preserve the mcp:save_facts ownership marker
-      },
-      { sourceId },
-    );
-
     const chunks: ChunkInput[] = chunkText(body).map((c, i) => ({
       chunk_index: i,
       chunk_text: c.text,
       chunk_source: 'compiled_truth',
     }));
-    if (chunks.length > 0 && opts?.embedChunks) {
+    pending.push({ slug, page: { ...page, compiled_truth: body }, chunks });
+  }
+  if (pending.length === 0) return { pagesMaterialized: 0, chunksWritten: 0 };
+
+  // Phase 2 — embed ALL new chunks in ONE batch (best-effort), so the
+  // withSourceScope tx holds open across a single network round-trip, not one
+  // per entity. On any failure chunks land NULL-embedded: keyword-searchable at
+  // once via the search_vector trigger, `embed --stale` fills the vector arm.
+  if (opts?.embedChunks) {
+    const flat = pending.flatMap(p => p.chunks);
+    if (flat.length > 0) {
       try {
-        const embeddings = await opts.embedChunks(chunks.map(c => c.chunk_text));
-        for (let i = 0; i < chunks.length; i++) {
+        const embeddings = await opts.embedChunks(flat.map(c => c.chunk_text));
+        for (let i = 0; i < flat.length; i++) {
           const vec = embeddings[i];
-          if (vec) chunks[i].embedding = vec;
+          if (vec) flat[i].embedding = vec;
         }
       } catch {
-        // Embedding lane hiccup — land chunks NULL-embedded (keyword-searchable
-        // via the search_vector trigger; `embed --stale` fills the vector arm).
-        // Never break the save for an embed failure (mirrors the per-fact embed).
+        // Embedding lane hiccup — degrade to NULL-embedded chunks (see above).
       }
     }
+  }
+
+  // Phase 3 — write each rebuilt page + its chunks.
+  let chunksWritten = 0;
+  for (const { slug, page, chunks } of pending) {
+    await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts materialize — entity body rebuilt from its own active facts; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
+      slug,
+      {
+        title: page.title,
+        type: page.type,
+        compiled_truth: page.compiled_truth,
+        timeline: page.timeline ?? '',
+        chunker_version: MARKDOWN_CHUNKER_VERSION,
+        // Stamp the durable ownership marker so a marker-only-qualified page (a
+        // legacy stub whose body loses the STUB_MARKER after this rewrite) stays
+        // construct-owned and keeps converging on later batches.
+        frontmatter: { ...page.frontmatter, source: 'mcp:save_facts' },
+      },
+      { sourceId },
+    );
     await engine.upsertChunks(slug, chunks, { sourceId }); // gbrain-allow-direct-insert: deterministic save_facts materialize — fact-substance chunks replace the stub chunk; low-level upsert, NOT the put_page op
     if (opts?.embeddingSignature && chunks.some(c => c.embedding)) {
       await engine.setPageEmbeddingSignature(slug, { sourceId, signature: opts.embeddingSignature });
     }
-    pagesMaterialized += 1;
     chunksWritten += chunks.length;
   }
-  return { pagesMaterialized, chunksWritten };
+  return { pagesMaterialized: pending.length, chunksWritten };
 }
 
 /** One directed co-occurrence edge, source-qualified on both endpoints. */

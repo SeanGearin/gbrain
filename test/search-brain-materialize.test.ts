@@ -89,6 +89,12 @@ describe('compileEntityBody', () => {
     const body = compileEntityBody('Robin Hale', 'person', [{ fact: 'Robin Hale founded Voltcrest' }]);
     expect(body).toContain('**Type:** Person');
   });
+
+  test('STUB_MARKER stays in sync with hybrid.ts isStubChunk literal (drift guard)', () => {
+    // hybrid.ts isStubChunk keys on chunk_text.includes('Stub page. Created from a
+    // saved fact.'); if construct's marker changes, stub demotion silently breaks.
+    expect(STUB_MARKER).toContain('Stub page. Created from a saved fact.');
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -693,6 +693,21 @@ export interface HybridSearchOpts extends SearchOpts {
    * entity-page chunks. Default ON; pass `false` to restrict to page chunks.
    */
   factsArm?: boolean;
+  /**
+   * Require a LEXICAL anchor (CC packet 2026-06-18). When true, a result only
+   * survives if its entity (slug) was matched by the KEYWORD arm — i.e. the
+   * vector chunk arm and the facts-vector arm REINFORCE keyword-matched entities
+   * but never independently surface a result. Set by the query op on the
+   * CUSTOMER/TENANT plane, where (a) the cross-encoder reranker is OFF (economics
+   * firewall) so there is no learned relevance gate, and (b) zembed-1 packs a
+   * personal brain into a tight cluster (≈0.8 inter-entity cosine), so a global
+   * vector NN returns the densest cluster for an off-world query ("pizza") — an
+   * absolute similarity floor can't separate it. Keyword presence is the reliable
+   * relevance signal there: off-world queries match no term → empty, not a fixed
+   * fallback cluster. Default OFF (operator plane keeps full vector recall +
+   * reranker).
+   */
+  requireLexicalAnchor?: boolean;
   /** Override dedup pipeline parameters. */
   dedupOpts?: {
     cosineThreshold?: number;
@@ -1325,6 +1340,19 @@ export async function hybridSearch(
   }
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
 
+  // LEXICAL ANCHOR (CC packet 2026-06-18) — customer/tenant plane only.
+  // Drop any fused result whose entity (slug) was NOT surfaced by the keyword
+  // arm, so the floorless vector + facts arms can only REINFORCE a keyword-
+  // matched entity, never independently surface the tight-cluster densest entity
+  // for an off-world query. This is the off-world guard the (gateway-off) tenant
+  // plane has no reranker for; an absolute cosine floor can't do it because
+  // zembed-1 packs the brain into a ~0.8-cosine cluster. Operator plane leaves
+  // this off and keeps full vector recall + the reranker.
+  if (opts?.requireLexicalAnchor) {
+    const anchored = new Set(keywordResults.map(r => r.slug));
+    fused = fused.filter(r => anchored.has(r.slug));
+  }
+
   // Cosine re-scoring before dedup so semantically better chunks survive.
   // v0.36 (D9): hydrate from the active embedding column so rescore happens
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
@@ -1589,6 +1617,7 @@ export async function hybridSearchCached(
   const cacheKnobsHash = knobsHash(resolvedForCache, {
     embeddingColumn: resolvedColCached.name,
     embeddingModel: resolvedColCached.embeddingModel,
+    requireLexicalAnchor: opts?.requireLexicalAnchor,
   });
 
   // Cache decision: opts.useCache (explicit) wins over global config; global

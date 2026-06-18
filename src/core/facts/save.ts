@@ -486,10 +486,20 @@ export async function runSaveFacts(
       ? (texts: string[]) => embedBatch(texts)
       : undefined;
     const embeddingSignature = embeddingsOn ? currentEmbeddingSignature() : null;
-    await materializeEntityPages(ctx.engine, ctx.sourceId, touchedEntitySlugs, {
-      embedChunks,
-      embeddingSignature,
-    });
+    // Best-effort: materialization is the DERIVED layer — the facts (+ graph)
+    // are the primary value and are already inserted. On the auto-commit
+    // (operator/CLI) plane a materialize failure must NOT discard the saved
+    // facts, so swallow + log and return the tally. (On the tenant withSourceScope
+    // tx the embed network call is already caught inside materializeEntityPages
+    // and the remaining ops are plain SQL; this catch is the outer backstop.)
+    try {
+      await materializeEntityPages(ctx.engine, ctx.sourceId, touchedEntitySlugs, {
+        embedChunks,
+        embeddingSignature,
+      });
+    } catch (err) {
+      console.error(`[save_facts] materialize skipped (facts saved): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   return { inserted, duplicate, dropped, fact_ids, dedup_mode };

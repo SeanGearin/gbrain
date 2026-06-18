@@ -1637,6 +1637,10 @@ const search: Operation = {
       expansion: false,
       ...scope,
       ...(perCallMode ? { mode: perCallMode } : {}),
+      // CC packet 2026-06-18 — see the `query` op: lexical-anchor the customer
+      // plane so off-world queries don't fall back to the tight-cluster densest
+      // entity. Operator/CLI keeps full vector recall.
+      requireLexicalAnchor: isCustomerScopedRemoteRead(ctx),
       onMeta: (m) => { capturedMeta = m; },
     });
     const latency_ms = Date.now() - startedAt;
@@ -1824,6 +1828,13 @@ const query: Operation = {
       // source_id ('__all__' → {}) leaves this unset → store falls back to
       // sourceId (local/CLI unchanged).
       cacheSourceId: ctx.sourceId,
+      // CC packet 2026-06-18 — customer/tenant plane: require a LEXICAL anchor so
+      // the floorless vector + facts arms reinforce keyword-matched entities and
+      // never independently surface the tight-cluster densest entity for an
+      // off-world query (no reranker on this plane; an absolute cosine floor
+      // can't separate a ~0.8-cosine personal-brain cluster). Operator/CLI plane
+      // keeps full vector recall + reranker.
+      requireLexicalAnchor: isCustomerScopedRemoteRead(ctx),
       // v0.29.1 — agent-explicit recency + salience. Omitted = heuristic defaults.
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,

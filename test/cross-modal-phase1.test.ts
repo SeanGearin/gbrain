@@ -143,7 +143,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // v0.40.3.0 D8 bumps to v=5 (sequenced behind salem's v=4 graph-signals).
     // v0.41.22.0 (type-unification): 5→6 for alias_resolved post-fusion boost.
     // T2: 6→7 title_boost. v0.42.3.0: 7→8 autocut. issue #1777: 8→9 archive/ demote.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

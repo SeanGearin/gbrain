@@ -706,7 +706,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // to take effect immediately (one-time global cache cold-miss on upgrade; refills
 // within cache.ttl_seconds). Same cache-key-contamination convention as the
 // autocut / title_boost / graph_signals bumps above.
-export const KNOBS_HASH_VERSION = 9;
+export const KNOBS_HASH_VERSION = 10;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -735,6 +735,14 @@ export interface KnobsHashContext {
    */
   schemaPack?: string;
   schemaPackVersion?: string;
+  /**
+   * v=10 (CC packet 2026-06-18) — customer-plane lexical-anchor gate. A
+   * lexical-anchored read (vector + facts arms reinforce keyword-matched
+   * entities only) returns a different set than an unanchored read, so the two
+   * must never share a cache row. Folded here (not into the knob resolver)
+   * because it is a per-request plane property, not a tunable search knob.
+   */
+  requireLexicalAnchor?: boolean;
 }
 
 export function knobsHash(
@@ -814,6 +822,11 @@ export function knobsHash(
     // etc.) so a partial-knobs caller (tests passing a minimal literal) can't
     // crash the hash. Typed callers always carry the field.
     `acj=${(knobs.autocut_jump ?? 0.2).toFixed(2)}`,
+    // v=10 addition (CC packet 2026-06-18, append-only): customer-plane
+    // lexical-anchor gate. An anchored read drops vector/facts results whose
+    // entity wasn't keyword-matched, so its set differs from an unanchored read
+    // for the same (source, query) — they must not share a cache row.
+    `la=${ctx?.requireLexicalAnchor ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

@@ -392,7 +392,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // archive/ demote (search-exclude policy change isn't in the hash, so the
     // version bump is what invalidates archive-excluded cache rows). A query
     // must not be served from a cache row written before the policy change.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -558,7 +558,7 @@ describe('v0.40.4 — graph_signals knob', () => {
 
 describe('v0.42.3.0 — autocut knobs', () => {
   test('KNOBS_HASH_VERSION is 9 (8→9 archive-demote, issue #1777)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
