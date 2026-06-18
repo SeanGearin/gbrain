@@ -45,6 +45,16 @@ import {
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
+/**
+ * Demotion for an un-materialized save_facts STUB chunk (CC packet 2026-06-18).
+ * A stub carries the entity NAME but no fact substance, so its compiled_truth
+ * chunk would otherwise win on an exact-title-match + the 2.0x COMPILED_TRUTH
+ * boost — burying the entity's real facts. Demoting it (< 1.0) guarantees a
+ * real fact-bearing compiled_truth chunk (still 2.0x) and the facts arm outrank
+ * any leftover stub. Applies ONLY to stub chunks (see isStubChunk); real
+ * materialized bodies and authored pages are untouched.
+ */
+const STUB_PAGE_DEMOTION = 0.5;
 const pendingCacheWrites = new Set<Promise<unknown>>();
 
 /**
@@ -1297,8 +1307,21 @@ export async function hybridSearch(
   // are vector-ranked, same space as the chunk arm). Added last so it composes
   // with every modality branch; empty when the arm is off / found nothing / not
   // the text path, in which case it contributes nothing to the fusion.
+  //
+  // ENTITY-GATE (CC packet 2026-06-18): only surface facts whose entity (slug)
+  // was ALSO matched by the chunk/keyword arms, so the facts arm REINFORCES a
+  // query-matched entity instead of injecting the densest GLOBAL cluster for a
+  // weak/off-world query (the "Boltline query returns Sightline's facts" and
+  // "pizza returns a fixed fallback cluster" failures). searchFactsVector is a
+  // pure global vector NN over the facts table, so without this an off-target
+  // query still pulls the biggest fact cluster; gating makes the result set
+  // track the query. Post-materialization the chunk arm carries each entity's
+  // substance, so a genuinely relevant entity is matched there first.
   if (factsList.length > 0) {
-    allLists.push({ list: factsList, k: vectorK });
+    const gatedFacts = gateFactsToMatchedEntities(factsList, [...vectorLists, keywordResults]);
+    if (gatedFacts.length > 0) {
+      allLists.push({ list: gatedFacts, k: vectorK });
+    }
   }
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
 
@@ -1757,6 +1780,49 @@ export async function hybridSearchCached(
 }
 
 /**
+ * An un-materialized save_facts STUB chunk — a `compiled_truth` chunk whose body
+ * is still the bare skeleton (carries the stub marker), as opposed to a body
+ * materialized from the entity's facts. Facts-arm rows carry NEGATIVE chunk_id,
+ * so the `chunk_id > 0` guard keeps them out; authored/enriched pages never
+ * carry the marker. Keep the marker string in sync with construct.ts STUB_MARKER.
+ */
+function isStubChunk(r: SearchResult): boolean {
+  return r.chunk_source === 'compiled_truth'
+    && (r.chunk_id ?? 0) > 0
+    && typeof r.chunk_text === 'string'
+    && r.chunk_text.includes('Stub page. Created from a saved fact.');
+}
+
+/**
+ * The compiled_truth score multiplier for one fused entry: demote leftover
+ * stubs, boost real materialized bodies + facts, leave everything else at 1.0.
+ */
+function compiledTruthBoost(r: SearchResult, applyBoost: boolean): number {
+  if (!applyBoost || r.chunk_source !== 'compiled_truth') return 1.0;
+  return isStubChunk(r) ? STUB_PAGE_DEMOTION : COMPILED_TRUTH_BOOST;
+}
+
+/**
+ * Facts-arm entity gate (CC packet 2026-06-18). `searchFactsVector` is a global
+ * vector NN over the facts table, so for a weak/off-world query it returns the
+ * densest fact cluster regardless of intent ("Boltline" → Sightline's facts;
+ * "pizza" → a fixed fallback cluster). Keep only facts whose entity (slug) was
+ * ALSO surfaced by the chunk/keyword arms (`matchedLists`), so the facts arm
+ * REINFORCES a query-matched entity instead of injecting an unrelated cluster.
+ * No match → empty, so the result set tracks the query. Pure + side-effect-free
+ * so it is unit-testable without a live embedding provider.
+ */
+export function gateFactsToMatchedEntities(
+  factsList: SearchResult[],
+  matchedLists: SearchResult[][],
+): SearchResult[] {
+  if (factsList.length === 0) return factsList;
+  const matched = new Set<string>();
+  for (const list of matchedLists) for (const r of list) matched.add(r.slug);
+  return factsList.filter(f => matched.has(f.slug));
+}
+
+/**
  * v0.32.x search-lite — weighted RRF. Each list contributes with its own
  * effective k value, which lets intent weighting bias keyword vs vector
  * lists without re-weighting individual scores. Wraps rrfFusion internally
@@ -1790,8 +1856,7 @@ export function rrfFusionWeighted(
   if (maxScore > 0) {
     for (const e of entries) {
       e.score = e.score / maxScore;
-      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' ? COMPILED_TRUTH_BOOST : 1.0;
-      e.score *= boost;
+      e.score *= compiledTruthBoost(e.result, applyBoost);
     }
   }
 
@@ -1833,8 +1898,9 @@ export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true)
       const rawScore = e.score;
       e.score = e.score / maxScore;
 
-      // Apply compiled truth boost after normalization (skip for detail=high)
-      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' ? COMPILED_TRUTH_BOOST : 1.0;
+      // Apply compiled-truth boost after normalization (skip for detail=high).
+      // Stubs are demoted, real materialized bodies + facts boosted.
+      const boost = compiledTruthBoost(e.result, applyBoost);
       e.score *= boost;
 
       if (DEBUG) {

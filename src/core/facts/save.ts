@@ -36,10 +36,11 @@ import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
 import { scanRestrictedData, logRestrictedDrop } from './restricted-data.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
+import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 import { cosineSimilarity } from './classify.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
-import { constructGraphFromClaim } from './construct.ts';
+import { constructGraphFromClaim, materializeEntityPages } from './construct.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -354,6 +355,9 @@ export async function runSaveFacts(
   let inserted = 0;
   let duplicate = 0;
   const fact_ids: number[] = [];
+  // Entity slugs that received a NEW fact this batch — the set whose pages must
+  // be (re)materialized from their facts after the loop (Layer 1, search_brain).
+  const touchedEntitySlugs = new Set<string>();
 
   for (const { claim: c, cleaned } of claims) {
     // Claims were sanitized + emptiness-checked in the validation pass above;
@@ -458,9 +462,34 @@ export async function runSaveFacts(
         personSurfaceHints,
         claimText: cleaned,
       });
+      // Anchor for the post-loop materialize: this fact's primary-subject page
+      // must be rebuilt from its facts so search_brain's chunk arm sees the
+      // substance (not the stub). entity_slug == page slug by construction.
+      if (entitySlug) touchedEntitySlugs.add(entitySlug);
     } else {
       duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
     }
+  }
+
+  // --- Layer 1: materialize entity bodies from facts (search_brain) ---------
+  // Rebuild each touched entity's compiled_truth from its OWN active facts and
+  // re-chunk, so search_brain's chunk arm retrieves real fact substance instead
+  // of the stub skeleton (the search_brain-empty root cause; see construct.ts).
+  // Deterministic + LLM-free: a pure facts→markdown compile (no chat gateway,
+  // which the tenant plane does not have). Chunk embeddings reuse the SAME
+  // ZeroEntropy zembed-1 lane the facts above used (embeddingsOn-gated,
+  // best-effort) — zero added model inference; keyword search works at once via
+  // the search_vector trigger even when the embed lane is down. Runs in the
+  // caller's withSourceScope tx (same-tx fact visibility, RLS-confined).
+  if (touchedEntitySlugs.size > 0) {
+    const embedChunks = embeddingsOn
+      ? (texts: string[]) => embedBatch(texts)
+      : undefined;
+    const embeddingSignature = embeddingsOn ? currentEmbeddingSignature() : null;
+    await materializeEntityPages(ctx.engine, ctx.sourceId, touchedEntitySlugs, {
+      embedChunks,
+      embeddingSignature,
+    });
   }
 
   return { inserted, duplicate, dropped, fact_ids, dedup_mode };

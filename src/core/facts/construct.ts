@@ -37,6 +37,20 @@
  *   embed is deferred + external, exactly as `reindex` defers it), so the
  *   tenant-plane FLAG-C discipline is untouched.
  *
+ * MATERIALIZATION (CC packet 2026-06-18 — the search_brain root cause, deeper).
+ *   Chunking the stub alone is NOT enough: the stub body carries the entity
+ *   NAME but ZERO fact substance, so a "Boltline" query title-matches the stub
+ *   while the entity's real facts (in the facts table) never reach the chunk
+ *   arm. `materializeEntityPages` closes this: after save_facts inserts a batch,
+ *   it rebuilds each touched entity's `compiled_truth` from that entity's own
+ *   ACTIVE facts (a deterministic facts→markdown compile — `compileEntityBody`,
+ *   NO chat model) and re-chunks it, so the chunk arm retrieves fact text, not a
+ *   skeleton. Unlike `ensureStub` (one-shot, new pages only) it rebuilds across
+ *   the whole active fact set and on every batch, so a multi-fact entity and a
+ *   pre-existing page both converge. Chunk embeddings reuse the SAME ZeroEntropy
+ *   zembed-1 lane the facts use (injected, best-effort) — zero added model
+ *   inference; keyword search works immediately even if that lane is down.
+ *
  * TENANT-PLANE DISCIPLINE (CC packet "where the real care goes"):
  *   - LOW-LEVEL direct writes only — `engine.putPage` / `engine.upsertChunks` /
  *     `engine.addLinksBatch`, NOT the `put_page` OP. The op's post-write hooks
@@ -70,8 +84,8 @@
  * there is no fresh engine, config read, model call, or embedding call here.
  */
 
-import type { BrainEngine, LinkBatchInput } from '../engine.ts';
-import type { ChunkInput } from '../types.ts';
+import type { BrainEngine, LinkBatchInput, FactRow } from '../engine.ts';
+import type { ChunkInput, Page } from '../types.ts';
 import { chunkText, MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
@@ -114,6 +128,37 @@ const ENTITY_RESOLUTION_FUZZY_THRESHOLD = 0.4;
  * caps edges at 32*31 = 992 per fact, comfortably batchable.
  */
 const MAX_ENTITIES_PER_FACT = 32;
+
+/**
+ * The boilerplate line that marks a page body as an un-materialized stub. Search
+ * ranking (hybrid.ts `isStubChunk`) keys on this exact string to demote stubs
+ * below real fact-bearing content, and `isConstructOwnedPage` uses it as a
+ * forward-safe ownership signal. Keep the two in sync — changing it here means
+ * changing the detector there.
+ */
+export const STUB_MARKER = '*Stub page. Created from a saved fact.*';
+
+/** The minimal graph-anchor body for an entity with no facts of its own yet. */
+function stubBody(name: string, label: string): string {
+  return `# ${name}\n\n**Type:** ${label}\n\n## Summary\n\n${STUB_MARKER}\n\n## Timeline\n`;
+}
+
+/** Human label for a page `type`. 'person'/'company' get the canonical casing. */
+function typeLabel(type: string): string {
+  if (type === 'person') return 'Person';
+  if (type === 'company') return 'Company';
+  return type ? type.charAt(0).toUpperCase() + type.slice(1) : 'Entity';
+}
+
+/**
+ * Embed a batch of chunk texts, INJECTED by the caller so this module stays
+ * gateway-free (the FLAG-C / red-team isolation proof — no AI-gateway import
+ * here). Returns one vector per text, or null for any that failed. save_facts
+ * supplies the ZeroEntropy zembed-1 batch embed when the embedding lane is
+ * configured; omitted → chunks land NULL-embedded (keyword-searchable via the
+ * search_vector trigger, vector arm filled later by `embed --stale`).
+ */
+export type EmbedChunksFn = (texts: string[]) => Promise<Array<Float32Array | null>>;
 
 export interface ConstructInput {
   /** Surface forms of people co-mentioned in the claim (→ people/ pages). */
@@ -283,8 +328,7 @@ async function ensureStub(
   // this is also RLS-confined to the tenant; here it keeps PGLite (no RLS)
   // honest about which source owns the page.
   if (await engine.getPage(slug, { sourceId })) return { pageCreated: false, chunksCreated: 0 };
-  const label = type === 'person' ? 'Person' : 'Company';
-  const compiledTruth = `# ${name}\n\n**Type:** ${label}\n\n## Summary\n\n*Stub page. Created from a saved fact.*\n\n## Timeline\n`;
+  const compiledTruth = stubBody(name, typeLabel(type));
   await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts graph construct — entity stub from a client-extracted fact; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
     slug,
     {
@@ -335,6 +379,133 @@ async function writeStubChunks(
   if (chunks.length === 0) return 0;
   await engine.upsertChunks(slug, chunks, { sourceId }); // gbrain-allow-direct-insert: deterministic save_facts graph construct — stub chunks from a client-extracted fact; low-level upsert (NULL embedding, trigger-built search_vector), NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
   return chunks.length;
+}
+
+/**
+ * Deterministic entity body from the entity's OWN active facts — the search_brain
+ * materialization (CC packet 2026-06-18). LLM-FREE: pure string assembly, no chat
+ * gateway (which the tenant plane does not have). Keeps the `# <title>` /
+ * `**Type:**` header so entity-name title matching still fires, and lists each
+ * distinct fact under a `## Facts` section so the chunk arm of hybrid search
+ * retrieves real fact substance instead of the stub skeleton. With no facts it
+ * returns the stub body unchanged, so a fact-less co-mention page stays a stub.
+ *
+ * Append-stable: `listFactsByEntity` returns newest-first, so we render
+ * oldest-first — an existing fact keeps its line position as new facts arrive,
+ * which keeps the body (and thus the content_hash / chunk set) stable across
+ * re-materializations that didn't actually change the fact set.
+ */
+export function compileEntityBody(
+  title: string,
+  type: string,
+  facts: Array<Pick<FactRow, 'fact'>>,
+): string {
+  const label = typeLabel(type);
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const text = facts[i].fact.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    lines.push(`- ${text}`);
+  }
+  if (lines.length === 0) return stubBody(title, label);
+  return `# ${title}\n\n**Type:** ${label}\n\n## Facts\n\n${lines.join('\n')}\n\n## Timeline\n`;
+}
+
+/**
+ * Is this page safe for save_facts to rebuild from facts? YES when save_facts
+ * created it (`frontmatter.source === 'mcp:save_facts'`) or its body still bears
+ * the stub marker (legacy stubs + forward-safe). Authored / enriched pages
+ * (operator-plane synthesize, imported markdown) have NEITHER, so we NEVER
+ * clobber a real body with a deterministic facts compile.
+ */
+function isConstructOwnedPage(page: Page): boolean {
+  const source = (page.frontmatter as { source?: unknown } | null | undefined)?.source;
+  if (source === 'mcp:save_facts') return true;
+  return page.compiled_truth.includes(STUB_MARKER);
+}
+
+/**
+ * Rebuild each entity page's `compiled_truth` from its own active facts and
+ * re-chunk it, so `search_brain` (hybrid search over content_chunks) retrieves
+ * the entity's real fact substance — the search_brain-empty root cause was that
+ * these bodies were stub skeletons (see the module SEARCHABILITY header).
+ *
+ * Runs INSIDE the caller's withSourceScope tx (same-tx visibility of the facts
+ * just inserted; RLS-confined to `sourceId` under the gbrain_tenant role). Pure
+ * SQL + a local chunk split + an OPTIONAL injected embed — no getConfig, no
+ * put_page op, no chat model. Idempotent: an unchanged fact set produces an
+ * identical body and is skipped (no rewrite, no re-chunk).
+ *
+ * - never clobbers authored/enriched pages (isConstructOwnedPage gate);
+ * - leaves a fact-less page as a stub (nothing to materialize);
+ * - chunk embedding is best-effort via `opts.embedChunks` — on omission/failure
+ *   chunks land NULL-embedded (keyword-searchable at once; `embed --stale` fills
+ *   the vector arm later), so an embed hiccup never breaks the save.
+ */
+export async function materializeEntityPages(
+  engine: BrainEngine,
+  sourceId: string,
+  entitySlugs: Iterable<string>,
+  opts?: { embedChunks?: EmbedChunksFn; embeddingSignature?: string | null },
+): Promise<{ pagesMaterialized: number; chunksWritten: number }> {
+  let pagesMaterialized = 0;
+  let chunksWritten = 0;
+  const done = new Set<string>();
+  for (const slug of entitySlugs) {
+    if (!slug || done.has(slug)) continue;
+    done.add(slug);
+
+    const page = await engine.getPage(slug, { sourceId });
+    if (!page) continue;                        // fact anchored to a slug with no page — the facts arm still serves it
+    if (!isConstructOwnedPage(page)) continue;  // authored/enriched body — never clobber
+
+    const facts = await engine.listFactsByEntity(sourceId, slug, { activeOnly: true, limit: 100 });
+    if (facts.length === 0) continue;           // nothing to materialize — leave the stub as-is
+
+    const body = compileEntityBody(page.title, page.type, facts);
+    if (body === page.compiled_truth) continue; // idempotent: identical body, skip rewrite + re-chunk
+
+    await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts materialize — entity body rebuilt from its own active facts; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
+      slug,
+      {
+        title: page.title,
+        type: page.type,
+        compiled_truth: body,
+        timeline: page.timeline ?? '',
+        chunker_version: MARKDOWN_CHUNKER_VERSION,
+        frontmatter: page.frontmatter, // preserve the mcp:save_facts ownership marker
+      },
+      { sourceId },
+    );
+
+    const chunks: ChunkInput[] = chunkText(body).map((c, i) => ({
+      chunk_index: i,
+      chunk_text: c.text,
+      chunk_source: 'compiled_truth',
+    }));
+    if (chunks.length > 0 && opts?.embedChunks) {
+      try {
+        const embeddings = await opts.embedChunks(chunks.map(c => c.chunk_text));
+        for (let i = 0; i < chunks.length; i++) {
+          const vec = embeddings[i];
+          if (vec) chunks[i].embedding = vec;
+        }
+      } catch {
+        // Embedding lane hiccup — land chunks NULL-embedded (keyword-searchable
+        // via the search_vector trigger; `embed --stale` fills the vector arm).
+        // Never break the save for an embed failure (mirrors the per-fact embed).
+      }
+    }
+    await engine.upsertChunks(slug, chunks, { sourceId }); // gbrain-allow-direct-insert: deterministic save_facts materialize — fact-substance chunks replace the stub chunk; low-level upsert, NOT the put_page op
+    if (opts?.embeddingSignature && chunks.some(c => c.embedding)) {
+      await engine.setPageEmbeddingSignature(slug, { sourceId, signature: opts.embeddingSignature });
+    }
+    pagesMaterialized += 1;
+    chunksWritten += chunks.length;
+  }
+  return { pagesMaterialized, chunksWritten };
 }
 
 /** One directed co-occurrence edge, source-qualified on both endpoints. */
