@@ -126,13 +126,14 @@ export class SemanticQueryCache {
    */
   async lookup(
     queryEmbedding: Float32Array | null,
-    opts: { sourceId?: string; knobsHash?: string } = {},
+    opts: { sourceId?: string; knobsHash?: string; queryText?: string } = {},
   ): Promise<CacheLookupResult> {
     if (!this.enabled || !queryEmbedding || queryEmbedding.length === 0) {
       return { hit: false };
     }
     const sourceId = opts.sourceId ?? 'default';
     const knobsHash = opts.knobsHash ?? '';
+    const queryTextNorm = normalizeCacheQueryText(opts.queryText);
     const distanceThreshold = 1 - this.similarityThreshold;
     const vec = embeddingToPgVector(queryEmbedding);
 
@@ -161,13 +162,14 @@ export class SemanticQueryCache {
          FROM query_cache qc
          WHERE qc.source_id = $2
            AND qc.knobs_hash = $4
+           AND ($5::text IS NULL OR lower(trim(qc.query_text)) = $5)
            AND qc.embedding IS NOT NULL
            AND qc.embedding <=> $1::vector < $3
            AND qc.created_at + (qc.ttl_seconds || ' seconds')::interval > now()
            AND ${CACHE_GATE_WHERE_CLAUSE}
          ORDER BY qc.embedding <=> $1::vector
          LIMIT 1`,
-        [vec, sourceId, distanceThreshold, knobsHash],
+        [vec, sourceId, distanceThreshold, knobsHash, queryTextNorm],
       );
 
       if (rows.length === 0) return { hit: false };
@@ -373,6 +375,12 @@ function clampTtl(v: number | undefined): number {
   if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return DEFAULT_TTL_SECONDS;
   // Cap at 30 days to avoid runaway TTLs.
   return Math.min(60 * 60 * 24 * 30, Math.floor(v));
+}
+
+function normalizeCacheQueryText(queryText: string | undefined): string | null {
+  if (typeof queryText !== 'string') return null;
+  const normalized = queryText.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
 }
 
 function safeJsonParse<T>(value: unknown, fallback: T): T {

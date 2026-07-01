@@ -150,6 +150,20 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
     expect(hit.similarity).toBeGreaterThan(0.99);
   });
 
+  test('query-text-gated lookup misses a different query with the same embedding', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(2);
+
+    await cache.store('Strider', emb, [makeResult('companies/strider')], META);
+
+    const wrongQueryHit = await cache.lookup(emb, { queryText: 'Sightline funding' });
+    expect(wrongQueryHit.hit).toBe(false);
+
+    const sameQueryHit = await cache.lookup(emb, { queryText: 'Strider' });
+    expect(sameQueryHit.hit).toBe(true);
+    expect(sameQueryHit.results?.[0].slug).toBe('companies/strider');
+  });
+
   test('similar embedding (cosine > 0.92) is a hit', async () => {
     const cache = new SemanticQueryCache(engine);
     const base = makeEmbedding(100);
