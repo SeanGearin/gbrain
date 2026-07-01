@@ -142,12 +142,30 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
     const results = [makeResult('a'), makeResult('b')];
 
     await cache.store('what is foo', emb, results, META);
-    const hit = await cache.lookup(emb);
+    const hit = await cache.lookup(emb, { queryText: 'what is foo' });
 
     expect(hit.hit).toBe(true);
     expect(hit.results).toHaveLength(2);
     expect(hit.results?.[0].slug).toBe('a');
     expect(hit.similarity).toBeGreaterThan(0.99);
+  });
+
+  test('lookup without query text fails closed (no text, no cache)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(3);
+    await cache.store('what is foo', emb, [makeResult('a')], META);
+
+    expect((await cache.lookup(emb)).hit).toBe(false);
+    expect((await cache.lookup(emb, { queryText: '   ' })).hit).toBe(false);
+  });
+
+  test('whitespace/case variants of the same text still hit (JS/SQL normalization agrees)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const emb = makeEmbedding(4);
+    await cache.store('Strider', emb, [makeResult('companies/strider')], META);
+
+    const hit = await cache.lookup(emb, { queryText: '  strider\n' });
+    expect(hit.hit).toBe(true);
   });
 
   test('query-text-gated lookup misses a different query with the same embedding', async () => {
@@ -177,8 +195,10 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
     mag = Math.sqrt(mag);
     for (let i = 0; i < DIM; i++) near[i] /= mag;
 
+    // Same query text, drifted embedding (e.g. re-embed after provider
+    // update) — the similarity path still serves it under the text gate.
     await cache.store('what is foo', base, [makeResult('a')], META);
-    const hit = await cache.lookup(near);
+    const hit = await cache.lookup(near, { queryText: 'what is foo' });
 
     expect(hit.hit).toBe(true);
     expect(hit.similarity).toBeGreaterThan(0.92);
@@ -189,7 +209,7 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
     const a = makeEmbedding(1);
     const b = makeOrthogonalEmbedding(2);
     await cache.store('q1', a, [makeResult('a')], META);
-    const hit = await cache.lookup(b);
+    const hit = await cache.lookup(b, { queryText: 'q1' });
     expect(hit.hit).toBe(false);
   });
 });
@@ -204,7 +224,7 @@ describe('SemanticQueryCache \u2014 TTL', () => {
     await engine.executeRaw(
       `UPDATE query_cache SET created_at = now() - interval '10 seconds'`,
     );
-    const hit = await cache.lookup(emb);
+    const hit = await cache.lookup(emb, { queryText: 'q' });
     expect(hit.hit).toBe(false);
   });
 });
@@ -214,9 +234,9 @@ describe('SemanticQueryCache \u2014 source isolation', () => {
     const cache = new SemanticQueryCache(engine);
     const emb = makeEmbedding(7);
     await cache.store('q', emb, [makeResult('a')], META, { sourceId: 'src-A' });
-    const hitB = await cache.lookup(emb, { sourceId: 'src-B' });
+    const hitB = await cache.lookup(emb, { sourceId: 'src-B', queryText: 'q' });
     expect(hitB.hit).toBe(false);
-    const hitA = await cache.lookup(emb, { sourceId: 'src-A' });
+    const hitA = await cache.lookup(emb, { sourceId: 'src-A', queryText: 'q' });
     expect(hitA.hit).toBe(true);
   });
 });
@@ -251,7 +271,7 @@ describe('SemanticQueryCache \u2014 management', () => {
     const cache = new SemanticQueryCache(engine);
     const emb = makeEmbedding(13);
     await cache.store('q', emb, [makeResult('a')], META);
-    await cache.lookup(emb);  // bump hit
+    await cache.lookup(emb, { queryText: 'q' });  // bump hit
     // Hit bump is async/fire-and-forget; give it a moment to land.
     await new Promise(r => setTimeout(r, 50));
     const stats = await cache.stats();
@@ -268,7 +288,7 @@ describe('SemanticQueryCache \u2014 disabled', () => {
     const emb = makeEmbedding(99);
     await cache.store('q', emb, [makeResult('a')], META);
     // Even after a store call, lookup must miss because enabled=false.
-    const hit = await cache.lookup(emb);
+    const hit = await cache.lookup(emb, { queryText: 'q' });
     expect(hit.hit).toBe(false);
   });
 });
