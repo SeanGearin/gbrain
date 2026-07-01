@@ -101,7 +101,18 @@ async function expandQueryWithDeps(query: string, deps: ExpandQueryDeps): Promis
       return unique.slice(0, MAX_QUERIES).map(q =>
         all.find(orig => orig.toLowerCase().trim() === q) || q,
       );
-    } catch {
+    } catch (err) {
+      // A timed-out/aborted provider is slow, not flaky — an immediate retry
+      // just doubles the stall (and the empty-result escalation pass can
+      // multiply it again). Retry only fast failures; fall back at once on
+      // timeout-class errors.
+      const name = (err as { name?: string } | null)?.name ?? '';
+      const isTimeout = name === 'AbortError' || name === 'TimeoutError'
+        || /timeout|abort/i.test(String((err as { message?: string } | null)?.message ?? ''));
+      if (isTimeout) {
+        deps.warn('[gbrain] expandQuery: expansion provider timed out; falling back to the original query without retry');
+        return [query];
+      }
       if (attempt < MAX_EXPANSION_ATTEMPTS) {
         deps.warn('[gbrain] expandQuery: expansion provider failed; retrying once');
         warnedRetry = true;

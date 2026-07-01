@@ -126,7 +126,6 @@ const CANONICAL_PATTERNS = [
   /::|->|\.\w+\(/,
   /\b(function|class|method|module)\s+\w+/i,
   /\b(graph|traversal|backlinks?|inbound|outbound)\b/i,
-  /\bwhat\s+do\s+(i|you|we)\s+know\b/i,
 ];
 
 // Aggressive recency: "today", "right now", "this morning", "just now".

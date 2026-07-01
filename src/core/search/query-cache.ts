@@ -134,6 +134,10 @@ export class SemanticQueryCache {
     const sourceId = opts.sourceId ?? 'default';
     const knobsHash = opts.knobsHash ?? '';
     const queryTextNorm = normalizeCacheQueryText(opts.queryText);
+    // Fail closed: without usable query text the text gate cannot apply, and
+    // an embedding-only match is exactly the F5 collision class (one cached
+    // row served to every nearby query). No text, no cache.
+    if (queryTextNorm === null) return { hit: false };
     const distanceThreshold = 1 - this.similarityThreshold;
     const vec = embeddingToPgVector(queryEmbedding);
 
@@ -162,7 +166,7 @@ export class SemanticQueryCache {
          FROM query_cache qc
          WHERE qc.source_id = $2
            AND qc.knobs_hash = $4
-           AND ($5::text IS NULL OR lower(trim(qc.query_text)) = $5)
+           AND lower(btrim(qc.query_text, E' \t\r\n')) = $5
            AND qc.embedding IS NOT NULL
            AND qc.embedding <=> $1::vector < $3
            AND qc.created_at + (qc.ttl_seconds || ' seconds')::interval > now()

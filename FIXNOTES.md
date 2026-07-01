@@ -9,14 +9,14 @@ Customer symptom: "what do I know about Boltline" and "tell me about Sightline a
 Three stacked causes, each fixed in its own commit:
 
 1. **Intent misclassification** (`c01f1fe4`, query-intent.ts): `ENTITY_PATTERNS` matched "what do **you/we** know" but not "what do **I** know" — first-person queries fell to GENERAL intent. Live discriminator that proved it from the public surface: the you-form returned 4 hits while the I-form returned `[]`. Fix: `(i|you|we)`.
-2. **Detail-gated empty escalation** (`7e48c5e1`, hybrid.ts): the empty-result retry-at-high-detail fired only when `detail === 'low'` (the ENTITY-resolved value). GENERAL-intent queries resolve `detail: undefined`, so empties returned with no second look. Fix: escalate on empty regardless of intent class, at all three empty checkpoints, with an `_emptyEscalated` recursion guard and `detail !== 'high'` bound.
+2. **Detail-gated empty escalation** (`7e48c5e1`, hybrid.ts): the empty-result retry-at-high-detail checked the CALLER's `opts.detail === 'low'`, so auto-detected 'low' (what ENTITY intent resolves — the F1 wrapper case) never escalated. Fix: gate on the RESOLVED `detail === 'low'` at all three empty checkpoints, with an `_emptyEscalated` recursion guard. (Escalation stays restricted to resolved-low on review: 'low' is the only level that narrows the searched chunk set, so retrying any other level is a guaranteed-futile second search — see Review hardening below.)
 3. **Expansion results not unioned + silent expansion fallback** (`7e48c5e1` + `f6333513`): expanded sub-queries previously contributed only vector arms — keyword results for sub-queries were dropped, so compound queries lost their strongest anchors (fix: `keywordLists` union feeds RRF fusion, entity gating, and anchoring). Separately, when the expansion gateway errored, expansion silently fell back to the raw query (expansion.ts catch) — this is why the failing surface DRIFTED day to day: gateway health masked/unmasked the bugs above. Fix: one retry + loud warnings on fallback.
 
 ## F5 — one frozen result set served to different queries
 
 Customer symptom (worse than F1 — silently *wrong*): with bare `{query}` args (the shape most MCP agent clients send), every query returned the identical result set — "Strider" and "Sightline funding" both answered with Boltline pages. Interleaved calls with `{detail:'low', limit:5}` were correct, same token, same session.
 
-Root cause (`268b6586`, query-cache.ts): the `SemanticQueryCache` **lookup** matched by embedding similarity within a `(source_id, knobs_hash)` partition — no query-text term — `ORDER BY embedding <=> $1 LIMIT 1`. Distinct queries whose embeddings fell within the similarity threshold shared whatever row was cached first. Explicit `detail`/`limit` args dodged it only because they land in a different `knobs_hash` partition. The **store** side always wrote `query_text` (row id = hash of `source_id::query_text::knobs_hash`) — only the lookup ignored it.
+Root cause (`268b6586`, query-cache.ts): the `SemanticQueryCache` **lookup** matched by embedding similarity within a `(source_id, knobs_hash)` partition — no query-text term — `ORDER BY embedding <=> $1 LIMIT 1`. Distinct queries whose embeddings fell within the similarity threshold shared whatever row was cached first. Explicit args dodged it because `limit` participates in `knobs_hash` (`detail` does NOT — folding `detail_resolved` into knobsHash is a follow-up), so `limit: 5` probes landed in a different partition. The **store** side always wrote `query_text` (row id = hash of `source_id::query_text::knobs_hash`) — only the lookup ignored it.
 
 Fix: `lookup()` takes `queryText` and the SQL requires `lower(trim(query_text)) = $5` alongside the similarity match; hybrid.ts passes the query at the lookup callsite.
 
@@ -36,6 +36,20 @@ All 38 pass (4.4s targeted run). Full `bun run verify` gate: run with `GBRAIN_HO
 ## Deploy
 
 Engine-side only; no schema migration (query_cache already stores query_text). Deploy to the customer plane is Sean-gated. Post-deploy acceptance: `loop-forge/loops/recall-canary/run.sh` must transition red → green (its evidence self-triages: bare-vs-detailargs twin = F5, compound cases = F1).
+
+## Review hardening (post-adversarial-review, 2026-07-01 late)
+
+Two independent adversarial reviewers (hybrid-regression lens, cache-semantics lens) returned ship-with-notes; all real findings applied:
+
+1. **Escalation gated on resolved `detail === 'low'`** — only 'low' narrows the searched chunk set; retrying undefined/medium-detail passes is a provably-futile second full search on every miss-query. Auto-detected 'low' (the F1 wrapper case) still escalates.
+2. **Escalation checkpoints test the pre-slice pool** — pagination past the last page or a tight tokenBudget no longer triggers a spurious re-search ("search found nothing" ≠ "presentation trimmed everything").
+3. **Escalated retry mints a fresh embed deadline** (`_queryEmbedDeadline: undefined`) — it no longer inherits a spent 6s AbortSignal window, which silently degraded the rescue to keyword-only exactly under slow-call conditions.
+4. **Expansion timeout-class failures don't retry** — a stalled gateway (300s AI_CHAT_TIMEOUT) now falls back immediately; only fast errors get the single retry. Caps outage amplification.
+5. **Cache fails closed without query text** — whitespace-only/absent text skips the cache instead of silently reverting to embedding-only matching (the F5 class).
+6. **JS/SQL whitespace normalization aligned** — SQL side uses `btrim(query_text, E' \t\r\n')` to mirror JS `trim()` for the common classes.
+7. **Reverted an unrequested CANONICAL_PATTERNS addition** — it would have changed recency/salience axes for previously-healthy you/we-form queries. The F1 fix needs only the ENTITY_PATTERNS amendment.
+
+Deliberate non-fixes (watch, don't churn): expanded keyword arms tilt RRF slightly lexical and widen the tenant lexical-anchor set — intended union semantics; watch healthy-query rank stability via the recall-canary/evals. Cache-lookup functional index (`source_id, knobs_hash, lower(btrim(query_text,...))`) and folding `detail_resolved` into knobsHash are follow-ups, not blockers.
 
 ## Branch variants
 

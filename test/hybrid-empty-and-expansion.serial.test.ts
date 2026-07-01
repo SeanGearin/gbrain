@@ -95,7 +95,7 @@ afterEach(() => {
 });
 
 describe('hybridSearch empty-result escalation', () => {
-  test('default-detail empty results retry once with high detail', async () => {
+  test('resolved-low empty results (ENTITY intent auto-detail) retry once with high detail', async () => {
     const calls: FakeSearchCall[] = [];
     const engine = makeFakeEngine({
       calls,
@@ -105,13 +105,50 @@ describe('hybridSearch empty-result escalation', () => {
         : [],
     });
 
-    const out = await hybridSearch(engine, 'Boltline traction memo', {
+    // "what do I know about X" auto-detects detail 'low' via ENTITY intent —
+    // the F1 shape. Only resolved-low passes may escalate: 'low' is the one
+    // level that narrows the searched chunk set, so the retry can rescue.
+    const out = await hybridSearch(engine, 'what do I know about Boltline', {
       mode: 'conservative',
       limit: 5,
     });
 
     expect(out.map((r) => r.slug)).toEqual(['companies/boltline']);
-    expect(calls.filter((c) => c.kind === 'vector').map((c) => c.detail)).toEqual([undefined, 'high']);
+    expect(calls.filter((c) => c.kind === 'vector').map((c) => c.detail)).toEqual(['low', 'high']);
+  });
+
+  test('default-detail (GENERAL intent) empty results do NOT retry — same candidate pool, futile', async () => {
+    const calls: FakeSearchCall[] = [];
+    const engine = makeFakeEngine({
+      calls,
+      keyword: () => [],
+      vector: () => [],
+    });
+
+    const out = await hybridSearch(engine, 'Boltline traction memo', {
+      mode: 'conservative',
+      limit: 5,
+    });
+
+    expect(out).toEqual([]);
+    expect(calls.filter((c) => c.kind === 'vector').map((c) => c.detail)).toEqual([undefined]);
+  });
+
+  test('escalation happens at most once (recursion guard)', async () => {
+    const calls: FakeSearchCall[] = [];
+    const engine = makeFakeEngine({
+      calls,
+      keyword: () => [],
+      vector: () => [],
+    });
+
+    const out = await hybridSearch(engine, 'who is glorbax the unfindable', {
+      mode: 'conservative',
+      limit: 5,
+    });
+
+    expect(out).toEqual([]);
+    expect(calls.filter((c) => c.kind === 'vector').map((c) => c.detail)).toEqual(['low', 'high']);
   });
 });
 

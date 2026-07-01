@@ -875,8 +875,14 @@ export async function hybridSearch(
   // Auto-detect detail level from query intent when caller doesn't specify
   const detail = opts?.detail ?? autoDetectDetail(query);
   const detailResolved: 'low' | 'medium' | 'high' | null = detail ?? null;
+  // Escalation can only change the candidate pool when the pass that just ran
+  // was RESOLVED detail 'low' — the one level that narrows the searched chunk
+  // set; higher levels change scoring/presentation only, so retrying is a
+  // guaranteed-futile second full search. Gating on the resolved value (not
+  // opts.detail) is the F1 fix: auto-detected 'low' from ENTITY intent now
+  // escalates, which the old caller-opts check missed.
   const shouldEscalateEmptyResults = (): boolean =>
-    detail !== 'high' && opts?._emptyEscalated !== true;
+    detail === 'low' && opts?._emptyEscalated !== true;
   const searchOpts: SearchOpts = {
     limit: innerLimit,
     detail,
@@ -1032,8 +1038,12 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
-    if (noEmbedBudgeted.length === 0 && shouldEscalateEmptyResults()) {
-      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    // Escalate on the PRE-slice pool ("search found nothing"), not the
+    // post-offset/post-budget array — pagination past the end or a tight
+    // tokenBudget must not trigger a futile full re-search. Fresh embed
+    // deadline: the retry must not inherit a spent AbortSignal window.
+    if (noEmbedHopped.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true, _queryEmbedDeadline: undefined });
     }
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
@@ -1290,8 +1300,10 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
-    if (kwBudgeted.length === 0 && shouldEscalateEmptyResults()) {
-      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    // Pre-slice pool + fresh embed deadline — same reasoning as the
+    // no-embedding-provider checkpoint above.
+    if (kwHopped.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true, _queryEmbedDeadline: undefined });
     }
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
@@ -1455,7 +1467,10 @@ export async function hybridSearch(
   // call's onMeta fires with the escalated detail_resolved; do NOT also
   // fire here (would double-emit and capture stale meta).
   if (deduped.length === 0 && shouldEscalateEmptyResults()) {
-    return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    // Fresh embed deadline: the escalated pass must not inherit a spent
+    // AbortSignal window, or the rescue silently degrades to keyword-only
+    // exactly when the first pass was slow.
+    return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true, _queryEmbedDeadline: undefined });
   }
 
   // v0.35.0.0+: cross-encoder reranker. Slots between dedup and slice so the
