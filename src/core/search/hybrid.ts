@@ -731,6 +731,8 @@ export interface HybridSearchOpts extends SearchOpts {
    * a fresh per-call deadline. Not part of the public contract.
    */
   _queryEmbedDeadline?: QueryEmbedDeadline;
+  /** INTERNAL — prevents empty-result high-detail retry recursion. */
+  _emptyEscalated?: boolean;
 }
 
 /**
@@ -873,6 +875,8 @@ export async function hybridSearch(
   // Auto-detect detail level from query intent when caller doesn't specify
   const detail = opts?.detail ?? autoDetectDetail(query);
   const detailResolved: 'low' | 'medium' | 'high' | null = detail ?? null;
+  const shouldEscalateEmptyResults = (): boolean =>
+    detail !== 'high' && opts?._emptyEscalated !== true;
   const searchOpts: SearchOpts = {
     limit: innerLimit,
     detail,
@@ -1028,6 +1032,9 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
+    if (noEmbedBudgeted.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    }
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
     emitMeta({
@@ -1108,6 +1115,20 @@ export async function hybridSearch(
     } catch {
       // Expansion failure is non-fatal
     }
+  }
+
+  let keywordLists: SearchResult[][] = [keywordResults];
+  if (expansionApplied && earlyModality !== 'image') {
+    const expandedKeywordLists = await Promise.all(
+      queries.slice(1).map(async (q) => {
+        try {
+          return await engine.searchKeyword(q, searchOpts);
+        } catch {
+          return [];
+        }
+      }),
+    );
+    keywordLists = [keywordResults, ...expandedKeywordLists];
   }
 
   // Embed all query variants and run vector search.
@@ -1269,6 +1290,9 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
+    if (kwBudgeted.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    }
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
     emitMeta({
@@ -1312,11 +1336,11 @@ export async function hybridSearch(
       // get textRrfK. Image branch gets imageRrfK.
       ...vectorLists.slice(0, -1).map(list => ({ list, k: textRrfK })),
       { list: vectorLists[vectorLists.length - 1], k: imageRrfK },
-      { list: keywordResults, k: keywordK },
+      ...keywordLists.map(list => ({ list, k: keywordK })),
     ]
     : [
       ...vectorLists.map(list => ({ list, k: vectorK })),
-      { list: keywordResults, k: keywordK },
+      ...keywordLists.map(list => ({ list, k: keywordK })),
     ];
   // Facts-vector arm (C): fuse fact hits as another RRF input at vectorK (they
   // are vector-ranked, same space as the chunk arm). Added last so it composes
@@ -1333,7 +1357,7 @@ export async function hybridSearch(
   // track the query. Post-materialization the chunk arm carries each entity's
   // substance, so a genuinely relevant entity is matched there first.
   if (factsList.length > 0) {
-    const gatedFacts = gateFactsToMatchedEntities(factsList, [...vectorLists, keywordResults]);
+    const gatedFacts = gateFactsToMatchedEntities(factsList, [...vectorLists, ...keywordLists]);
     if (gatedFacts.length > 0) {
       allLists.push({ list: gatedFacts, k: vectorK });
     }
@@ -1349,7 +1373,7 @@ export async function hybridSearch(
   // zembed-1 packs the brain into a ~0.8-cosine cluster. Operator plane leaves
   // this off and keeps full vector recall + the reranker.
   if (opts?.requireLexicalAnchor) {
-    const anchored = new Set(keywordResults.map(r => r.slug));
+    const anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
     fused = fused.filter(r => anchored.has(r.slug));
   }
 
@@ -1430,8 +1454,8 @@ export async function hybridSearch(
   // Auto-escalate: if detail=low returned 0, retry with high. The inner
   // call's onMeta fires with the escalated detail_resolved; do NOT also
   // fire here (would double-emit and capture stale meta).
-  if (deduped.length === 0 && opts?.detail === 'low') {
-    return hybridSearch(engine, query, { ...opts, detail: 'high' });
+  if (deduped.length === 0 && shouldEscalateEmptyResults()) {
+    return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
   }
 
   // v0.35.0.0+: cross-encoder reranker. Slots between dedup and slice so the
@@ -1699,7 +1723,11 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: cacheSourceId, knobsHash: cacheKnobsHash });
+    const hit = await cache.lookup(queryEmbedding, {
+      sourceId: cacheSourceId,
+      knobsHash: cacheKnobsHash,
+      queryText: query,
+    });
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
