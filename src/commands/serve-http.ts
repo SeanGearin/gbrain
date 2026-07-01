@@ -355,8 +355,29 @@ export async function queryAgentClientSpend(engine: BrainEngine): Promise<AgentC
 export type ProvisionSourceClientResult =
   | { status: 200; body: { source_id: string; client_id: string; client_secret: string } }
   | { status: 409; body: { error: 'already_provisioned'; source_id: string; client_id: string } }
+  | { status: 409; body: { error: 'source_name_taken'; message: string } }
   | { status: 400; body: { error: string; message: string } }
   | { status: 500; body: { error: string; message: string } };
+
+// pg 23505 on sources_name_key specifically — sources.name is globally UNIQUE
+// and doubles as the display label, so a non-unique display_name under a
+// DIFFERENT source_id is a deterministic CALLER bug, not an engine IO failure.
+// Matched by code+constraint_name (postgres.js) or by the canonical pg message
+// text (PGLite emits message only); a 23505 on any OTHER constraint (e.g. a
+// true sources_pkey INSERT race) deliberately does NOT match and stays in the
+// 500 class. Edge (harmless): a same-id INSERT race where name==id violates
+// BOTH indexes and pg reports whichever it checks first — normally sources_pkey
+// (stays 500), but index-check order is not contractual; if sources_name_key is
+// reported the loser gets this 409 instead. Convergence is unaffected either
+// way (the winner's ledger already advanced) — the cost is one misleading log
+// line in a sub-ms window.
+function isSourceNameCollision(e: unknown): boolean {
+  const err = e as { code?: string; constraint_name?: string; message?: string } | null;
+  if (!err || typeof err !== 'object') return false;
+  if (err.code === '23505' && err.constraint_name === 'sources_name_key') return true;
+  const msg = typeof err.message === 'string' ? err.message : '';
+  return msg.includes('duplicate key value violates unique constraint') && msg.includes('sources_name_key');
+}
 
 export async function provisionSourceClient(
   engine: BrainEngine,
@@ -443,6 +464,23 @@ export async function provisionSourceClient(
       // fall through to mint
     } else if (e instanceof SourceOpError && e.code === 'invalid_id') {
       return { status: 400, body: { error: 'invalid_source_id', message: e.message } };
+    } else if (isSourceNameCollision(e)) {
+      // The 2026-06-17 provisioning burn: this used to hide inside the 500
+      // source_create_failed class, indistinguishable from an IO failure, so
+      // caller retry loops ground on it for days. It is deterministic caller
+      // input — surface it as a 409 with the actionable contract. (The Virgil
+      // worker sends display_name = source_id since d913b17 and can no longer
+      // hit this; the INSERT is atomic, so no partial source row is left.)
+      return {
+        status: 409,
+        body: {
+          error: 'source_name_taken',
+          message:
+            `display_name ${JSON.stringify(displayName.slice(0, 64))} is already registered as another ` +
+            `source's name (unique constraint sources_name_key). Pass a unique display_name, or omit it — ` +
+            `it defaults to source_id.`,
+        },
+      };
     } else {
       return { status: 500, body: { error: 'source_create_failed', message: e instanceof Error ? e.message : String(e) } };
     }
