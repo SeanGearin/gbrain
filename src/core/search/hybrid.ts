@@ -682,6 +682,8 @@ export interface HybridSearchOpts extends SearchOpts {
    */
   mode?: string;
   expandFn?: (query: string) => Promise<string[]>;
+  /** Require a result slug to appear in the original or expanded keyword arms. */
+  requireLexicalAnchor?: boolean;
   /** Override default RRF K constant (default: 60). Lower values boost top-ranked results more. */
   rrfK?: number;
   /** Override dedup pipeline parameters. */
@@ -707,6 +709,8 @@ export interface HybridSearchOpts extends SearchOpts {
    * a fresh per-call deadline. Not part of the public contract.
    */
   _queryEmbedDeadline?: QueryEmbedDeadline;
+  /** INTERNAL - prevents empty-result high-detail retry recursion. */
+  _emptyEscalated?: boolean;
 }
 
 /**
@@ -854,6 +858,8 @@ export async function hybridSearch(
   // Auto-detect detail level from query intent when caller doesn't specify
   const detail = opts?.detail ?? autoDetectDetail(query);
   const detailResolved: 'low' | 'medium' | 'high' | null = detail ?? null;
+  const shouldEscalateEmptyResults = (): boolean =>
+    detail !== 'high' && opts?._emptyEscalated !== true;
   const searchOpts: SearchOpts = {
     limit: innerLimit,
     detail,
@@ -1037,6 +1043,9 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
+    if (noEmbedBudgeted.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    }
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
     emitMeta({
@@ -1117,6 +1126,20 @@ export async function hybridSearch(
     } catch {
       // Expansion failure is non-fatal
     }
+  }
+
+  let keywordLists: SearchResult[][] = [keywordResults];
+  if (expansionApplied && earlyModality !== 'image') {
+    const expandedKeywordLists = await Promise.all(
+      queries.slice(1).map(async (q) => {
+        try {
+          return await engine.searchKeyword(q, searchOpts);
+        } catch {
+          return [];
+        }
+      }),
+    );
+    keywordLists = [keywordResults, ...expandedKeywordLists];
   }
 
   // Embed all query variants and run vector search.
@@ -1269,6 +1292,9 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
+    if (kwBudgeted.length === 0 && shouldEscalateEmptyResults()) {
+      return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
+    }
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
     emitMeta({
@@ -1312,11 +1338,11 @@ export async function hybridSearch(
       // get textRrfK. Image branch gets imageRrfK.
       ...vectorLists.slice(0, -1).map(list => ({ list, k: textRrfK })),
       { list: vectorLists[vectorLists.length - 1], k: imageRrfK },
-      { list: keywordResults, k: keywordK },
+      ...keywordLists.map(list => ({ list, k: keywordK })),
     ]
     : [
       ...vectorLists.map(list => ({ list, k: vectorK })),
-      { list: keywordResults, k: keywordK },
+      ...keywordLists.map(list => ({ list, k: keywordK })),
     ];
 
   // v0.43 — relational recall arm (fourth RRF arm), built above so it also
@@ -1336,6 +1362,14 @@ export async function hybridSearch(
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
     fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+  }
+
+  // Tenant strict-recall mode: keep only pages with a lexical hit. Expansion
+  // keyword arms count as lexical anchors so synonym rewrites can admit the
+  // page they were generated to find.
+  if (opts?.requireLexicalAnchor) {
+    const anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
+    fused = fused.filter(r => anchored.has(r.slug));
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -1404,11 +1438,11 @@ export async function hybridSearch(
   // Dedup
   const deduped = dedupResults(fused, dedupOpts);
 
-  // Auto-escalate: if detail=low returned 0, retry with high. The inner
+  // Auto-escalate: if a policy-filtered non-high search returned 0, retry with high. The inner
   // call's onMeta fires with the escalated detail_resolved; do NOT also
   // fire here (would double-emit and capture stale meta).
-  if (deduped.length === 0 && opts?.detail === 'low') {
-    return hybridSearch(engine, query, { ...opts, detail: 'high' });
+  if (deduped.length === 0 && shouldEscalateEmptyResults()) {
+    return hybridSearch(engine, query, { ...opts, detail: 'high', _emptyEscalated: true });
   }
 
   // v0.35.0.0+: cross-encoder reranker. Slots between dedup and slice so the
