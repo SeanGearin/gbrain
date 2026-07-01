@@ -16,6 +16,7 @@ import { countCJKAwareWords } from '../cjk.ts';
 const MAX_QUERIES = 3;
 const MIN_WORDS = 3;
 const MAX_QUERY_CHARS = 500;
+const MAX_EXPANSION_ATTEMPTS = 2;
 
 /**
  * Defense-in-depth sanitization for user queries before they reach the LLM.
@@ -54,32 +55,82 @@ export function sanitizeExpansionOutput(alternatives: unknown[]): string[] {
   return out;
 }
 
-export async function expandQuery(query: string): Promise<string[]> {
+type ExpansionGateway = (query: string) => Promise<string[]>;
+type ExpansionAvailability = (touchpoint: 'expansion') => boolean;
+type ExpansionWarn = (message: string) => void;
+
+interface ExpandQueryDeps {
+  expand: ExpansionGateway;
+  isAvailable: ExpansionAvailability;
+  warn: ExpansionWarn;
+}
+
+async function expandQueryWithDeps(query: string, deps: ExpandQueryDeps): Promise<string[]> {
   if (countCJKAwareWords(query) < MIN_WORDS) return [query];
 
   // Skip LLM call entirely if gateway has no expansion provider configured.
-  if (!gatewayIsAvailable('expansion')) return [query];
+  if (!deps.isAvailable('expansion')) return [query];
 
-  try {
-    const sanitized = sanitizeQueryForPrompt(query);
-    if (sanitized.length === 0) return [query];
+  const sanitized = sanitizeQueryForPrompt(query);
+  if (sanitized.length === 0) return [query];
 
-    // gateway.expand() returns [original + expansions]. We feed it the sanitized
-    // copy so the LLM channel is safe; the ORIGINAL query remains the first entry
-    // for downstream search (gateway.expand includes the query it was called with).
-    const gatewayResults = await gatewayExpand(sanitized);
+  let warnedRetry = false;
+  for (let attempt = 1; attempt <= MAX_EXPANSION_ATTEMPTS; attempt++) {
+    try {
+      // gateway.expand() returns [original + expansions]. We feed it the
+      // sanitized copy so the LLM channel is safe; the ORIGINAL query remains
+      // the first entry for downstream search.
+      const gatewayResults = await deps.expand(sanitized);
 
-    // Validate LLM-produced alternatives (everything after the first entry).
-    const alternatives = gatewayResults.slice(1);
-    const sanitizedAlts = sanitizeExpansionOutput(alternatives);
+      // Validate LLM-produced alternatives (everything after the first entry).
+      const alternatives = gatewayResults.slice(1);
+      const sanitizedAlts = sanitizeExpansionOutput(alternatives);
+      if (sanitizedAlts.length === 0) {
+        if (attempt < MAX_EXPANSION_ATTEMPTS) {
+          deps.warn('[gbrain] expandQuery: expansion provider returned no alternatives; retrying once');
+          warnedRetry = true;
+          continue;
+        }
+        deps.warn('[gbrain] expandQuery: expansion provider returned no alternatives after retry; falling back to the original query');
+        return [query];
+      }
 
-    // Original query + sanitized alternatives, deduped, capped at MAX_QUERIES.
-    const all = [query, ...sanitizedAlts];
-    const unique = [...new Set(all.map(q => q.toLowerCase().trim()))];
-    return unique.slice(0, MAX_QUERIES).map(q =>
-      all.find(orig => orig.toLowerCase().trim() === q) || q,
-    );
-  } catch {
-    return [query];
+      // Original query + sanitized alternatives, deduped, capped at MAX_QUERIES.
+      const all = [query, ...sanitizedAlts];
+      const unique = [...new Set(all.map(q => q.toLowerCase().trim()))];
+      return unique.slice(0, MAX_QUERIES).map(q =>
+        all.find(orig => orig.toLowerCase().trim() === q) || q,
+      );
+    } catch {
+      if (attempt < MAX_EXPANSION_ATTEMPTS) {
+        deps.warn('[gbrain] expandQuery: expansion provider failed; retrying once');
+        warnedRetry = true;
+        continue;
+      }
+      deps.warn(
+        warnedRetry
+          ? '[gbrain] expandQuery: expansion provider failed after retry; falling back to the original query'
+          : '[gbrain] expandQuery: expansion provider failed; falling back to the original query',
+      );
+      return [query];
+    }
   }
+
+  return [query];
+}
+
+export async function expandQuery(query: string): Promise<string[]> {
+  return expandQueryWithDeps(query, {
+    expand: gatewayExpand,
+    isAvailable: gatewayIsAvailable,
+    warn: (message) => console.warn(message),
+  });
+}
+
+/** Test seam for fallback/retry behavior without mocking module imports. */
+export async function expandQueryWithGatewayForTests(
+  query: string,
+  deps: ExpandQueryDeps,
+): Promise<string[]> {
+  return expandQueryWithDeps(query, deps);
 }
