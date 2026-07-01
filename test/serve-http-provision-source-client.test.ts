@@ -228,6 +228,44 @@ describe('provisionSourceClient — isolation', () => {
   });
 });
 
+describe('provisionSourceClient — sources.name collision (sources_name_key)', () => {
+  test('same display_name under a different source_id → 409 source_name_taken, no partial row', async () => {
+    // The 2026-06-17 provisioning burn, previously a 500 source_create_failed
+    // indistinguishable from an IO failure.
+    const first = await provisionSourceClient(engine, provider, { source_id: 't-name1', display_name: 'John Smith' });
+    expect(first.status).toBe(200);
+
+    const second = await provisionSourceClient(engine, provider, { source_id: 't-name2', display_name: 'John Smith' });
+    expect(second.status).toBe(409);
+    const body = second.body as Record<string, unknown>;
+    expect(body.error).toBe('source_name_taken');
+    expect(String(body.message)).toContain('John Smith');
+    // The grep token operators learned on 2026-06-17 must survive the friendlier message.
+    expect(String(body.message)).toContain('sources_name_key');
+    expect(body).not.toHaveProperty('client_id');
+    expect(body).not.toHaveProperty('client_secret');
+
+    // The INSERT is atomic: the loser leaves NO partial source row, so a
+    // corrected retry converges instead of tripping partial-state recovery.
+    const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE id = 't-name2'`, []);
+    expect(rows.length).toBe(0);
+
+    // Corrected retry (the worker's shape since d913b17: display_name = source_id).
+    const retry = await provisionSourceClient(engine, provider, { source_id: 't-name2', display_name: 't-name2' });
+    expect(retry.status).toBe(200);
+  });
+
+  test('a same-source_id repeat still reports already_provisioned, not source_name_taken', async () => {
+    // Guard the precedence: the mint-once gate fires before source creation,
+    // so re-provisioning an existing source keeps its dedicated 409 shape.
+    const first = await provisionSourceClient(engine, provider, { source_id: 't-name3', display_name: 'Jane Doe' });
+    expect(first.status).toBe(200);
+    const repeat = await provisionSourceClient(engine, provider, { source_id: 't-name3', display_name: 'Jane Doe' });
+    expect(repeat.status).toBe(409);
+    expect((repeat.body as Record<string, unknown>).error).toBe('already_provisioned');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // recordProvisionAudit — mcp_request_log row + SSE broadcast, secret-free
 // ---------------------------------------------------------------------------
