@@ -1380,6 +1380,7 @@ export async function hybridSearch(
       ...keywordLists.map(list => ({ list, k: keywordK })),
     ];
 
+<<<<<<< HEAD
   // v0.43 — relational recall arm (fourth RRF arm), built above so it also
   // contributes on the keyword-only fallback path. Neutral weight (baseRrfK):
   // competes evenly with keyword/vector, not dominating. Empty for
@@ -1387,6 +1388,37 @@ export async function hybridSearch(
   // re-score, post-fusion boosts, dedup, reranker, autocut, token budget).
   if (relationalList.length > 0 && effectiveModality !== 'image') {
     allLists.push({ list: relationalList, k: baseRrfK });
+=======
+  // LEXICAL ANCHOR (CC packet 2026-06-18) — customer/tenant plane only.
+  // Drop any fused result whose entity (slug) was NOT surfaced by the keyword
+  // arm, so the floorless vector + facts arms can only REINFORCE a keyword-
+  // matched entity, never independently surface the tight-cluster densest entity
+  // for an off-world query. This is the off-world guard the (gateway-off) tenant
+  // plane has no reranker for; an absolute cosine floor can't do it because
+  // zembed-1 packs the brain into a ~0.8-cosine cluster. Operator plane leaves
+  // this off and keeps full vector recall + the reranker.
+  if (opts?.requireLexicalAnchor) {
+    const anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
+    if (fused.length > 0) {
+      // Whole-phrase FTS ANDs terms, so a conversational query either matches
+      // nothing ("what do you KNOW about Boltline" — one out-of-corpus word
+      // empties the arm) or matches only the rare page containing EVERY term
+      // (a single spurious anchor that throttles recall to that page). Both
+      // starve the anchor set. Union in per-term anchors: real lexical
+      // evidence for any significant term keeps a page eligible. A true
+      // off-world query (NO term in the corpus) still anchors to nothing and
+      // still gates to empty, so the guard this gate exists for is preserved.
+      const terms = anchorProbeTerms(query);
+      if (terms.length > 0) {
+        const probeOpts = { ...searchOpts, limit: ANCHOR_PROBE_LIMIT };
+        const perTerm = await Promise.all(terms.map(async t => {
+          try { return await engine.searchKeyword(t, probeOpts); } catch { return []; }
+        }));
+        for (const r of perTerm.flat()) anchored.add(r.slug);
+      }
+    }
+    fused = fused.filter(r => anchored.has(r.slug));
+>>>>>>> b0b681ee (fix(search): union per-term anchors into the lexical gate — a single spurious whole-phrase anchor no longer throttles recall)
   }
 
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
