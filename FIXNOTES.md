@@ -55,3 +55,9 @@ Deliberate non-fixes (watch, don't churn): expanded keyword arms tilt RRF slight
 
 - `fix/query-empty-and-frozen-results-b7line` (this branch, off `6d0a5264`) — the SURGICAL deploy: only these fixes land on the line box2 currently runs.
 - `fix/query-empty-and-frozen-results` (in `.codex-port/gbrain-f1f5`, off fork/master v0.42.55.0) — the same fixes on the maintained master line, for whenever box2 upgrades. Full verify gate 30/30 green there.
+
+## F1 addendum — the binding cause on the tenant plane (found by the canary's post-deploy red, 2026-07-02)
+
+After deploying the fixes above, F5 went green but every wrapper/compound case stayed hard-empty — and the honest cache exposed that yesterday's "second-person wrapper works" evidence had itself been an F5 cache mirage. Live probes then isolated the true binding cause: the tenant plane's `requireLexicalAnchor` gate anchors on whole-phrase keyword hits, and Postgres FTS ANDs terms — one out-of-corpus word ("what do you KNOW about Boltline", "Boltline INVOLVEMENT deal") empties the keyword arm, the anchor set goes empty, and the gate annihilates every vector hit. Probes: "about Boltline" → hits (stopword drops); "know about Boltline" → []; "purple elephant Boltline" → [].
+
+Fix: when the whole-phrase keyword arms produce zero anchors and fused results exist, probe the query's significant terms individually (`anchorProbeTerms`, cap 6, filler-filtered) and anchor on their hits. A true off-world query still anchors to nothing and still gates to empty — the guard's purpose is preserved; conversational phrasing about real entities stops being annihilated. Tests: "conversational phrase … survives the gate via per-term anchors" + "true off-world query still gates to empty".

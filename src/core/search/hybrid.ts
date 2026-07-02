@@ -27,7 +27,7 @@ import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
 import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
-import { isTitlePhraseMatch } from './title-match.ts';
+import { isTitlePhraseMatch, tokenizeTitle } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { stampEvidence } from './evidence.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
@@ -583,6 +583,29 @@ async function applyAliasResolvedBoost(
       r.alias_resolved_boost = ALIAS_RESOLVED_BOOST;
     }
   }
+}
+
+// Lexical-anchor term probe — fallback anchoring when the whole-phrase
+// keyword arm is empty (FTS AND semantics). Filler words would never anchor
+// a page; everything else gets one cheap per-term keyword probe.
+const ANCHOR_PROBE_LIMIT = 10;
+const ANCHOR_PROBE_MAX_TERMS = 6;
+const ANCHOR_PROBE_FILLER = new Set([
+  'the', 'a', 'an', 'of', 'and', 'or', 'to', 'in', 'on', 'for', 'with',
+  'at', 'by', 'from', 'as', 'is', 'it', 'this', 'that', 'my', 'your',
+  'i', 'you', 'we', 'me', 'us', 'do', 'does', 'did', 'was', 'were', 'are',
+  'what', 'whats', 'who', 'whos', 'how', 'why', 'when', 'where', 'which',
+  'know', 'tell', 'about', 'its', 's', 'going', 'happening', 'anything',
+]);
+
+function anchorProbeTerms(query: string): string[] {
+  const seen = new Set<string>();
+  for (const t of tokenizeTitle(query)) {
+    if (t.length < 2 || ANCHOR_PROBE_FILLER.has(t)) continue;
+    seen.add(t);
+    if (seen.size >= ANCHOR_PROBE_MAX_TERMS) break;
+  }
+  return [...seen];
 }
 
 // T3 — free-text alias hop tuning.
@@ -1385,7 +1408,24 @@ export async function hybridSearch(
   // zembed-1 packs the brain into a ~0.8-cosine cluster. Operator plane leaves
   // this off and keeps full vector recall + the reranker.
   if (opts?.requireLexicalAnchor) {
-    const anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
+    let anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
+    if (anchored.size === 0 && fused.length > 0) {
+      // The whole-phrase keyword arms found nothing. FTS ANDs terms, so a
+      // single out-of-corpus word ("what do you KNOW about Boltline") empties
+      // the arm — and an empty anchor set would annihilate every vector hit
+      // for a query about a real entity. Probe the significant terms
+      // individually and anchor on their hits instead. A true off-world query
+      // (NO term in the corpus) still anchors to nothing and still gates to
+      // empty, so the guard this gate exists for is preserved.
+      const terms = anchorProbeTerms(query);
+      if (terms.length > 0) {
+        const probeOpts = { ...searchOpts, limit: ANCHOR_PROBE_LIMIT };
+        const perTerm = await Promise.all(terms.map(async t => {
+          try { return await engine.searchKeyword(t, probeOpts); } catch { return []; }
+        }));
+        anchored = new Set(perTerm.flat().map(r => r.slug));
+      }
+    }
     fused = fused.filter(r => anchored.has(r.slug));
   }
 

@@ -152,6 +152,49 @@ describe('hybridSearch empty-result escalation', () => {
   });
 });
 
+describe('lexical-anchor term probe', () => {
+  test('conversational phrase about a real entity survives the gate via per-term anchors', async () => {
+    const calls: FakeSearchCall[] = [];
+    const boltline = result('companies/boltline', 20);
+    const engine = makeFakeEngine({
+      calls,
+      // Whole phrase misses (FTS AND: "know" is out-of-corpus); the bare
+      // entity term hits — the probe must find it and anchor the vector hit.
+      keyword: (query) => (query.toLowerCase() === 'boltline' ? [boltline] : []),
+      vector: () => [boltline],
+    });
+
+    const out = await hybridSearch(engine, 'what do you know about Boltline', {
+      mode: 'conservative',
+      limit: 5,
+      requireLexicalAnchor: true,
+    });
+
+    expect(out.map((r) => r.slug)).toEqual(['companies/boltline']);
+    const keywordQueries = calls.filter((c) => c.kind === 'keyword').map((c) => c.query?.toLowerCase());
+    expect(keywordQueries).toContain('boltline');
+  });
+
+  test('true off-world query still gates to empty (no term anchors anywhere)', async () => {
+    const calls: FakeSearchCall[] = [];
+    const engine = makeFakeEngine({
+      calls,
+      keyword: () => [],
+      // Vector always returns something (zembed packs everything close) —
+      // exactly the junk the gate exists to suppress.
+      vector: () => [result('companies/boltline', 21)],
+    });
+
+    const out = await hybridSearch(engine, 'purple elephant quantum tariffs', {
+      mode: 'conservative',
+      limit: 5,
+      requireLexicalAnchor: true,
+    });
+
+    expect(out).toEqual([]);
+  });
+});
+
 describe('hybridSearch expansion + lexical anchor', () => {
   test('expanded sub-query hits are not erased by the tenant lexical-anchor gate', async () => {
     const calls: FakeSearchCall[] = [];
