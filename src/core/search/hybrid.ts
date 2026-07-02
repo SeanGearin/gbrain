@@ -1408,22 +1408,23 @@ export async function hybridSearch(
   // zembed-1 packs the brain into a ~0.8-cosine cluster. Operator plane leaves
   // this off and keeps full vector recall + the reranker.
   if (opts?.requireLexicalAnchor) {
-    let anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
-    if (anchored.size === 0 && fused.length > 0) {
-      // The whole-phrase keyword arms found nothing. FTS ANDs terms, so a
-      // single out-of-corpus word ("what do you KNOW about Boltline") empties
-      // the arm — and an empty anchor set would annihilate every vector hit
-      // for a query about a real entity. Probe the significant terms
-      // individually and anchor on their hits instead. A true off-world query
-      // (NO term in the corpus) still anchors to nothing and still gates to
-      // empty, so the guard this gate exists for is preserved.
+    const anchored = new Set(keywordLists.flatMap(list => list.map(r => r.slug)));
+    if (fused.length > 0) {
+      // Whole-phrase FTS ANDs terms, so a conversational query either matches
+      // nothing ("what do you KNOW about Boltline" — one out-of-corpus word
+      // empties the arm) or matches only the rare page containing EVERY term
+      // (a single spurious anchor that throttles recall to that page). Both
+      // starve the anchor set. Union in per-term anchors: real lexical
+      // evidence for any significant term keeps a page eligible. A true
+      // off-world query (NO term in the corpus) still anchors to nothing and
+      // still gates to empty, so the guard this gate exists for is preserved.
       const terms = anchorProbeTerms(query);
       if (terms.length > 0) {
         const probeOpts = { ...searchOpts, limit: ANCHOR_PROBE_LIMIT };
         const perTerm = await Promise.all(terms.map(async t => {
           try { return await engine.searchKeyword(t, probeOpts); } catch { return []; }
         }));
-        anchored = new Set(perTerm.flat().map(r => r.slug));
+        for (const r of perTerm.flat()) anchored.add(r.slug);
       }
     }
     fused = fused.filter(r => anchored.has(r.slug));
