@@ -2,6 +2,15 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.54.0] - 2026-06-30
+
+**`gbrain <op> --json` now gives integrations a guaranteed machine-readable output contract.** Read operations like `graph`, `backlinks`, `list`, and `get` emit JSON today only because they have no human formatter yet, an accident a downstream tool's parser silently depends on and one formatter change away from breaking. The new global `--json` flag makes that channel explicit and stable: it bypasses the per-op human formatter and prints the raw operation result as JSON, on both the local and thin-client (remote brain) dispatch paths. Default output is unchanged, and CLI-only commands that already had their own `--json` keep it.
+
+### Added
+- **Global `--json` flag for shared read operations.** `gbrain graph <slug> --json`, `gbrain list --json`, `gbrain backlinks <slug> --json`, and any other shared op now emit the raw result as pretty-printed JSON instead of the human formatter. The shape is identical whether the brain is local (PGLite/Postgres) or routed through a remote thin client, so visualizers, dashboards, and other tools can build against a stable contract rather than an accident of which ops happen to lack a formatter. The flag is recorded globally but passed through to CLI-only commands so their existing `--json` handling is untouched.
+
+To take advantage of v0.42.54.0, pass `--json` to any read command, for example `gbrain graph <slug> --json` or `gbrain list --json`, and parse the result as JSON.
+
 ## [0.42.53.0] - 2026-06-23
 
 **`gbrain sync` works again on managed Postgres brains: the durable-checkpoint pin write was encoding its value the wrong way, so every multi-source sync aborted at the very first checkpoint. Fixed, plus a repo-wide sweep of the same JSONB footgun and a new CI guard so it can't come back.** A recent release added a structural check on the sync checkpoint table; the pin write that runs before every drain bound its value as a string rather than a real array, so the check rejected it and the run bailed before importing anything. The bug was invisible on the embedded engine (its driver parses the value either way) and only bit managed Postgres.

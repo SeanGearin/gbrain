@@ -314,7 +314,12 @@ async function main() {
   // PGLite migration replay on thin-client installs. The arg parser, image
   // transform, and required-param check are all engine-free; refactoring
   // them out of the engine try/catch is safe and unlocks routing.
-  const params = parseOpArgs(op, subArgs);
+  //
+  // `--json` is a global output-format flag (already captured in cliOpts),
+  // not an op param. Strip it before parseOpArgs — otherwise the generic
+  // parser mis-consumes the following token as `--json`'s value
+  // (cli.ts:parseOpArgs treats unknown `--flag X` as `flag=X`).
+  const params = parseOpArgs(op, subArgs.filter((a) => a !== '--json'));
 
   // v0.27.1 (`gbrain query --image <path>`): swap the `image` param from
   // a filesystem path into base64 bytes + mime. The op accepts base64; the
@@ -443,8 +448,7 @@ async function main() {
     // routed path. Date → ISO string; bigint → string (postgres.js shape);
     // Buffer → object. Microsecond-cost; eliminates a whole drift bug class.
     const result = JSON.parse(JSON.stringify(rawResult));
-    const output = formatResult(op.name, result);
-    if (output) process.stdout.write(output);
+    renderOpResult(op.name, result, cliOpts);
   } catch (e: unknown) {
     // v0.42.20.0 (codex D4): on error, set exitCode + return so the `finally`
     // STILL runs (drains every background-work sink + disconnects). A bare
@@ -526,8 +530,10 @@ async function runThinClientRouted(
       signal: sigintController.signal,
     });
     const result = unpackToolResult(raw);
-    const output = formatResult(op.name, result);
-    if (output) process.stdout.write(output);
+    // Same guaranteed machine-readable contract on the thin-client routed path,
+    // so `gbrain <op> --json` is shape-identical whether the brain is local or
+    // remote.
+    renderOpResult(op.name, result, cliOpts);
   } catch (e: unknown) {
     if (e instanceof RemoteMcpError) {
       const url = cfg.remote_mcp!.mcp_url;
@@ -941,6 +947,24 @@ export function formatResult(opName: string, result: unknown): string {
     default:
       return JSON.stringify(result, null, 2) + '\n';
   }
+}
+
+/**
+ * Render a shared-operation result to stdout.
+ *
+ * `--json` (cliOpts.json) is the guaranteed machine-readable contract: emit the
+ * raw op result as JSON, bypassing the per-op human formatter so integrators
+ * get a stable channel that survives a future formatResult case being added for
+ * an op. Otherwise fall back to the human formatter. Shared by the local and
+ * thin-client dispatch paths so the two can never drift.
+ */
+function renderOpResult(opName: string, result: unknown, cliOpts: CliOptions): void {
+  if (cliOpts.json) {
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return;
+  }
+  const output = formatResult(opName, result);
+  if (output) process.stdout.write(output);
 }
 
 /**
@@ -2334,6 +2358,13 @@ ADMIN
   call <tool> '<json>'               Raw tool invocation
   version                            Version info
   --tools-json                       Tool discovery (JSON)
+
+GLOBAL FLAGS
+  --json                             Emit raw op result as JSON (stable machine
+                                     contract; bypasses the human formatter)
+  --quiet                            Suppress progress + identity banner
+  --progress-json                    Structured progress events on stderr
+  --timeout <Ns>                     Per-call timeout for routed (thin-client) ops
 
 Run gbrain <command> --help for command-specific help.
 `);

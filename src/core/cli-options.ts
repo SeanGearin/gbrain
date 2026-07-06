@@ -29,6 +29,25 @@ export interface CliOptions {
    * the reranker. Has no effect on other commands.
    */
   explain: boolean;
+  /**
+   * Guaranteed machine-readable output for shared operations. When set,
+   * the shared-op dispatch (local AND thin-client routed) bypasses the
+   * per-op human formatter in cli.ts:formatResult and prints the raw op
+   * result as `JSON.stringify(result, null, 2)`.
+   *
+   * Why this is a contract, not a convenience: commands like `graph`,
+   * `backlinks`, and `get_*` currently emit JSON *only because* they have
+   * no `formatResult` case yet — an accident an integrator's parser
+   * depends on, and one `formatResult` case away from breaking silently.
+   * `--json` makes the machine channel explicit and stable for the
+   * ecosystem of tools building on the read ops (visualizers, dashboards).
+   *
+   * Recorded globally but NOT stripped from argv: CLI-only commands
+   * (`doctor --json`, `orphans --json`, …) parse `--json` themselves, so
+   * it must stay visible to them. The shared-op path strips it before
+   * `parseOpArgs` (which would otherwise mis-consume it as a flag value).
+   */
+  json: boolean;
 }
 
 export const DEFAULT_CLI_OPTIONS: CliOptions = {
@@ -37,6 +56,7 @@ export const DEFAULT_CLI_OPTIONS: CliOptions = {
   progressInterval: 1000,
   timeoutMs: null,
   explain: false,
+  json: false,
 };
 
 /**
@@ -112,6 +132,15 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
     if (a === '--explain') {
       cliOpts.explain = true;
+      continue;
+    }
+    // Guaranteed machine-readable output for shared ops. Recorded globally
+    // AND passed through (rest.push) so CLI-only commands that parse their
+    // own `--json` (doctor, orphans, …) still see it. The shared-op path in
+    // cli.ts strips it before parseOpArgs.
+    if (a === '--json') {
+      cliOpts.json = true;
+      rest.push(a);
       continue;
     }
     rest.push(a);

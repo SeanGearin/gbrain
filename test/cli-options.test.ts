@@ -58,15 +58,37 @@ describe('parseGlobalFlags', () => {
   });
 
   test('unknown flags pass through unchanged', () => {
-    const r = parseGlobalFlags(['doctor', '--fast', '--json', '--foo=bar']);
-    expect(r.rest).toEqual(['doctor', '--fast', '--json', '--foo=bar']);
+    const r = parseGlobalFlags(['doctor', '--fast', '--frobnicate', '--foo=bar']);
+    expect(r.rest).toEqual(['doctor', '--fast', '--frobnicate', '--foo=bar']);
     expect(r.cliOpts).toEqual(DEFAULT_CLI_OPTIONS);
   });
 
   test('all global flags combined', () => {
     const r = parseGlobalFlags(['--quiet', '--progress-json', '--progress-interval=250', 'sync']);
-    expect(r.cliOpts).toEqual({ quiet: true, progressJson: true, progressInterval: 250, timeoutMs: null, explain: false });
+    expect(r.cliOpts).toEqual({ quiet: true, progressJson: true, progressInterval: 250, timeoutMs: null, explain: false, json: false });
     expect(r.rest).toEqual(['sync']);
+  });
+
+  // --json: guaranteed machine-readable contract for shared ops. Unlike the
+  // other globals it is recorded AND passed through (not stripped), because
+  // CLI-only commands (doctor, orphans, …) parse their own --json.
+  test('--json sets cliOpts.json AND stays in rest (passthrough)', () => {
+    const r = parseGlobalFlags(['graph', 'people/tony-guan', '--json']);
+    expect(r.cliOpts.json).toBe(true);
+    expect(r.rest).toEqual(['graph', 'people/tony-guan', '--json']);
+  });
+
+  test('--json works in any argv position and coexists with a stripped global', () => {
+    const r = parseGlobalFlags(['--quiet', 'doctor', '--json']);
+    expect(r.cliOpts.json).toBe(true);
+    expect(r.cliOpts.quiet).toBe(true);
+    // --quiet stripped, --json preserved for the per-command parser.
+    expect(r.rest).toEqual(['doctor', '--json']);
+  });
+
+  test('--json absent → false default', () => {
+    const r = parseGlobalFlags(['list', '-n', '5']);
+    expect(r.cliOpts.json).toBe(false);
   });
 
   // v0.40.4 — --explain flag
@@ -96,7 +118,7 @@ describe('getCliOptions / setCliOptions singleton', () => {
 
   test('setCliOptions applies + getCliOptions returns a copy', () => {
     _resetCliOptionsForTest();
-    setCliOptions({ quiet: false, progressJson: true, progressInterval: 250, timeoutMs: null, explain: false });
+    setCliOptions({ quiet: false, progressJson: true, progressInterval: 250, timeoutMs: null, explain: false, json: false });
     expect(getCliOptions().progressJson).toBe(true);
     expect(getCliOptions().progressInterval).toBe(250);
   });
@@ -156,12 +178,12 @@ describe('CLI integration: progress streams to the right channel', () => {
 
 describe('cliOptsToProgressOptions', () => {
   test('--quiet → quiet mode', () => {
-    const opts = cliOptsToProgressOptions({ quiet: true, progressJson: false, progressInterval: 1000, timeoutMs: null, explain: false });
+    const opts = cliOptsToProgressOptions({ quiet: true, progressJson: false, progressInterval: 1000, timeoutMs: null, explain: false, json: false });
     expect(opts.mode).toBe('quiet');
   });
 
   test('--progress-json → json mode with interval', () => {
-    const opts = cliOptsToProgressOptions({ quiet: false, progressJson: true, progressInterval: 500, timeoutMs: null, explain: false });
+    const opts = cliOptsToProgressOptions({ quiet: false, progressJson: true, progressInterval: 500, timeoutMs: null, explain: false, json: false });
     expect(opts.mode).toBe('json');
     expect(opts.minIntervalMs).toBe(500);
   });
@@ -173,7 +195,7 @@ describe('cliOptsToProgressOptions', () => {
   });
 
   test('quiet takes priority over progressJson', () => {
-    const opts = cliOptsToProgressOptions({ quiet: true, progressJson: true, progressInterval: 1000, timeoutMs: null, explain: false });
+    const opts = cliOptsToProgressOptions({ quiet: true, progressJson: true, progressInterval: 1000, timeoutMs: null, explain: false, json: false });
     expect(opts.mode).toBe('quiet');
   });
 });
