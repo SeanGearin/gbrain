@@ -35,6 +35,7 @@ const TEST_SOURCES = [
   'tenant-entity', 'tenant-rel', 'tenant-restricted', 'tenant-seed',
   'tenant-sup-insert', 'tenant-sup-dedup', 'tenant-sup-self', 'tenant-sup-e2e',
   'tenant-results', 'tenant-results-sup', 'tenant-results-e2e',
+  'tenant-b4-surface', 'tenant-b4-slug', 'tenant-b4-graph',
 ];
 
 beforeAll(async () => {
@@ -660,6 +661,147 @@ describe('save_facts — restricted-data scrub (drop one, keep the batch)', () =
     const payload = JSON.parse(r.content[0].text);
     expect(payload.dropped).toBe(1);
     expect(payload.inserted).toBe(0);
+  });
+});
+
+// B4 restricted-data scrub of the STRUCTURED SURFACE FORMS. The claim TEXT scan
+// (above) DROPS the whole claim; the surface forms (people/entities/date_context)
+// are scrubbed differently — the offending form is STRIPPED and the claim is
+// KEPT. The leak these guard: a card/SSN/credential in entities[] flows into the
+// `context` column, into entity_slug resolution, AND into the co-occurrence
+// graph, so it must be scrubbed at the source, once, for all three consumers.
+describe('save_facts — B4 surface-form restricted-data scrub (strip form, keep claim)', () => {
+  async function pageSlugs(sourceId: string): Promise<string[]> {
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE source_id = $1`,
+      [sourceId],
+    );
+    return rows.map(r => r.slug);
+  }
+
+  test('an SSN in entities[] is scrubbed from the context column; the claim is KEPT and the clean entity survives', async () => {
+    // Claim text is clean (the SSN is only in the surface form), so the claim is
+    // not dropped — it is inserted with the SSN stripped out of the surface.
+    const res = await runSaveFacts(
+      [{
+        claim: 'Dana joined the finance operations team',
+        provenance: 'user_stated',
+        people: ['Dana'],
+        entities: ['Beacon Properties', '123-45-6789'],
+      }],
+      { engine, sourceId: 'tenant-b4-surface' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+    expect(res.dropped).toBe(0); // NOT dropped — the claim is kept
+
+    const row = await readFactRaw(res.fact_ids[0]);
+    // Context folds the surviving surface forms but NEVER the SSN.
+    expect(row.context).toContain('Dana');
+    expect(row.context).toContain('Beacon Properties');
+    expect(row.context).not.toContain('123-45-6789');
+  });
+
+  test('the SSN never reaches the facts table, the entity_slug, OR the graph pages', async () => {
+    const res = await runSaveFacts(
+      [{
+        claim: 'Boltline signed a new league partnership',
+        provenance: 'user_stated',
+        entities: ['Boltline', '123-45-6789'],
+      }],
+      { engine, sourceId: 'tenant-b4-graph' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+
+    const row = await readFactRaw(res.fact_ids[0]);
+    // Leading-mention subject is the clean entity, never the stripped SSN.
+    expect(row.entity_slug).toBe('companies/boltline');
+    expect(row.context ?? '').not.toContain('123-45-6789');
+
+    // No fact text and no graph page slug derived from the SSN.
+    const facts = await engine.executeRaw<{ fact: string; context: string | null }>(
+      `SELECT fact, context FROM facts WHERE source_id = $1`,
+      ['tenant-b4-graph'],
+    );
+    expect(facts.some(f => (f.fact + (f.context ?? '')).includes('123-45-6789'))).toBe(false);
+    const slugs = await pageSlugs('tenant-b4-graph');
+    expect(slugs.some(s => s.includes('123-45-6789'))).toBe(false);
+    // The legitimate entity page WAS built.
+    expect(slugs).toContain('companies/boltline');
+  });
+
+  test('an entities[] containing ONLY restricted data → stripped to empty → entity_slug NULL (no SSN-slug node)', async () => {
+    const res = await runSaveFacts(
+      [{
+        claim: 'the account was opened last quarter',
+        provenance: 'user_stated',
+        entities: ['078-05-1120'], // famous SSN, dashed shape → always caught
+      }],
+      { engine, sourceId: 'tenant-b4-slug' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+
+    const row = await readFactRaw(res.fact_ids[0]);
+    // With the only candidate stripped, there is no subject → NULL, not an
+    // SSN-derived slug. Context is null too (no surviving surface form).
+    expect(row.entity_slug).toBeNull();
+    expect(row.context).toBeNull();
+    const slugs = await pageSlugs('tenant-b4-slug');
+    expect(slugs.some(s => s.includes('078-05-1120'))).toBe(false);
+  });
+
+  test('a card in date_context is cleared; the claim and its clean people[] survive', async () => {
+    const res = await runSaveFacts(
+      [{
+        claim: 'Priya scheduled the renewal call',
+        provenance: 'user_stated',
+        people: ['Priya'],
+        date_context: 'the day the 4111 1111 1111 1111 card expires',
+      }],
+      { engine, sourceId: 'tenant-b4-surface' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+    const row = await readFactRaw(res.fact_ids[0]);
+    expect(row.context).toContain('Priya');
+    expect(row.context).not.toContain('4111');
+    expect(row.context).not.toContain('when:'); // the whole date_context form was cleared
+  });
+
+  test('a bare 9-digit entity with no SSN context is KEPT (conservative parity with the text scan)', async () => {
+    const res = await runSaveFacts(
+      [{
+        claim: 'the invoice cleared this morning',
+        provenance: 'user_stated',
+        entities: ['invoice 123456789'],
+      }],
+      { engine, sourceId: 'tenant-b4-surface' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+    const row = await readFactRaw(res.fact_ids[0]);
+    expect(row.context).toContain('123456789'); // saved — not high-signal
+  });
+
+  test('clean surface forms are unaffected (no false-positive stripping)', async () => {
+    const res = await runSaveFacts(
+      [{
+        claim: 'Marcus advises Boltline on the partnership',
+        provenance: 'user_stated',
+        people: ['Marcus Vale'],
+        entities: ['Boltline'],
+        date_context: 'since last spring',
+      }],
+      { engine, sourceId: 'tenant-b4-surface' },
+    );
+    if ('error' in res) throw new Error(`unexpected validation error: ${res.detail}`);
+    expect(res.inserted).toBe(1);
+    const row = await readFactRaw(res.fact_ids[0]);
+    expect(row.context).toContain('Marcus Vale');
+    expect(row.context).toContain('Boltline');
+    expect(row.context).toContain('since last spring');
   });
 });
 

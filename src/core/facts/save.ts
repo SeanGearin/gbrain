@@ -34,7 +34,13 @@
 import { z } from 'zod';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
-import { scanRestrictedData, logRestrictedDrop, type RestrictedCategory } from './restricted-data.ts';
+import {
+  scanRestrictedData,
+  logRestrictedDrop,
+  scrubSurfaceForms,
+  logRestrictedSurfaceStrip,
+  type RestrictedCategory,
+} from './restricted-data.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 import { cosineSimilarity } from './classify.ts';
@@ -402,7 +408,30 @@ export async function runSaveFacts(
       dropped += 1;
       continue;
     }
-    claims.push({ claim: parsed.data, cleaned, index: i });
+    // B4: the claim TEXT passed the restricted scan above, but the STRUCTURED
+    // SURFACE FORMS (people/entities/date_context) were not scanned — yet they
+    // flow into the `context` column, entity_slug resolution, AND the
+    // co-occurrence graph. A card/SSN/credential in entities[] would otherwise
+    // be banked verbatim (an SSN could even become an entity page slug + graph
+    // node). Unlike the text path (drop the whole claim) we STRIP the offending
+    // surface form and KEEP the claim — a co-mention is not worth a whole
+    // memory. Every downstream reader (buildContext, primarySubject,
+    // constructGraphFromClaim, collectPersonSurfaceHints) sees the scrubbed
+    // arrays because they all read this same claim object.
+    const surfaceScrub = scrubSurfaceForms(parsed.data);
+    let claim: ValidClaim = parsed.data;
+    if (surfaceScrub.stripped.length > 0) {
+      for (const cat of surfaceScrub.stripped) {
+        logRestrictedSurfaceStrip(cat, 'mcp:save_facts');
+      }
+      claim = {
+        ...parsed.data,
+        people: surfaceScrub.people,
+        entities: surfaceScrub.entities,
+        date_context: surfaceScrub.date_context,
+      };
+    }
+    claims.push({ claim, cleaned, index: i });
   }
 
   // --- 2. batch-level capability: is the embedding lane configured? -------

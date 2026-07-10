@@ -159,3 +159,90 @@ export function logRestrictedDrop(category: RestrictedCategory, source: string):
     `[facts:restricted-data] dropped 1 claim (category=${category}, source=${source}); value not logged`,
   );
 }
+
+// --- B4: structured surface-form scrub --------------------------------------
+
+/**
+ * The outcome of scrubbing a claim's structured surface forms.
+ *   - people / entities — the input arrays with any element carrying restricted
+ *     data REMOVED. IDENTITY-PRESERVED (same reference) when nothing was
+ *     stripped, so the clean path is behaviourally unchanged.
+ *   - date_context — cleared to `undefined` when it carried restricted data.
+ *   - stripped — the categories removed, in encounter order (people →
+ *     entities → date_context), for value-free logging. Empty when clean.
+ */
+export interface SurfaceScrubResult {
+  people: string[] | undefined;
+  entities: string[] | undefined;
+  date_context: string | undefined;
+  stripped: RestrictedCategory[];
+}
+
+/**
+ * B4: scrub restricted data (PCI card / SSN / credential) out of a claim's
+ * STRUCTURED SURFACE FORMS — people[], entities[], date_context.
+ *
+ * The claim TEXT is scanned separately by `scanRestrictedData`, and a hit there
+ * DROPS the whole claim. The surface forms are different in kind: they are
+ * who/what/when metadata that flows into the `context` column, into
+ * entity_slug resolution, AND into the co-occurrence graph. A card number, SSN,
+ * or API key sitting in `entities[]` would otherwise be banked verbatim (an SSN
+ * could even become an entity page slug + graph node). But a co-mention is not
+ * worth a whole memory, so — unlike the text path — this STRIPS the offending
+ * surface form and KEEPS the claim.
+ *
+ * Same conservative, high-signal detector as the text scan, applied to each
+ * array element and to date_context INDEPENDENTLY (so a bare 9-digit run with
+ * no SSN context token is saved, exactly as in claim text). Pure; no I/O.
+ */
+export function scrubSurfaceForms(surface: {
+  people?: string[];
+  entities?: string[];
+  date_context?: string;
+}): SurfaceScrubResult {
+  const stripped: RestrictedCategory[] = [];
+
+  const scrubArray = (arr: string[] | undefined): string[] | undefined => {
+    if (!arr) return arr;
+    let removed = false;
+    const kept: string[] = [];
+    for (const item of arr) {
+      const scan = scanRestrictedData(item);
+      if (scan.restricted && scan.category) {
+        stripped.push(scan.category);
+        removed = true;
+        continue; // strip only this element; keep the rest
+      }
+      kept.push(item);
+    }
+    // Clean path returns the SAME reference — zero behaviour change and no
+    // allocation when nothing was restricted.
+    return removed ? kept : arr;
+  };
+
+  const people = scrubArray(surface.people);
+  const entities = scrubArray(surface.entities);
+
+  let date_context = surface.date_context;
+  if (date_context) {
+    const scan = scanRestrictedData(date_context);
+    if (scan.restricted && scan.category) {
+      stripped.push(scan.category);
+      date_context = undefined;
+    }
+  }
+
+  return { people, entities, date_context, stripped };
+}
+
+/**
+ * Value-free log of a surface-form strip. A DISTINCT message from
+ * `logRestrictedDrop` because the claim itself is KEPT — only the offending
+ * surface form was removed. Category + source only; the value is NEVER logged.
+ */
+export function logRestrictedSurfaceStrip(category: RestrictedCategory, source: string): void {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[facts:restricted-data] stripped 1 surface form (category=${category}, source=${source}); claim kept, value not logged`,
+  );
+}
