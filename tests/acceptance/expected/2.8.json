@@ -1,0 +1,259 @@
+{
+  "ids": {
+    "roofId": 1,
+    "marketId": 2,
+    "gardenId": 3,
+    "ribbonId": 4,
+    "classId": 5
+  },
+  "seed": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "real_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "dedup_unknown_target": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "dedup_expired_target": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "insert_unknown_target": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        4
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 4
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "insert_expired_target": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        5
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 5
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "supersession_audit": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 1,
+          "fact": "Ines keeps bees on the roof",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": "<t2>",
+          "superseded_by": 3,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t3>"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 5,
+          "fact": "Ines teaches a beekeeping class in spring",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t4>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t5>"
+        },
+        {
+          "id": 4,
+          "fact": "Ines won a blue ribbon at the county fair",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t6>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t7>"
+        },
+        {
+          "id": 3,
+          "fact": "Ines moved the hives to the community garden",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t8>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t9>"
+        },
+        {
+          "id": 2,
+          "fact": "Ines sells honey at the weekend market",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t10>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t11>"
+        },
+        {
+          "id": 1,
+          "fact": "Ines keeps bees on the roof",
+          "kind": "fact",
+          "entity_slug": "people/ines",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t12>",
+          "valid_until": null,
+          "expired_at": "<t13>",
+          "superseded_by": 3,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t14>"
+        }
+      ],
+      "total": 5
+    }
+  }
+}

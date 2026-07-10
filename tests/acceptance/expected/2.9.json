@@ -1,0 +1,82 @@
+{
+  "ids": {
+    "seedId": 1
+  },
+  "seed": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "zero_target": {
+    "isError": false,
+    "payload": {
+      "error": "invalid_claim",
+      "failed_index": 1,
+      "detail": "claim[1].supersedes: Too small: expected number to be >0"
+    }
+  },
+  "float_target": {
+    "isError": false,
+    "payload": {
+      "error": "invalid_claim",
+      "failed_index": 0,
+      "detail": "claim[0].supersedes: Invalid input: expected int, received number"
+    }
+  },
+  "negative_target": {
+    "isError": false,
+    "payload": {
+      "error": "invalid_claim",
+      "failed_index": 0,
+      "detail": "claim[0].supersedes: Too small: expected number to be >0"
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 1,
+          "fact": "Vera plays the cello in a quartet",
+          "kind": "fact",
+          "entity_slug": "people/vera",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "supersession_audit": {
+    "isError": false,
+    "payload": {
+      "facts": [],
+      "total": 0
+    }
+  }
+}

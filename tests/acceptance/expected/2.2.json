@@ -1,0 +1,140 @@
+{
+  "ids": {
+    "apartmentId": 1,
+    "marathonId": 2,
+    "beagleId": 3,
+    "houseId": 4
+  },
+  "seed_saves": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "mixed_batch": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        3,
+        4
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 3
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 4
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 4,
+          "fact": "Marcus bought a house in Maplewood",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 3,
+          "fact": "Marcus adopted a beagle named Waffles",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t4>"
+        },
+        {
+          "id": 2,
+          "fact": "Marcus trains for the marathon on weekends",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t6>"
+        },
+        {
+          "id": 1,
+          "fact": "Marcus rents an apartment in Astoria",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t7>",
+          "valid_until": null,
+          "expired_at": "<t8>",
+          "superseded_by": 4,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t9>"
+        }
+      ],
+      "total": 4
+    }
+  }
+}

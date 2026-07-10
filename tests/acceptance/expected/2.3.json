@@ -1,0 +1,110 @@
+{
+  "ids": {
+    "staleId": 1,
+    "canonicalId": 2
+  },
+  "stale_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "canonical_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "dedup_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Nadia can safely eat shellfish after her treatment",
+          "kind": "fact",
+          "entity_slug": "people/nadia",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 1,
+          "fact": "Nadia is allergic to shellfish",
+          "kind": "fact",
+          "entity_slug": "people/nadia",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": "<t4>",
+          "superseded_by": 2,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t5>"
+        }
+      ],
+      "total": 2
+    }
+  }
+}

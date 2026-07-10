@@ -1,0 +1,123 @@
+{
+  "mixed_plain_batch": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        2,
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 2
+        },
+        {
+          "index": 2,
+          "status": "duplicate",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "single_plain_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 3,
+          "fact": "Lena is learning to restore vintage kilns",
+          "kind": "fact",
+          "entity_slug": "people/lena",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 2,
+          "fact": "Lena volunteers at the animal shelter on Fridays",
+          "kind": "fact",
+          "entity_slug": "people/lena",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t4>"
+        },
+        {
+          "id": 1,
+          "fact": "Lena runs a pottery studio in Asheville",
+          "kind": "fact",
+          "entity_slug": "people/lena",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t6>"
+        }
+      ],
+      "total": 3
+    }
+  },
+  "supersession_audit": {
+    "isError": false,
+    "payload": {
+      "facts": [],
+      "total": 0
+    }
+  }
+}

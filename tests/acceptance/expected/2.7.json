@@ -1,0 +1,149 @@
+{
+  "ids": {
+    "oldId": 1,
+    "newId": 2
+  },
+  "old_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall_by_entity": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Ravi switched to an electric hatchback",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "recall_recent": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Ravi switched to an electric hatchback",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t4>"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "recall_grep_stale": {
+    "isError": false,
+    "payload": {
+      "facts": [],
+      "total": 0
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Ravi switched to an electric hatchback",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t6>"
+        },
+        {
+          "id": 1,
+          "fact": "Ravi drives a diesel pickup",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t7>",
+          "valid_until": null,
+          "expired_at": "<t8>",
+          "superseded_by": 2,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t9>"
+        }
+      ],
+      "total": 2
+    }
+  }
+}
