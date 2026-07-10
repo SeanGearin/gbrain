@@ -4052,6 +4052,12 @@ const recall: Operation = {
       source: r.source,
       source_session: r.source_session,
       confidence: r.confidence,
+      // B8 provenance projection: surface the v114 trust stamp the write
+      // path (save_facts) already records, so callers can render
+      // "[you said]" (user_stated) / "[inferred]" (model_inferred) /
+      // "[origin unknown]" (null). Additive field; null for
+      // server-extracted and pre-v114 rows.
+      provenance: r.provenance ?? null,
       created_at: r.created_at.toISOString(),
     }));
     const payload = {

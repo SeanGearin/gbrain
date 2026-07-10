@@ -510,6 +510,11 @@ function remoteFactToRow(o: Record<string, unknown>): FactRow {
     source: typeof o.source === 'string' ? o.source : '',
     source_session: typeof o.source_session === 'string' ? o.source_session : null,
     confidence: typeof o.confidence === 'number' ? o.confidence : 0.5,
+    // B8 provenance projection: hydrate from the remote payload when the
+    // server sends it; null against an older server that doesn't.
+    provenance: (o.provenance === 'user_stated' || o.provenance === 'model_inferred')
+      ? o.provenance
+      : null,
     embedding: null,
     embedded_at: null,
     created_at: parseMaybeDate(o.created_at) ?? new Date(0),
@@ -533,6 +538,9 @@ function factRowToJson(r: FactRow): Record<string, unknown> {
     source: r.source,
     source_session: r.source_session,
     confidence: r.confidence,
+    // B8 provenance projection: mirrors the MCP recall payload so
+    // `gbrain recall --json` verifies the field end-to-end on the box.
+    provenance: r.provenance ?? null,
     effective_confidence: Number(effectiveConfidence(r).toFixed(3)),
     created_at: r.created_at.toISOString(),
   };

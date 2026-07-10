@@ -5982,6 +5982,10 @@ interface FactRowSqlShape {
   source: string;
   source_session: string | null;
   confidence: number | string;
+  // B8: v114 facts_provenance_columns. TEXT with no CHECK constraint (the
+  // save_facts handler is the sole writer and validates the enum), so typed
+  // loosely here and narrowed in rowToFactPg.
+  provenance: string | null;
   embedding: string | number[] | Float32Array | null;
   embedded_at: Date | null;
   created_at: Date;
@@ -6021,6 +6025,13 @@ function rowToFactPg(row: FactRowSqlShape): FactRow {
     source: row.source,
     source_session: row.source_session,
     confidence: typeof row.confidence === 'string' ? parseFloat(row.confidence) : row.confidence,
+    // B8 provenance projection: narrow the unconstrained TEXT column to the
+    // handler-validated enum; anything else (including undefined on a
+    // pre-v114 brain where SELECT * lacks the column) reads as null =
+    // "no client provenance recorded."
+    provenance: row.provenance === 'user_stated' || row.provenance === 'model_inferred'
+      ? row.provenance
+      : null,
     embedding,
     embedded_at: row.embedded_at,
     created_at: row.created_at,

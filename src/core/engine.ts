@@ -514,6 +514,16 @@ export interface FactRow {
   source: string;
   source_session: string | null;
   confidence: number;
+  /**
+   * B8 provenance projection: the v114 (facts_provenance_columns) trust stamp
+   * read back out. 'user_stated' | 'model_inferred' for save_facts rows
+   * (client-authored, handler-validated enum — the sole writer); null for
+   * every server-extracted row (extract_facts, put_page fences) and every
+   * pre-v114 row. Optional so FactRow literals built by paths that never see
+   * the column (fence parsing, remote thin-client hydration on an old server)
+   * stay valid; absent and null both mean "no client provenance recorded."
+   */
+  provenance?: 'user_stated' | 'model_inferred' | null;
   embedding: Float32Array | null;
   embedded_at: Date | null;
   created_at: Date;
