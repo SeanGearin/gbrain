@@ -1,0 +1,93 @@
+{
+  "save": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 1,
+      "dropped": 3,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        1,
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "dropped",
+          "category": "ssn"
+        },
+        {
+          "index": 2,
+          "status": "duplicate",
+          "fact_id": 1
+        },
+        {
+          "index": 3,
+          "status": "dropped",
+          "category": "payment_card"
+        },
+        {
+          "index": 4,
+          "status": "inserted",
+          "fact_id": 2
+        },
+        {
+          "index": 5,
+          "status": "dropped",
+          "category": "credential"
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Marcus prefers the metro over driving downtown",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 1,
+          "fact": "Marcus renewed the Fairview office lease",
+          "kind": "fact",
+          "entity_slug": "people/marcus",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t4>"
+        }
+      ],
+      "total": 2
+    }
+  }
+}

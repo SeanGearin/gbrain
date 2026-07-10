@@ -1,0 +1,87 @@
+{
+  "ids": {
+    "silverLakeId": 1,
+    "echoParkId": 2,
+    "greyhoundId": 3
+  },
+  "plain_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "insert_path_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "second_plain_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "dedup_path_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  }
+}
