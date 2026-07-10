@@ -59,6 +59,17 @@ const ClaimSchema = z
     date_context: z.string().optional(),
     provenance: z.enum(['user_stated', 'model_inferred']),
     confidence: z.number().min(0).max(1).optional(),
+    /**
+     * B2 correction: the id of a PRIOR fact this claim replaces. When present,
+     * the target row is expired (expired_at set) and superseded_by-linked to
+     * the canonical replacement — atomically on the insert path (the engine's
+     * insert+expire tx, so no observer ever sees both rows active). The engine
+     * already supersedes natively; this is the one field that makes it reachable
+     * from the customer plane. Optional; omit for a plain save. Positive integer
+     * (facts.id is a serial). A claim can only supersede a DIFFERENT fact — the
+     * loop guards self-supersession.
+     */
+    supersedes: z.number().int().positive().optional(),
   })
   .strict();
 
@@ -87,6 +98,22 @@ export type SaveFactsResult =
        * dropped). The dropped value itself is never returned or logged.
        */
       dropped: number;
+      /**
+       * B2 supersessions applied this batch: a PRIOR fact expired and pointed
+       * (superseded_by) at its replacement because a claim carried `supersedes`.
+       * Always present (0 when no claim asked to supersede).
+       *
+       * Counting is honest on the dedup path (the correction's text already
+       * existed, so the target is expired via `expireFact`, counted iff a row
+       * was actually updated). On the INSERT path it counts an atomic
+       * insert+expire the engine DISPATCHED against an in-source target; an
+       * invalid / foreign / already-expired target is a safe no-op on the old
+       * row (RLS + the engine's `expired_at IS NULL` guard) while the new fact
+       * still inserts, and the atomic path does not report whether the old row
+       * was touched. Authoritative supersession state is always readable via
+       * recall(supersessions: true).
+       */
+      superseded: number;
       fact_ids: number[];
       /**
        * Which dedup layers were active for this batch:
@@ -354,6 +381,7 @@ export async function runSaveFacts(
 
   let inserted = 0;
   let duplicate = 0;
+  let superseded = 0;
   const fact_ids: number[] = [];
   // Entity slugs that received a NEW fact this batch — the set whose pages must
   // be (re)materialized from their facts after the loop (Layer 1, search_brain).
@@ -404,7 +432,26 @@ export async function runSaveFacts(
       }
     }
 
+    // B2 correction target: the prior fact this claim replaces, or null when
+    // the client didn't ask for a supersede. A claim can only supersede a
+    // DIFFERENT fact — never the row it just deduped/inserted to, since
+    // expiring the canonical row and pointing superseded_by at itself would
+    // corrupt the chain (guarded per-branch below).
+    const supersedeTargetId = typeof c.supersedes === 'number' ? c.supersedes : null;
+
     if (matchedId !== null) {
+      // duplicate+supersedes → still apply the supersede. The correction's text
+      // already exists as canonical row `matchedId`, so no new row is written;
+      // expire the superseded target and point it at that canonical row.
+      // RLS-confined + idempotent: a target in another tenant, already expired,
+      // or unknown is a silent no-op (expireFact returns false → not counted).
+      // Self-supersession (target === the canonical dup) is skipped.
+      if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
+        const applied = await ctx.engine.expireFact(supersedeTargetId, {
+          supersededBy: matchedId,
+        });
+        if (applied) superseded += 1;
+      }
       duplicate += 1;
       fact_ids.push(matchedId);
       continue;
@@ -443,10 +490,22 @@ export async function runSaveFacts(
       provenance: c.provenance,
       client_authored: true,
     };
-    const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, there is no fence/markdown source to reconcile through
+    // B2: when the claim supersedes a prior fact AND its text is not a dup, use
+    // the engine's ATOMIC insert+expire path (its own tx) so no observer ever
+    // sees the old and new rows both active — returns status 'superseded'. A new
+    // row (fresh id) can never equal supersedeTargetId, so no self-guard needed
+    // here. Plain insert otherwise.
+    const insertCtx = supersedeTargetId !== null
+      ? { source_id: ctx.sourceId, supersedeId: supersedeTargetId }
+      : { source_id: ctx.sourceId };
+    const result = await ctx.engine.insertFact(newFact, insertCtx); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, there is no fence/markdown source to reconcile through
     fact_ids.push(result.id);
-    if (result.status === 'inserted') {
+    // 'superseded' means the engine wrote a NEW row (and atomically expired the
+    // target) — count it as an insert exactly like 'inserted', and additionally
+    // tally the supersession.
+    if (result.status === 'inserted' || result.status === 'superseded') {
       inserted += 1;
+      if (result.status === 'superseded') superseded += 1;
       // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
       // this claim's people[]/entities[] into entity stub pages + bidirectional
       // co-occurrence edges so traverse_graph / find_experts have a graph to
@@ -502,7 +561,7 @@ export async function runSaveFacts(
     }
   }
 
-  return { inserted, duplicate, dropped, fact_ids, dedup_mode };
+  return { inserted, duplicate, dropped, superseded, fact_ids, dedup_mode };
 }
 
 function collectPersonSurfaceHints(claims: ValidClaim[]): string[] {

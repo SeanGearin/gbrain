@@ -33,6 +33,7 @@ const TEST_SOURCES = [
   'tenant-a', 'tenant-dedup', 'tenant-near', 'tenant-batchdup',
   'tenant-validate', 'tenant-atomic', 'tenant-x', 'tenant-y',
   'tenant-entity', 'tenant-rel', 'tenant-restricted', 'tenant-seed',
+  'tenant-sup-insert', 'tenant-sup-dedup', 'tenant-sup-self', 'tenant-sup-e2e',
 ];
 
 beforeAll(async () => {
@@ -658,6 +659,194 @@ describe('save_facts — restricted-data scrub (drop one, keep the batch)', () =
     const payload = JSON.parse(r.content[0].text);
     expect(payload.dropped).toBe(1);
     expect(payload.inserted).toBe(0);
+  });
+});
+
+// B2 supersession state: expired_at + superseded_by are the observable proof a
+// correction landed. Read them directly (they aren't on the reduced readFactRaw).
+async function readSupersession(id: number): Promise<{
+  expired_at: Date | null;
+  superseded_by: number | null;
+}> {
+  const rows = await engine.executeRaw<{ expired_at: Date | string | null; superseded_by: number | string | null }>(
+    `SELECT expired_at, superseded_by FROM facts WHERE id = $1`,
+    [id],
+  );
+  const row = rows[0];
+  return {
+    expired_at: row.expired_at == null ? null : new Date(row.expired_at as string),
+    superseded_by: row.superseded_by == null ? null : Number(row.superseded_by),
+  };
+}
+
+describe('save_facts — B2 supersedes (correction on the customer plane)', () => {
+  test('insert path: a correction with `supersedes` atomically expires the target and links it to the new row', async () => {
+    const old = await runSaveFacts(
+      [{ claim: 'Dexter lives in Portland', provenance: 'user_stated', people: ['Dexter'] }],
+      { engine, sourceId: 'tenant-sup-insert' },
+    );
+    if ('error' in old) throw new Error('unexpected validation error');
+    expect(old.inserted).toBe(1);
+    const oldId = old.fact_ids[0];
+
+    // Lexically distinct correction so it never accidentally dedups — the
+    // supersede link is explicit via the id, not inferred from text overlap.
+    const corr = await runSaveFacts(
+      [{ claim: 'Dexter relocated to Austin last month', provenance: 'user_stated', people: ['Dexter'], supersedes: oldId }],
+      { engine, sourceId: 'tenant-sup-insert' },
+    );
+    if ('error' in corr) throw new Error('unexpected validation error');
+    expect(corr.inserted).toBe(1);
+    expect(corr.superseded).toBe(1);
+    expect(corr.duplicate).toBe(0);
+    expect(corr.dropped).toBe(0);
+    const newId = corr.fact_ids[0];
+    expect(newId).not.toBe(oldId);
+
+    // Old row: expired + pointed at the replacement. New row: active.
+    const oldState = await readSupersession(oldId);
+    expect(oldState.expired_at).not.toBeNull();
+    expect(oldState.superseded_by).toBe(newId);
+    const newState = await readSupersession(newId);
+    expect(newState.expired_at).toBeNull();
+    expect(newState.superseded_by).toBeNull();
+  });
+
+  test('dedup path: duplicate+supersedes still applies the supersede (no new row, old row expired to the canonical dup)', async () => {
+    // Old value, then the canonical corrected value as a normal save.
+    const freePlan = await runSaveFacts(
+      [{ claim: 'Nadia is on the Free plan', provenance: 'user_stated', people: ['Nadia'] }],
+      { engine, sourceId: 'tenant-sup-dedup' },
+    );
+    if ('error' in freePlan) throw new Error('unexpected validation error');
+    const freeId = freePlan.fact_ids[0];
+
+    const proPlan = await runSaveFacts(
+      [{ claim: 'Nadia is on the Pro plan', provenance: 'user_stated', people: ['Nadia'] }],
+      { engine, sourceId: 'tenant-sup-dedup' },
+    );
+    if ('error' in proPlan) throw new Error('unexpected validation error');
+    const proId = proPlan.fact_ids[0];
+
+    const before = await countFacts('tenant-sup-dedup');
+
+    // Re-send the canonical corrected value (a DUP of proId) but mark that it
+    // supersedes the old free-plan fact. No new row; the supersede still lands.
+    const corr = await runSaveFacts(
+      [{ claim: 'Nadia is on the Pro plan', provenance: 'user_stated', people: ['Nadia'], supersedes: freeId }],
+      { engine, sourceId: 'tenant-sup-dedup' },
+    );
+    if ('error' in corr) throw new Error('unexpected validation error');
+    expect(corr.inserted).toBe(0);
+    expect(corr.duplicate).toBe(1);
+    expect(corr.superseded).toBe(1);
+    expect(corr.fact_ids).toEqual([proId]);
+    expect(await countFacts('tenant-sup-dedup')).toBe(before); // no new row
+
+    const freeState = await readSupersession(freeId);
+    expect(freeState.expired_at).not.toBeNull();
+    expect(freeState.superseded_by).toBe(proId); // pointed at the canonical dup
+
+    // Idempotent / honest no-op: re-applying against the now-expired target
+    // does NOT re-count (expireFact returns false on expired_at IS NOT NULL).
+    const again = await runSaveFacts(
+      [{ claim: 'Nadia is on the Pro plan', provenance: 'user_stated', people: ['Nadia'], supersedes: freeId }],
+      { engine, sourceId: 'tenant-sup-dedup' },
+    );
+    if ('error' in again) throw new Error('unexpected validation error');
+    expect(again.superseded).toBe(0);
+    expect(again.duplicate).toBe(1);
+  });
+
+  test('self-supersession is guarded: a dup that names its own matched row as `supersedes` does not expire it', async () => {
+    const first = await runSaveFacts(
+      [{ claim: 'Otto plays chess on Sundays', provenance: 'user_stated', people: ['Otto'] }],
+      { engine, sourceId: 'tenant-sup-self' },
+    );
+    if ('error' in first) throw new Error('unexpected validation error');
+    const id = first.fact_ids[0];
+
+    const selfDup = await runSaveFacts(
+      [{ claim: 'Otto plays chess on Sundays', provenance: 'user_stated', people: ['Otto'], supersedes: id }],
+      { engine, sourceId: 'tenant-sup-self' },
+    );
+    if ('error' in selfDup) throw new Error('unexpected validation error');
+    expect(selfDup.duplicate).toBe(1);
+    expect(selfDup.superseded).toBe(0); // never supersede itself
+    expect(selfDup.fact_ids).toEqual([id]);
+
+    // The row is still active — not expired against itself.
+    const state = await readSupersession(id);
+    expect(state.expired_at).toBeNull();
+    expect(state.superseded_by).toBeNull();
+  });
+
+  test('a plain save (no `supersedes`) reports superseded:0 and is otherwise unchanged', async () => {
+    const res = await runSaveFacts(
+      [{ claim: 'Percy prefers tea over coffee', provenance: 'user_stated', people: ['Percy'] }],
+      { engine, sourceId: 'tenant-sup-insert' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.inserted).toBe(1);
+    expect(res.superseded).toBe(0);
+  });
+
+  test('supersedes must be a positive integer (schema rejects 0 / negative / float)', async () => {
+    for (const bad of [0, -3, 2.5]) {
+      const res = await runSaveFacts(
+        [{ claim: 'x is y', provenance: 'user_stated', supersedes: bad }],
+        { engine, sourceId: 'tenant-sup-insert' },
+      );
+      if (!('error' in res)) throw new Error(`expected rejection for supersedes=${bad}`);
+      expect(res.error).toBe('invalid_claim');
+      expect(res.failed_index).toBe(0);
+    }
+  });
+
+  test('end to end through dispatch: save → correct → recall(supersessions) shows the chain, and payload carries `superseded`', async () => {
+    // Owner caller so recall reads the source's own private rows back.
+    const ownerCaller = {
+      remote: true,
+      sourceId: 'tenant-sup-e2e',
+      auth: { token: 't', clientId: 'c', scopes: ['read', 'write'], sourceId: 'tenant-sup-e2e' },
+    };
+
+    const saved = await dispatchToolCall(
+      engine,
+      'save_facts',
+      { claims: [{ claim: 'Wren works at Northwind', provenance: 'user_stated', people: ['Wren'] }] },
+      ownerCaller,
+    );
+    const savedPayload = JSON.parse(saved.content[0].text);
+    expect(savedPayload.inserted).toBe(1);
+    expect(savedPayload.superseded).toBe(0);
+    const oldId = savedPayload.fact_ids[0];
+
+    const corrected = await dispatchToolCall(
+      engine,
+      'save_facts',
+      { claims: [{ claim: 'Wren now works at Gale Systems', provenance: 'user_stated', people: ['Wren'], supersedes: oldId }] },
+      ownerCaller,
+    );
+    const corrPayload = JSON.parse(corrected.content[0].text);
+    expect(corrPayload.inserted).toBe(1);
+    expect(corrPayload.superseded).toBe(1);
+    const newId = corrPayload.fact_ids[0];
+
+    // The supersession audit log (recall supersessions:true) surfaces the old
+    // row with superseded_by → the new row. This is exactly Sean's on-deploy
+    // verification path.
+    const audit = await dispatchToolCall(
+      engine,
+      'recall',
+      { supersessions: true },
+      ownerCaller,
+    );
+    const auditPayload = JSON.parse(audit.content[0].text);
+    const superseded = (auditPayload.facts as Array<{ id: number; superseded_by: number | null }>)
+      .find(f => f.id === oldId);
+    expect(superseded).toBeDefined();
+    expect(superseded!.superseded_by).toBe(newId);
   });
 });
 
