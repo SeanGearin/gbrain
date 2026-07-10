@@ -34,7 +34,7 @@
 import { z } from 'zod';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { sanitizeTakeForPrompt } from '../think/sanitize.ts';
-import { scanRestrictedData, logRestrictedDrop } from './restricted-data.ts';
+import { scanRestrictedData, logRestrictedDrop, type RestrictedCategory } from './restricted-data.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 import { cosineSimilarity } from './classify.ts';
@@ -80,6 +80,24 @@ export interface SaveFactsContext {
   sourceId: string;
 }
 
+/**
+ * B3: one claim's outcome, tagged with its position in the REQUEST array.
+ *   'inserted'  — a new row was written; fact_id is its id. A superseding
+ *                 insert (B2) also reports 'inserted' — it IS a new row; the
+ *                 batch `superseded` counter + recall(supersessions:true)
+ *                 report the chain.
+ *   'duplicate' — no new row; fact_id is the CANONICAL existing row the claim
+ *                 matched (dedup Layer 1/2, or the engine's advisory-lock race).
+ *   'dropped'   — restricted-data scrub (PCI card / SSN / credential); the
+ *                 claim was never inserted. Carries the `category` ONLY —
+ *                 the value itself is never returned or logged, but the
+ *                 category is reported honestly so the caller can tell the
+ *                 user WHY the memory was refused instead of losing it silently.
+ */
+export type SaveFactsClaimResult =
+  | { index: number; status: 'inserted' | 'duplicate'; fact_id: number }
+  | { index: number; status: 'dropped'; category: RestrictedCategory };
+
 export type SaveFactsResult =
   | {
       // Whole-batch validation failure. No rows written. `failed_index` names
@@ -115,6 +133,14 @@ export type SaveFactsResult =
        */
       superseded: number;
       fact_ids: number[];
+      /**
+       * B3: per-claim outcomes — EXACTLY one entry per input claim, ordered by
+       * `index` (the claim's position in the request array). This is the
+       * alignment-safe receipt: `fact_ids` carries no entry for a dropped
+       * claim, so a positional zip of fact_ids against the request breaks
+       * whenever dropped > 0 — `results` never does. Always present.
+       */
+      results: SaveFactsClaimResult[];
       /**
        * Which dedup layers were active for this batch:
        *   'trgm'         — Layer 1 only (no embedding provider configured —
@@ -334,7 +360,13 @@ export async function runSaveFacts(
   // a schema failure, so a malformed item can never leak partial writes ahead
   // of itself. Each surviving claim carries its sanitized `cleaned` text
   // forward; the insert loop never re-sanitizes.
-  const claims: Array<{ claim: ValidClaim; cleaned: string }> = [];
+  const claims: Array<{ claim: ValidClaim; cleaned: string; index: number }> = [];
+  // B3: per-claim receipt, assigned by REQUEST index. Every non-error path
+  // fills every slot exactly once — a claim is either dropped here in
+  // validation or reaches the insert loop below — so the array comes out
+  // dense and index-ordered with no sort. (A whole-batch validation failure
+  // returns the error shape before this is ever surfaced.)
+  const results: SaveFactsClaimResult[] = new Array(rawClaims.length);
   let dropped = 0;
   for (let i = 0; i < rawClaims.length; i++) {
     const parsed = ClaimSchema.safeParse(rawClaims[i]);
@@ -365,10 +397,12 @@ export async function runSaveFacts(
     const restricted = scanRestrictedData(cleaned);
     if (restricted.restricted && restricted.category) {
       logRestrictedDrop(restricted.category, 'mcp:save_facts');
+      // B3: honest drop receipt — the category class only, never the value.
+      results[i] = { index: i, status: 'dropped', category: restricted.category };
       dropped += 1;
       continue;
     }
-    claims.push({ claim: parsed.data, cleaned });
+    claims.push({ claim: parsed.data, cleaned, index: i });
   }
 
   // --- 2. batch-level capability: is the embedding lane configured? -------
@@ -387,7 +421,7 @@ export async function runSaveFacts(
   // be (re)materialized from their facts after the loop (Layer 1, search_brain).
   const touchedEntitySlugs = new Set<string>();
 
-  for (const { claim: c, cleaned } of claims) {
+  for (const { claim: c, cleaned, index } of claims) {
     // Claims were sanitized + emptiness-checked in the validation pass above;
     // `cleaned` is the trust-boundary-safe text. No re-sanitization here.
 
@@ -454,6 +488,7 @@ export async function runSaveFacts(
       }
       duplicate += 1;
       fact_ids.push(matchedId);
+      results[index] = { index, status: 'duplicate', fact_id: matchedId };
       continue;
     }
 
@@ -506,6 +541,9 @@ export async function runSaveFacts(
     if (result.status === 'inserted' || result.status === 'superseded') {
       inserted += 1;
       if (result.status === 'superseded') superseded += 1;
+      // B3: a superseding insert is still a NEW row → 'inserted' (the batch
+      // `superseded` counter reports the chain; see SaveFactsClaimResult).
+      results[index] = { index, status: 'inserted', fact_id: result.id };
       // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
       // this claim's people[]/entities[] into entity stub pages + bidirectional
       // co-occurrence edges so traverse_graph / find_experts have a graph to
@@ -527,6 +565,7 @@ export async function runSaveFacts(
       if (entitySlug) touchedEntitySlugs.add(entitySlug);
     } else {
       duplicate += 1; // engine-level dedup (advisory-lock race) — count as duplicate
+      results[index] = { index, status: 'duplicate', fact_id: result.id };
     }
   }
 
@@ -561,7 +600,7 @@ export async function runSaveFacts(
     }
   }
 
-  return { inserted, duplicate, dropped, superseded, fact_ids, dedup_mode };
+  return { inserted, duplicate, dropped, superseded, fact_ids, results, dedup_mode };
 }
 
 function collectPersonSurfaceHints(claims: ValidClaim[]): string[] {

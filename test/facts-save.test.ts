@@ -34,6 +34,7 @@ const TEST_SOURCES = [
   'tenant-validate', 'tenant-atomic', 'tenant-x', 'tenant-y',
   'tenant-entity', 'tenant-rel', 'tenant-restricted', 'tenant-seed',
   'tenant-sup-insert', 'tenant-sup-dedup', 'tenant-sup-self', 'tenant-sup-e2e',
+  'tenant-results', 'tenant-results-sup', 'tenant-results-e2e',
 ];
 
 beforeAll(async () => {
@@ -847,6 +848,154 @@ describe('save_facts — B2 supersedes (correction on the customer plane)', () =
       .find(f => f.id === oldId);
     expect(superseded).toBeDefined();
     expect(superseded!.superseded_by).toBe(newId);
+  });
+});
+
+// B3 per-claim results: `results` is the index-aligned receipt — one entry per
+// INPUT claim, ordered by request position. It exists because `fact_ids` skips
+// dropped claims, so a positional zip against the request misattributes every
+// claim after the first drop. These tests prove the alignment holds exactly
+// where the old contract broke (dropped > 0) and that the drop reason
+// (category) is reported honestly while the value never leaks.
+describe('save_facts — B3 per-claim results (index-aligned receipt)', () => {
+  test('mixed batch with a drop stays index-aligned: inserted / dropped / duplicate', async () => {
+    const res = await runSaveFacts(
+      [
+        { claim: 'Rae uses a split keyboard', provenance: 'user_stated', people: ['Rae'] },
+        { claim: 'his ssn is 123-45-6789', provenance: 'user_stated' },
+        { claim: 'Rae uses a split keyboard', provenance: 'user_stated', people: ['Rae'] },
+      ],
+      { engine, sourceId: 'tenant-results' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.inserted).toBe(1);
+    expect(res.dropped).toBe(1);
+    expect(res.duplicate).toBe(1);
+
+    // Exactly one entry per INPUT claim, ordered by request index — including
+    // the dropped slot fact_ids has no entry for.
+    expect(res.results).toHaveLength(3);
+    expect(res.results.map(r => r.index)).toEqual([0, 1, 2]);
+    expect(res.results.map(r => r.status)).toEqual(['inserted', 'dropped', 'duplicate']);
+
+    // The duplicate points at the canonical row claim 0 inserted.
+    const first = res.results[0];
+    const third = res.results[2];
+    if (first.status === 'dropped' || third.status === 'dropped') throw new Error('unexpected drop');
+    expect(third.fact_id).toBe(first.fact_id);
+
+    // THE alignment fix: fact_ids[1] belongs to request index 2, not 1 — a
+    // positional zip would pin the duplicate on the SSN claim. results doesn't.
+    expect(res.fact_ids).toEqual([first.fact_id, third.fact_id]);
+
+    // The dropped entry carries the category ONLY — never the value, no fact_id.
+    const droppedEntry = res.results[1];
+    if (droppedEntry.status !== 'dropped') throw new Error('expected dropped');
+    expect(droppedEntry.category).toBe('ssn');
+    expect('fact_id' in droppedEntry).toBe(false);
+    expect(JSON.stringify(res.results)).not.toContain('123-45-6789');
+  });
+
+  test('each restricted category is reported honestly: payment_card / ssn / credential', async () => {
+    const res = await runSaveFacts(
+      [
+        { claim: 'card 4111 1111 1111 1111', provenance: 'user_stated' },
+        { claim: 'her ssn is 987-65-4321', provenance: 'user_stated' },
+        { claim: 'the key is sk-AbCd1234EfGh5678IjKl9012mnop', provenance: 'user_stated' },
+      ],
+      { engine, sourceId: 'tenant-results' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.dropped).toBe(3);
+    expect(res.fact_ids).toHaveLength(0);
+    expect(res.results).toHaveLength(3);
+    expect(res.results.map(r => (r.status === 'dropped' ? r.category : null))).toEqual([
+      'payment_card', 'ssn', 'credential',
+    ]);
+    const serialized = JSON.stringify(res.results);
+    expect(serialized).not.toContain('4111');
+    expect(serialized).not.toContain('987-65-4321');
+    expect(serialized).not.toContain('sk-AbCd');
+  });
+
+  test('clean batch: results always present and equal to a positional zip (dropped === 0 back-compat)', async () => {
+    const res = await runSaveFacts(
+      [
+        { claim: 'Nils moved to Lisbon in March', provenance: 'user_stated', people: ['Nils'] },
+        { claim: 'Nils is learning Portuguese', provenance: 'model_inferred', people: ['Nils'] },
+      ],
+      { engine, sourceId: 'tenant-results' },
+    );
+    if ('error' in res) throw new Error('unexpected validation error');
+    expect(res.inserted).toBe(2);
+    expect(res.results).toHaveLength(2);
+    for (let i = 0; i < res.results.length; i++) {
+      const r = res.results[i];
+      if (r.status === 'dropped') throw new Error('unexpected drop');
+      expect(r.index).toBe(i);
+      expect(r.status).toBe('inserted');
+      // The worker's interim dropped===0 positional contract stays valid.
+      expect(r.fact_id).toBe(res.fact_ids[i]);
+    }
+  });
+
+  test('B2 interplay: a superseding insert reports "inserted" (new row id); duplicate+supersedes reports "duplicate" (canonical id)', async () => {
+    const old = await runSaveFacts(
+      [{ claim: 'Vera works at Meridian Labs', provenance: 'user_stated', people: ['Vera'] }],
+      { engine, sourceId: 'tenant-results-sup' },
+    );
+    if ('error' in old) throw new Error('unexpected validation error');
+    const oldId = old.fact_ids[0];
+
+    // Insert path: correction text is new → atomic insert+expire, per-claim
+    // status 'inserted' carrying the NEW row's id.
+    const corr = await runSaveFacts(
+      [{ claim: 'Vera left Meridian Labs for Halcyon', provenance: 'user_stated', people: ['Vera'], supersedes: oldId }],
+      { engine, sourceId: 'tenant-results-sup' },
+    );
+    if ('error' in corr) throw new Error('unexpected validation error');
+    expect(corr.superseded).toBe(1);
+    const corrEntry = corr.results[0];
+    if (corrEntry.status === 'dropped') throw new Error('unexpected drop');
+    expect(corrEntry.status).toBe('inserted');
+    const newId = corrEntry.fact_id;
+    expect(newId).toBe(corr.fact_ids[0]);
+    expect(newId).not.toBe(oldId);
+
+    // Dedup path: re-send the correction text with supersedes → no new row;
+    // per-claim status 'duplicate' carrying the CANONICAL row's id.
+    const dup = await runSaveFacts(
+      [{ claim: 'Vera left Meridian Labs for Halcyon', provenance: 'user_stated', people: ['Vera'], supersedes: oldId }],
+      { engine, sourceId: 'tenant-results-sup' },
+    );
+    if ('error' in dup) throw new Error('unexpected validation error');
+    const dupEntry = dup.results[0];
+    if (dupEntry.status === 'dropped') throw new Error('unexpected drop');
+    expect(dupEntry.status).toBe('duplicate');
+    expect(dupEntry.fact_id).toBe(newId);
+  });
+
+  test('the MCP save_facts op surfaces `results` in its payload, aligned across a drop', async () => {
+    const r = await dispatchToolCall(
+      engine,
+      'save_facts',
+      {
+        claims: [
+          { claim: 'Iris hosts a Tuesday book club', provenance: 'user_stated', people: ['Iris'] },
+          { claim: 'card 5555 5555 5555 4444', provenance: 'user_stated' },
+        ],
+      },
+      { remote: true, sourceId: 'tenant-results-e2e' },
+    );
+    expect(r.isError).toBeFalsy();
+    const payload = JSON.parse(r.content[0].text);
+    expect(payload.inserted).toBe(1);
+    expect(payload.dropped).toBe(1);
+    expect(Array.isArray(payload.results)).toBe(true);
+    expect(payload.results).toHaveLength(2);
+    expect(payload.results[0]).toEqual({ index: 0, status: 'inserted', fact_id: payload.fact_ids[0] });
+    expect(payload.results[1]).toEqual({ index: 1, status: 'dropped', category: 'payment_card' });
+    expect(r.content[0].text).not.toContain('5555');
   });
 });
 
