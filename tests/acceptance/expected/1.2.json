@@ -1,0 +1,319 @@
+{
+  "save_a": {
+    "isError": false,
+    "payload": {
+      "inserted": 3,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        2,
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 2
+        },
+        {
+          "index": 2,
+          "status": "inserted",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "save_b": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        5
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 5
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "all": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 5,
+          "fact": "Ravi probably favors trail routes over road courses",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 4,
+          "fact": "Ravi mapped the old canal route for the club",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t4>"
+        },
+        {
+          "id": 3,
+          "fact": "Ravi likely tapers his mileage two weeks out",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t6>"
+        },
+        {
+          "id": 2,
+          "fact": "Ravi pulls a double espresso before every long run",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t7>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t8>"
+        },
+        {
+          "id": 1,
+          "fact": "Ravi trains for the Berlin marathon in October",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t9>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t10>"
+        }
+      ],
+      "total": 5
+    }
+  },
+  "grepped": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 5,
+          "fact": "Ravi probably favors trail routes over road courses",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t11>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t12>"
+        },
+        {
+          "id": 4,
+          "fact": "Ravi mapped the old canal route for the club",
+          "kind": "fact",
+          "entity_slug": "people/ravi",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t13>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t14>"
+        }
+      ],
+      "total": 2
+    }
+  },
+  "pages": [
+    {
+      "isError": false,
+      "payload": {
+        "facts": [
+          {
+            "id": 5,
+            "fact": "Ravi probably favors trail routes over road courses",
+            "kind": "fact",
+            "entity_slug": "people/ravi",
+            "visibility": "private",
+            "notability": "medium",
+            "valid_from": "<t15>",
+            "valid_until": null,
+            "expired_at": null,
+            "superseded_by": null,
+            "consolidated_at": null,
+            "consolidated_into": null,
+            "source": "mcp:save_facts",
+            "confidence": 0.7,
+            "provenance": "model_inferred",
+            "created_at": "<t16>"
+          },
+          {
+            "id": 4,
+            "fact": "Ravi mapped the old canal route for the club",
+            "kind": "fact",
+            "entity_slug": "people/ravi",
+            "visibility": "world",
+            "notability": "medium",
+            "valid_from": "<t17>",
+            "valid_until": null,
+            "expired_at": null,
+            "superseded_by": null,
+            "consolidated_at": null,
+            "consolidated_into": null,
+            "source": "mcp:extract_facts",
+            "confidence": 1,
+            "provenance": null,
+            "created_at": "<t18>"
+          }
+        ],
+        "total": 2
+      }
+    },
+    {
+      "isError": false,
+      "payload": {
+        "facts": [
+          {
+            "id": 3,
+            "fact": "Ravi likely tapers his mileage two weeks out",
+            "kind": "fact",
+            "entity_slug": "people/ravi",
+            "visibility": "private",
+            "notability": "medium",
+            "valid_from": "<t19>",
+            "valid_until": null,
+            "expired_at": null,
+            "superseded_by": null,
+            "consolidated_at": null,
+            "consolidated_into": null,
+            "source": "mcp:save_facts",
+            "confidence": 0.7,
+            "provenance": "model_inferred",
+            "created_at": "<t20>"
+          },
+          {
+            "id": 2,
+            "fact": "Ravi pulls a double espresso before every long run",
+            "kind": "fact",
+            "entity_slug": "people/ravi",
+            "visibility": "private",
+            "notability": "medium",
+            "valid_from": "<t21>",
+            "valid_until": null,
+            "expired_at": null,
+            "superseded_by": null,
+            "consolidated_at": null,
+            "consolidated_into": null,
+            "source": "mcp:save_facts",
+            "confidence": 1,
+            "provenance": "user_stated",
+            "created_at": "<t22>"
+          }
+        ],
+        "total": 2
+      }
+    },
+    {
+      "isError": false,
+      "payload": {
+        "facts": [
+          {
+            "id": 1,
+            "fact": "Ravi trains for the Berlin marathon in October",
+            "kind": "fact",
+            "entity_slug": "people/ravi",
+            "visibility": "private",
+            "notability": "medium",
+            "valid_from": "<t23>",
+            "valid_until": null,
+            "expired_at": null,
+            "superseded_by": null,
+            "consolidated_at": null,
+            "consolidated_into": null,
+            "source": "mcp:save_facts",
+            "confidence": 1,
+            "provenance": "user_stated",
+            "created_at": "<t24>"
+          }
+        ],
+        "total": 1
+      }
+    },
+    {
+      "isError": false,
+      "payload": {
+        "facts": [],
+        "total": 0
+      }
+    }
+  ]
+}

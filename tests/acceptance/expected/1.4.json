@@ -1,0 +1,68 @@
+{
+  "seeded_id": 1,
+  "stored_provenance": "extractor_v2",
+  "save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Tomasz is renovating a canal barge in Utrecht",
+          "kind": "fact",
+          "entity_slug": "people/tomasz",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        },
+        {
+          "id": 1,
+          "fact": "Tomasz archives shortwave radio broadcasts",
+          "kind": "fact",
+          "entity_slug": "people/tomasz",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t4>"
+        }
+      ],
+      "total": 2
+    }
+  }
+}

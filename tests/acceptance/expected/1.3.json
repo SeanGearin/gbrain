@@ -1,0 +1,238 @@
+{
+  "save1": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "save2": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        4
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 4
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "entity": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 5,
+          "fact": "Marisol chairs the neighborhood garden committee",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t2>"
+        },
+        {
+          "id": 4,
+          "fact": "Marisol presumably prefers autumn hiking trips",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t4>"
+        },
+        {
+          "id": 3,
+          "fact": "Marisol repairs vintage film cameras on weekends",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t6>"
+        },
+        {
+          "id": 2,
+          "fact": "Marisol is training to become a licensed arborist",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t7>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t8>"
+        },
+        {
+          "id": 1,
+          "fact": "Marisol keeps a sourdough starter named Bruno",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t9>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t10>"
+        }
+      ],
+      "total": 5
+    }
+  },
+  "control": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 5,
+          "fact": "Marisol chairs the neighborhood garden committee",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t11>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t12>"
+        },
+        {
+          "id": 4,
+          "fact": "Marisol presumably prefers autumn hiking trips",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t13>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t14>"
+        },
+        {
+          "id": 3,
+          "fact": "Marisol repairs vintage film cameras on weekends",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t15>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t16>"
+        },
+        {
+          "id": 2,
+          "fact": "Marisol is training to become a licensed arborist",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t17>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t18>"
+        },
+        {
+          "id": 1,
+          "fact": "Marisol keeps a sourdough starter named Bruno",
+          "kind": "fact",
+          "entity_slug": "people/marisol",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t19>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t20>"
+        }
+      ],
+      "total": 5
+    }
+  }
+}
