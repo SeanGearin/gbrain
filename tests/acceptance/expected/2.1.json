@@ -1,0 +1,195 @@
+{
+  "ids": {
+    "initechId": 1,
+    "hooliId": 2,
+    "deskId": 3
+  },
+  "plain_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "insert_path_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "second_plain_save": {
+    "isError": false,
+    "payload": {
+      "inserted": 1,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        3
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 3
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "dedup_path_correction": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 1,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "self_supersession_attempt": {
+    "isError": false,
+    "payload": {
+      "inserted": 0,
+      "duplicate": 1,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "duplicate",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall_default": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 2,
+          "fact": "Priya moved to Hooli as of this spring",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t2>"
+        }
+      ],
+      "total": 1
+    }
+  },
+  "recall_history": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 3,
+          "fact": "Priya keeps a standing desk in the office",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": "<t4>",
+          "superseded_by": 2,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t5>"
+        },
+        {
+          "id": 2,
+          "fact": "Priya moved to Hooli as of this spring",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t6>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t7>"
+        },
+        {
+          "id": 1,
+          "fact": "Priya works at Initech",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t8>",
+          "valid_until": null,
+          "expired_at": "<t9>",
+          "superseded_by": 2,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t10>"
+        }
+      ],
+      "total": 3
+    }
+  }
+}

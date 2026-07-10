@@ -1,0 +1,90 @@
+{
+  "save": {
+    "isError": false,
+    "payload": {
+      "inserted": 2,
+      "duplicate": 0,
+      "dropped": 0,
+      "superseded": 0,
+      "fact_ids": [
+        1,
+        2
+      ],
+      "results": [
+        {
+          "index": 0,
+          "status": "inserted",
+          "fact_id": 1
+        },
+        {
+          "index": 1,
+          "status": "inserted",
+          "fact_id": 2
+        }
+      ],
+      "dedup_mode": "trgm"
+    }
+  },
+  "recall": {
+    "isError": false,
+    "payload": {
+      "facts": [
+        {
+          "id": 3,
+          "fact": "Priya joined the hiking club",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "world",
+          "notability": "medium",
+          "valid_from": "<t1>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:extract_facts",
+          "confidence": 1,
+          "provenance": null,
+          "created_at": "<t2>"
+        },
+        {
+          "id": 2,
+          "fact": "Priya probably prefers morning meetings",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t3>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 0.7,
+          "provenance": "model_inferred",
+          "created_at": "<t4>"
+        },
+        {
+          "id": 1,
+          "fact": "Priya is allergic to penicillin",
+          "kind": "fact",
+          "entity_slug": "people/priya",
+          "visibility": "private",
+          "notability": "medium",
+          "valid_from": "<t5>",
+          "valid_until": null,
+          "expired_at": null,
+          "superseded_by": null,
+          "consolidated_at": null,
+          "consolidated_into": null,
+          "source": "mcp:save_facts",
+          "confidence": 1,
+          "provenance": "user_stated",
+          "created_at": "<t6>"
+        }
+      ],
+      "total": 3
+    }
+  }
+}
