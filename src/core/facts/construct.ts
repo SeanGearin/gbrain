@@ -443,6 +443,17 @@ function isConstructOwnedPage(page: Page): boolean {
  * - chunk embedding is best-effort via `opts.embedChunks` — on omission/failure
  *   chunks land NULL-embedded (keyword-searchable at once; `embed --stale` fills
  *   the vector arm later), so an embed hiccup never breaks the save.
+ * - every rewrite snapshots the page's PRE-update state (createVersion), the
+ *   same contract as the put_page op (import-file.ts versions-on-existing).
+ *   As-of reconstruction (worker pro-time-travel `open_note_as_of`) reads the
+ *   version chain as "a snapshot at T holds the content that stood until T";
+ *   before this, the materialize was a NON-versioning rewrite, so every
+ *   save_facts batch moved updated_at with no snapshot and permanently
+ *   poisoned time-travel for exactly the pages save_facts keeps current.
+ *   Pages already rewritten versionlessly can't be back-filled (the pre-state
+ *   is gone) — the first post-fix rewrite banks whatever stands now, so the
+ *   chain is whole from that point forward and the older gap stays honestly
+ *   disclosed by the reader (updated_at moved, no covering snapshot).
  */
 export async function materializeEntityPages(
   engine: BrainEngine,
@@ -499,6 +510,15 @@ export async function materializeEntityPages(
   // Phase 3 — write each rebuilt page + its chunks.
   let chunksWritten = 0;
   for (const { slug, page, chunks } of pending) {
+    // Snapshot the PRE-update state first — the put_page op's version contract
+    // (a version row at T = the content that stood until T), which as-of
+    // reconstruction depends on. Plain INSERT..SELECT; gbrain_tenant holds
+    // page_versions DML + sequence USAGE (b7-role.sql), and the row satisfies
+    // the b7 WITH CHECK because the feeding SELECT is already source-scoped.
+    // Phase 1 guarantees the page exists (it was read in this same tx) and
+    // only body-changed pages reach here, so this can neither throw the
+    // page-not-found error nor mint a version for a no-op rewrite.
+    await engine.createVersion(slug, { sourceId });
     await engine.putPage( // gbrain-allow-direct-insert: deterministic save_facts materialize — entity body rebuilt from its own active facts; low-level upsert, NOT the put_page op (no FLAG-C post-write hooks on the tenant plane)
       slug,
       {
