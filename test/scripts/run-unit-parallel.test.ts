@@ -69,11 +69,14 @@ afterAll(() => {
   if (TMPROOT) rmSync(TMPROOT, { recursive: true, force: true });
 });
 
-function runWrapper(extraArgs: string[] = []): { code: number; stdout: string; stderr: string } {
+function runWrapper(
+  extraArgs: string[] = [],
+  extraEnv: Record<string, string> = {},
+): { code: number; stdout: string; stderr: string } {
   const result = spawnSync(
     'bash',
     [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2', ...extraArgs],
-    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env } },
+    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env, ...extraEnv } },
   );
   return {
     code: result.status ?? -1,
@@ -152,5 +155,48 @@ describe('failing-on-purpose', () => {
     // Format: `shard 1/2: pass=N fail=N skip=N rc=N`
     expect(summary).toMatch(/shard 1\/2: pass=\d+ fail=\d+ skip=\d+ rc=\d+/);
     expect(summary).toMatch(/shard 2\/2: pass=\d+ fail=\d+ skip=\d+ rc=\d+/);
+  });
+});
+
+describe('run-unit-parallel.sh no-timeout-binary fallback (watchdog rc capture)', () => {
+  // Regression pin for the fallback branch (stock macOS: no `timeout` or
+  // `gtimeout`). It used to read rc AFTER killing + reaping the sleep-cap
+  // watchdog, so every shard recorded the watchdog's SIGTERM status (143)
+  // and a fully green run still exited non-zero (verify observed fail=30
+  // on all-OK logs). GBRAIN_FORCE_TIMEOUT_FALLBACK=1 forces the branch on
+  // machines that DO have a timeout binary (CI), so this stays covered
+  // everywhere. Short shard cap keeps any orphaned watchdog sleep brief.
+  const FORCE_FALLBACK = {
+    GBRAIN_FORCE_TIMEOUT_FALLBACK: '1',
+    GBRAIN_TEST_SHARD_TIMEOUT: '30',
+  };
+
+  it('records the real shard rc (not the watchdog 143) and exits 0 on all-pass', () => {
+    rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
+    try {
+      const r = runWrapper([], FORCE_FALLBACK);
+      expect(r.code).toBe(0);
+      const summary = readFileSync(join(TMPROOT, '.context', 'test-summary.txt'), 'utf-8');
+      expect(summary).toMatch(/shard 1\/2: pass=\d+ fail=0 skip=0 rc=0/);
+      expect(summary).toMatch(/shard 2\/2: pass=\d+ fail=0 skip=0 rc=0/);
+      expect(summary).not.toContain('rc=143');
+    } finally {
+      const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+      writeFileSync(join(TMPROOT, 'test', 'd-fail.test.ts'), failing);
+    }
+  });
+
+  it('still propagates a real failure as non-zero exit under the fallback', () => {
+    const r = runWrapper([], FORCE_FALLBACK);
+    expect(r.code).not.toBe(0);
+    const summary = readFileSync(join(TMPROOT, '.context', 'test-summary.txt'), 'utf-8');
+    // The failing shard must surface bun's own exit code, never the watchdog's.
+    expect(summary).not.toContain('rc=143');
+    const failureLog = readFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'utf-8');
+    expect(failureLog).toMatch(/--- shard \d+:/);
+    expect(failureLog).toContain('failing-on-purpose');
   });
 });

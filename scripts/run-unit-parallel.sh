@@ -15,6 +15,7 @@
 #   SHARDS=N                     same as --shards
 #   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 600)
 #   GBRAIN_TEST_MAX_CONCURRENCY  passed through to bun test (default 4)
+#   GBRAIN_FORCE_TIMEOUT_FALLBACK=1   test-only: force the no-timeout-binary path
 #
 # Output files (workspace-local; falls back to /tmp if .context/ unwritable):
 #   .context/test-failures.log   failure blocks (cleared at start)
@@ -102,10 +103,14 @@ rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged 2
 # ──────────────────────────────────────────────────────────────────────────
 # Resolve `timeout` command. macOS without coreutils has neither; we degrade
 # to bg-pid + sleep cap. For now, prefer gtimeout (brew coreutils) → timeout.
+# GBRAIN_FORCE_TIMEOUT_FALLBACK=1 (tests only) skips binary resolution so the
+# fallback branch stays exercised on machines that do have a timeout binary.
 # ──────────────────────────────────────────────────────────────────────────
 TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+if [ "${GBRAIN_FORCE_TIMEOUT_FALLBACK:-0}" != "1" ]; then
+  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
+  elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+  fi
 fi
 
 START_TS=$(date +%s)
@@ -133,6 +138,7 @@ for i in $(seq 1 "$N"); do
         env SHARD="$i/$N" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
+      rc=$?
     else
       env SHARD="$i/$N" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
@@ -142,10 +148,14 @@ for i in $(seq 1 "$N"); do
         sleep 5 && kill -KILL "$pid" 2>/dev/null ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
+      rc=$?  # read BEFORE reaping the watchdog — its kill status (143) would mask the shard's rc
+      # Children first, then the watchdog shell: a TERM'd shell doesn't
+      # forward the signal to an in-flight `sleep`, which would linger as
+      # an orphan that CI's end-of-job cleanup reports as a failure.
+      pkill -P "$cap_pid" 2>/dev/null
       kill "$cap_pid" 2>/dev/null
       wait "$cap_pid" 2>/dev/null
     fi
-    rc=$?
     echo "$rc" > "$LOG_DIR/shard-$i.exit"
     [ "$rc" = "124" ] && echo "WEDGED" > "$LOG_DIR/shard-$i.wedged"
   ) &

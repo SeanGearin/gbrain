@@ -15,11 +15,12 @@
 
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 const SCRIPT = "scripts/run-verify-parallel.sh";
+const SCRIPT_ABS = resolve(import.meta.dir, "..", "..", SCRIPT);
 
 describe("run-verify-parallel.sh — CLI contract", () => {
   it("--dry-list emits one line per check, exit 0", () => {
@@ -170,6 +171,78 @@ exit 0
       expect(r.stderr).toMatch(/Failed:\s+beta\s+gamma/);
     } finally {
       cleanup(d);
+    }
+  });
+});
+
+describe("run-verify-parallel.sh — no-timeout-binary fallback (real script, tiny CHECKS)", () => {
+  // Regression pin for the fallback branch (stock macOS: no `timeout` or
+  // `gtimeout`). It used to read rc AFTER killing + reaping the sleep-cap
+  // watchdog, so every check recorded the watchdog's SIGTERM status (143)
+  // and a fully green tree reported pass=0 fail=<all>. Unlike the synthetic
+  // dispatcher above, this runs the REAL script: we copy it into a
+  // repo-shaped tempdir and rewrite only its static CHECKS array to a
+  // couple of trivial bun scripts. GBRAIN_FORCE_TIMEOUT_FALLBACK=1 forces
+  // the fallback branch on machines that DO have a timeout binary (CI).
+
+  function writeHarness(checks: string[], pkgScripts: Record<string, string>): string {
+    const dir = mkdtempSync(join(tmpdir(), "verify-fallback-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const src = readFileSync(SCRIPT_ABS, "utf8");
+    const arr = checks.map((c) => `  "${c}"`).join("\n");
+    const patched = src.replace(/CHECKS=\([\s\S]*?\n\)/, `CHECKS=(\n${arr}\n)`);
+    if (patched === src) throw new Error("CHECKS array rewrite did not match — script shape changed?");
+    writeFileSync(join(dir, "scripts", "run-verify-parallel.sh"), patched, { mode: 0o755 });
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "verify-fallback-fixture", version: "0.0.0", scripts: pkgScripts }, null, 2),
+    );
+    return dir;
+  }
+
+  function runHarness(dir: string, env: Record<string, string>) {
+    return spawnSync("bash", [join(dir, "scripts", "run-verify-parallel.sh")], {
+      encoding: "utf8",
+      cwd: dir,
+      // Short cap so a wedged fixture (or an orphaned watchdog sleep on the
+      // kill race) resolves well inside the test timeout.
+      env: { ...process.env, GBRAIN_VERIFY_TIMEOUT: "30", ...env },
+    });
+  }
+
+  it("all-green: exit 0 with real per-check rc, not the watchdog's 143", () => {
+    const dir = writeHarness(["ok:one", "ok:two"], { "ok:one": "exit 0", "ok:two": "exit 0" });
+    try {
+      const r = runHarness(dir, { GBRAIN_FORCE_TIMEOUT_FALLBACK: "1" });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain("pass=2 fail=0");
+      expect(r.stderr).not.toContain("rc=143");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("failing check surfaces its own rc (7), never the watchdog status", () => {
+    const dir = writeHarness(["ok:one", "bad:one"], { "ok:one": "exit 0", "bad:one": "exit 7" });
+    try {
+      const r = runHarness(dir, { GBRAIN_FORCE_TIMEOUT_FALLBACK: "1" });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain("Failed: bad:one");
+      expect(r.stderr).toMatch(/--- bad:one \(rc=7\) ---/);
+      expect(r.stderr).not.toContain("rc=143");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("default binary resolution also propagates rc (timeout-bin branch where present)", () => {
+    const dir = writeHarness(["ok:one", "ok:two"], { "ok:one": "exit 0", "ok:two": "exit 0" });
+    try {
+      const r = runHarness(dir, {});
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain("pass=2 fail=0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -15,6 +15,7 @@
 # Env overrides:
 #   GBRAIN_VERIFY_TIMEOUT       per-check wallclock cap, seconds (default 120)
 #   GBRAIN_VERIFY_LOG_DIR       where to write per-check logs (default tempdir)
+#   GBRAIN_FORCE_TIMEOUT_FALLBACK=1   test-only: force the no-timeout-binary path
 #
 # Exit codes:
 #   0   all checks passed
@@ -99,9 +100,13 @@ fi
 # Resolve `timeout` for per-check wallclock cap. macOS doesn't ship one;
 # brew coreutils provides `gtimeout`. If neither is available, fall back to
 # bg-pid + sleep-cap (slightly less reliable but still bounded).
+# GBRAIN_FORCE_TIMEOUT_FALLBACK=1 (tests only) skips binary resolution so the
+# fallback branch stays exercised on machines that do have a timeout binary.
 TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+if [ "${GBRAIN_FORCE_TIMEOUT_FALLBACK:-0}" != "1" ]; then
+  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
+  elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+  fi
 fi
 
 START_TS=$(date +%s)
@@ -125,6 +130,7 @@ for c in "${CHECKS[@]}"; do
   (
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" "${TIMEOUT}s" bun run "$c" > "$LOG_FILE" 2>&1
+      rc=$?
     else
       bun run "$c" > "$LOG_FILE" 2>&1 &
       pid=$!
@@ -132,10 +138,14 @@ for c in "${CHECKS[@]}"; do
         sleep 5 && kill -KILL "$pid" 2>/dev/null ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
+      rc=$?  # read BEFORE reaping the watchdog — its kill status (143) would mask the check's rc
+      # Children first, then the watchdog shell: a TERM'd shell doesn't
+      # forward the signal to an in-flight `sleep`, which would linger as
+      # an orphan that CI's end-of-job cleanup reports as a failure.
+      pkill -P "$cap_pid" 2>/dev/null
       kill "$cap_pid" 2>/dev/null
       wait "$cap_pid" 2>/dev/null
     fi
-    rc=$?
     echo "$rc" > "$EXIT_FILE"
   ) &
   PIDS+=($!)
