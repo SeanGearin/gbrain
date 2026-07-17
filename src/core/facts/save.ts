@@ -614,18 +614,36 @@ export async function runSaveFacts(
       : undefined;
     const embeddingSignature = embeddingsOn ? currentEmbeddingSignature() : null;
     // Best-effort: materialization is the DERIVED layer — the facts (+ graph)
-    // are the primary value and are already inserted. On the auto-commit
-    // (operator/CLI) plane a materialize failure must NOT discard the saved
-    // facts, so swallow + log and return the tally. (On the tenant withSourceScope
-    // tx the embed network call is already caught inside materializeEntityPages
-    // and the remaining ops are plain SQL; this catch is the outer backstop.)
+    // are the primary value. A materialize failure must NOT discard them on
+    // EITHER plane, so the rebuild runs inside engine.transaction(), the
+    // engine's plane-aware nesting primitive (postgres-engine.ts): a real
+    // transaction at top level (operator/CLI auto-commit plane, where the
+    // facts are already durably committed), a SAVEPOINT when already inside
+    // the tenant withSourceScope dispatch tx. Either way a SQL error rolls
+    // back ONLY the materialize writes and leaves the surrounding state
+    // healthy, so the catch below can swallow honestly on both planes.
+    //
+    // FS-2 (engine audit 2026-07-17): before this guard, a materialize SQL
+    // error on the tenant plane aborted the WHOLE dispatch tx (25P02). The
+    // swallow let this function return its success tally, but postgres.js's
+    // begin-scope error backstop (uncaughtError, postgres@3.4.9) re-threw the
+    // swallowed query error after the op resolved — the caller received a
+    // failure AND every fact in the batch was rolled back: a derived-layer
+    // rebuild hiccup silently destroyed the batch's primary writes while this
+    // log line claimed "facts saved". (On a driver without that backstop the
+    // same shape fabricates a success receipt for rows that no longer exist.)
+    // The savepoint contains the failure: the facts (+ graph stubs) commit,
+    // the receipt is true, and a later save/cycle re-materializes — the
+    // facts→body compile is idempotent over the fact set.
     try {
-      await materializeEntityPages(ctx.engine, ctx.sourceId, touchedEntitySlugs, {
-        embedChunks,
-        embeddingSignature,
-      });
+      await ctx.engine.transaction((txEngine) =>
+        materializeEntityPages(txEngine, ctx.sourceId, touchedEntitySlugs, {
+          embedChunks,
+          embeddingSignature,
+        }),
+      );
     } catch (err) {
-      console.error(`[save_facts] materialize skipped (facts saved): ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`[save_facts] materialize skipped, facts saved (materialize writes rolled back to their own savepoint/tx): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
