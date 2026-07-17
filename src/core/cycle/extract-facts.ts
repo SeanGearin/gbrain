@@ -118,7 +118,7 @@ export async function runExtractFacts(
   // first.
   //
   // v0.42.24 carve-out: B7 `save_facts` rows (client_authored = TRUE,
-  // migration v93) are entity-slugged but deliberately fence-less —
+  // migration v93/v114) are entity-slugged but deliberately fence-less —
   // they are NOT v0.31 legacy rows pending backfill. Without the
   // carve-out, ONE save_facts claim with a resolvable subject
   // permanently tripped this guard and froze fence reconciliation for
@@ -126,15 +126,26 @@ export async function runExtractFacts(
   // meant fence forgets/supersessions could never re-derive their
   // expiry state. Pre-v93 schemas lack the column; fall back to the
   // original predicate.
+  //
+  // C2 carve-out: dead rows (expired_at/superseded_by set) are likewise
+  // NOT pending backfill — the v0_32_2 phase-B sweep permanently skips
+  // them (fencing them un-struck resurrected them ACTIVE at the next
+  // reconcile). Counting them here would freeze reconciliation forever
+  // on any brain with a dead legacy row, the B7-freeze class in a new
+  // coat. Both columns are born with the facts table (v45), so they
+  // are safe to reference in the pre-v93 fallback too.
   let legacy: Array<{ n: string }>;
   try {
     legacy = await engine.executeRaw<{ n: string }>(
       `SELECT COUNT(*) AS n FROM facts
-        WHERE row_num IS NULL AND entity_slug IS NOT NULL AND client_authored = FALSE`,
+        WHERE row_num IS NULL AND entity_slug IS NOT NULL AND client_authored = FALSE
+          AND expired_at IS NULL AND superseded_by IS NULL`,
     );
   } catch {
     legacy = await engine.executeRaw<{ n: string }>(
-      `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
+      `SELECT COUNT(*) AS n FROM facts
+        WHERE row_num IS NULL AND entity_slug IS NOT NULL
+          AND expired_at IS NULL AND superseded_by IS NULL`,
     );
   }
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);

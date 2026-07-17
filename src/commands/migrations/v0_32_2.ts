@@ -26,6 +26,29 @@
  * fence onto). They're skipped with a warning; the operator decides
  * whether to hand-curate or delete them. Their row_num stays NULL
  * forever; they live in the legacy keyspace permanently.
+ *
+ * C2: two further row classes are permanently excluded from the sweep
+ * (see sweepEligiblePredicate):
+ *
+ *   Dead rows (`expired_at`/`superseded_by` set). Rendering them onto
+ *   a fence UN-struck resurrects them ACTIVE at the next reconcile —
+ *   destroying supersession chains and falsifying the db_only
+ *   durable:true contract of `supersedeFactDurably`. They are SKIPPED,
+ *   not struck: striking would move them into fence custody, where the
+ *   next reconcile re-mints their ids and re-derives their expiry at
+ *   day precision — silently rewriting history the DB already records
+ *   exactly. Skipped dead rows keep row_num NULL forever, the same
+ *   permanent-legacy keyspace as NULL-entity_slug rows; the
+ *   extract-facts guard carves them out of its "pending backfill"
+ *   count for the same reason.
+ *
+ *   client_authored rows. Deliberately fence-less by design (the
+ *   save_facts contract: stable ids, never re-minted by reconcile).
+ *   Sweeping them converts them to fence-backed and invalidates every
+ *   fact id the client holds. The column only exists from schema
+ *   v93/v114 while phase A floors at v51, so its absence is a
+ *   supported state — probed per run. expired_at/superseded_by are
+ *   born with the facts table itself (v45), always present at floor.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
@@ -128,6 +151,55 @@ interface PhaseBOutcome {
   failed_pages: string[];
 }
 
+// ── C2: sweep eligibility — ONE predicate for preview and write ──
+//
+// The dry-run count and the write-path SELECT both build from this
+// fragment. If they ever diverge, `--dry-run` reports work the real
+// run won't perform (the lying-count class). Column availability:
+// expired_at/superseded_by are born with the facts table (schema v45,
+// below the v51 phase-A floor — always present); client_authored only
+// exists from v93/v114, so it is probed per run and omitted on older
+// schemas (where no save_facts rows can exist).
+
+const LIVE_ROW_PREDICATE = `expired_at IS NULL AND superseded_by IS NULL`;
+const DEAD_ROW_PREDICATE = `(expired_at IS NOT NULL OR superseded_by IS NOT NULL)`;
+
+function sweepEligiblePredicate(hasClientAuthored: boolean): string {
+  return `row_num IS NULL AND ${LIVE_ROW_PREDICATE}` +
+    (hasClientAuthored ? ` AND client_authored = FALSE` : '');
+}
+
+async function factsHasClientAuthored(engine: BrainEngine): Promise<boolean> {
+  try {
+    const rows = await engine.executeRaw<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'facts' AND column_name = 'client_authored'`,
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function countSweepExclusions(
+  engine: BrainEngine,
+  hasClientAuthored: boolean,
+): Promise<{ dead: number; client: number }> {
+  const deadRows = await engine.executeRaw<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND ${DEAD_ROW_PREDICATE}`,
+  );
+  const dead = parseInt(deadRows[0]?.n ?? '0', 10);
+  let client = 0;
+  if (hasClientAuthored) {
+    const clientRows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM facts
+        WHERE row_num IS NULL AND ${LIVE_ROW_PREDICATE} AND client_authored = TRUE`,
+    );
+    client = parseInt(clientRows[0]?.n ?? '0', 10);
+  }
+  return { dead, client };
+}
+
 /**
  * Dirty-tree refusal: mirror src/core/dry-fix.ts behavior. Refuses to
  * write if any source's local_path has uncommitted changes. Dry-run
@@ -154,21 +226,38 @@ async function phaseBFenceFacts(
 ): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) {
     // Dry-run: report what WOULD happen without touching FS or DB.
+    // Counts derive from the SAME predicate as the write path below —
+    // the preview number must equal what `--write` performs.
     if (!engine) return { name: 'fence_facts', status: 'skipped', detail: 'no_brain_configured' };
     try {
+      const hasClientAuthored = await factsHasClientAuthored(engine);
+      const pred = sweepEligiblePredicate(hasClientAuthored);
       const counts = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL`,
+        `SELECT COUNT(*) AS n FROM facts WHERE ${pred}`,
       );
       const total = parseInt(counts[0]?.n ?? '0', 10);
       const noEntity = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NULL`,
+        `SELECT COUNT(*) AS n FROM facts WHERE ${pred} AND entity_slug IS NULL`,
       );
       const noEntityCount = parseInt(noEntity[0]?.n ?? '0', 10);
-      return {
-        name: 'fence_facts',
-        status: 'skipped',
-        detail: `dry-run: would fence ${total - noEntityCount} rows; ${noEntityCount} unfenceable (NULL entity_slug)`,
-      };
+      const noLocal = await engine.executeRaw<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM facts f
+          LEFT JOIN sources s ON s.id = f.source_id
+         WHERE ${pred} AND f.entity_slug IS NOT NULL AND s.local_path IS NULL`,
+      );
+      const noLocalCount = parseInt(noLocal[0]?.n ?? '0', 10);
+      const excluded = await countSweepExclusions(engine, hasClientAuthored);
+
+      let detail = `dry-run: would fence ${total - noEntityCount - noLocalCount} rows; ` +
+        `${noEntityCount} unfenceable (NULL entity_slug)`;
+      if (noLocalCount > 0) {
+        detail += `; ${noLocalCount} skipped (source has no local_path)`;
+      }
+      if (excluded.dead > 0 || excluded.client > 0) {
+        detail += `; excluded from sweep: ${excluded.dead} expired/superseded, ` +
+          `${excluded.client} client-authored`;
+      }
+      return { name: 'fence_facts', status: 'skipped', detail };
     } catch (e) {
       return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
     }
@@ -198,12 +287,13 @@ async function phaseBFenceFacts(
     }
 
     // Walk legacy rows in (source_id, entity_slug) groups for per-page
-    // atomic writes.
+    // atomic writes. Same predicate as the dry-run preview above.
+    const hasClientAuthored = await factsHasClientAuthored(engine);
     const legacy = await engine.executeRaw<LegacyFactRow>(
       `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
               context, valid_from, valid_until, source, confidence
          FROM facts
-        WHERE row_num IS NULL
+        WHERE ${sweepEligiblePredicate(hasClientAuthored)}
         ORDER BY source_id, entity_slug, id`,
     );
 
@@ -332,9 +422,11 @@ async function phaseBFenceFacts(
       }
     }
 
+    const excluded = await countSweepExclusions(engine, hasClientAuthored);
     const detail = `scanned=${outcome.scanned} fenced=${outcome.fenced} ` +
       `pages=${outcome.pages_touched} skipped_no_entity=${outcome.skipped_no_entity} ` +
-      `skipped_no_local_path=${outcome.skipped_no_local_path}` +
+      `skipped_no_local_path=${outcome.skipped_no_local_path} ` +
+      `excluded_dead=${excluded.dead} excluded_client=${excluded.client}` +
       (outcome.failed_pages.length > 0 ? ` failed=${outcome.failed_pages.length}` : '');
 
     if (outcome.failed_pages.length > 0) {
