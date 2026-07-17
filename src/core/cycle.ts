@@ -1247,13 +1247,17 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       status: 'ok',
       duration_ms: 0,
       summary:
-        `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), ` +
+        `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s) ` +
+        `(${purgedPages.versionRowsDestroyed} version row(s) destroyed with them), ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `and ${purgedBatchRetryAuditFiles} stale batch-retry audit file(s)`,
       details: {
         purged_sources_count: purgedSources.length,
         purged_pages_count: purgedPages.count,
+        // VT-1 (engine audit 2026-07-17): the purge is where version history
+        // genuinely dies (page_versions ON DELETE CASCADE) — disclose it.
+        purged_version_rows_count: purgedPages.versionRowsDestroyed,
         purged_orphan_clones_count: purgedClones.count,
         purged_orphan_clone_names: purgedClones.names,
         purged_sources: purgedSources,

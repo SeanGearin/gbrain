@@ -755,6 +755,16 @@ export interface BrainEngine {
    * is included in the INSERT column list so ON CONFLICT (source_id, slug)
    * DO UPDATE actually targets the intended row instead of fabricating a
    * duplicate at (default, slug). Multi-source brains MUST pass sourceId.
+   *
+   * VT-6 (engine audit 2026-07-17) — VERSIONING IS AN ENGINE PROPERTY:
+   * when the write overwrites an existing row (soft-deleted or live) and
+   * the incoming compiled_truth/frontmatter differ from what stands, the
+   * pre-update state is snapshotted into page_versions atomically within
+   * the same statement. Callers MUST NOT pair putPage with their own
+   * createVersion — that mints duplicate snapshots. No-op rewrites and
+   * title/type-only changes mint nothing (snapshots capture only
+   * compiled_truth + frontmatter), so the chain stays 1:1 with real
+   * content changes.
    */
   putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page>;
   /**
@@ -788,25 +798,23 @@ export interface BrainEngine {
   ): Promise<{ slug: string; id: number } | null>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
-   * chunk_relations via existing FK ON DELETE CASCADE.
+   * chunk_relations — AND page_versions — via FK ON DELETE CASCADE.
+   *
+   * ⚠ VT-1 (engine audit 2026-07-17): a hard delete DESTROYS THE PAGE'S
+   * ENTIRE VERSION HISTORY (page_versions is FK-keyed to pages.id with
+   * ON DELETE CASCADE). Any as-of reconstruction for any T while the page
+   * existed becomes impossible. `gbrain sync` no longer calls this — repo-
+   * driven deletes are SOFT deletes (softDeletePage/softDeletePages) so
+   * history survives until the disclosed purge TTL. Hard delete is reserved
+   * for `purgeDeletedPages` (which counts + logs the destruction) and for
+   * callers that explicitly intend total destruction (test teardown).
    *
    * v0.26.5: this is no longer the public-facing `delete_page` op handler —
-   * the op now soft-deletes via `softDeletePage` instead. `deletePage` stays
-   * as the underlying primitive used by `purgeDeletedPages` and by callers
-   * that explicitly want hard-delete semantics (e.g. test setup teardown).
-   */
-  /**
+   * the op soft-deletes via `softDeletePage` instead.
+   *
    * v0.18.0+ multi-source: `opts.sourceId` scopes the DELETE so a source-A
    * delete doesn't hard-delete the same-slug pages in sources B/C/D. Without
    * it, the bare DELETE matches every row with that slug across all sources.
-   * Cascades through content_chunks / page_links / chunk_relations via FKs.
-   *
-   * v0.41.19.0 (CDX-11): single-row primitive used by `purgeDeletedPages`,
-   * `gbrain sync` (one path per call), test setup teardown, and the v0.41.19.0
-   * sync-delete decompose path (when `deletePages` throws on a 500-row batch,
-   * the sync loop falls back to per-slug `deletePage` to log unrecoverable
-   * failures to `failedFiles`). `gbrain sync` calls this on EVERY run that
-   * sees a deleted file — it is NOT admin-only.
    */
   deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
   /**
@@ -838,6 +846,10 @@ export interface BrainEngine {
    * `deletePage` (which keeps the optional/'default' fallback for back-
    * compat). Filed as v0.42+ TODO to tighten `deletePage` to match once a
    * full caller audit confirms every site threads `sourceId`.
+   *
+   * ⚠ VT-1 (engine audit 2026-07-17): HARD delete — destroys each page's
+   * entire version history via the page_versions CASCADE. `gbrain sync` now
+   * uses `softDeletePages` instead; see `deletePage` for the full warning.
    */
   deletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]>;
   /**
@@ -865,21 +877,51 @@ export interface BrainEngine {
    * v0.26.5 — set `deleted_at = now()` on a page. Returns the slug if a row
    * was soft-deleted, null if no row matched (already soft-deleted OR not found).
    * Idempotent-as-null. The page stays in the DB and cascade rows (chunks,
-   * links) stay intact; the autopilot purge phase hard-deletes after 72h.
+   * links, page_versions) stay intact; the autopilot purge phase hard-deletes
+   * after 72h.
+   *
+   * VT-5 (engine audit 2026-07-17): writes an append-only `page_lifecycle`
+   * ingest_log row atomically with the flip, so the deletion event is
+   * durably recorded even after a later restore erases `deleted_at`.
    */
   softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null>;
+  /**
+   * VT-1 (engine audit 2026-07-17) — batch soft-delete: single SQL
+   * round-trip, same chunking contract as `deletePages`
+   * (<= DELETE_BATCH_SIZE per call, sourceId REQUIRED), returns the slugs
+   * of rows ACTUALLY flipped (missing / already-deleted slugs are skipped,
+   * idempotent). This is `gbrain sync`'s replacement for `deletePages`:
+   * repo-driven deletes keep the row + its page_versions history until the
+   * disclosed purge TTL instead of cascade-destroying the page's past.
+   * Writes one `page_lifecycle` ingest_log row per call.
+   */
+  softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]>;
   /**
    * v0.26.5 — clear `deleted_at` on a soft-deleted page. Returns true iff a
    * row was restored. False if the slug is unknown OR the page is not
    * currently soft-deleted (idempotent-as-false).
+   *
+   * VT-5 (engine audit 2026-07-17): before nulling `deleted_at` — the only
+   * copy of the deletion timestamp — the deletion interval
+   * `[deleted_at .. now()]` is recorded in an append-only `page_lifecycle`
+   * ingest_log row, atomically. Pre-fix, a restore made any as-of answer
+   * inside that interval unfalsifiably wrong: nothing recorded that the
+   * page was invisible at the time.
    */
   restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean>;
   /**
    * v0.26.5 — hard-delete pages whose `deleted_at` is older than the cutoff.
    * Called by the autopilot purge phase and by the `gbrain pages purge-deleted`
-   * CLI escape hatch. Cascades through existing FKs.
+   * CLI escape hatch. Cascades through existing FKs — including
+   * page_versions: THIS IS THE POINT WHERE VERSION HISTORY IS GENUINELY
+   * DESTROYED (VT-1). The loss cannot be avoided without a schema change,
+   * so it is explicit instead of silent: `versionRowsDestroyed` reports the
+   * count to every caller, and a `page_lifecycle` ingest_log row (no pages
+   * FK — it survives the purge) records what was destroyed, per source.
    */
-  purgeDeletedPages(olderThanHours: number): Promise<{ slugs: string[]; count: number }>;
+  purgeDeletedPages(
+    olderThanHours: number,
+  ): Promise<{ slugs: string[]; count: number; versionRowsDestroyed: number }>;
   /**
    * v0.26.5: by default `listPages` excludes soft-deleted rows. Set
    * `filters.includeDeleted: true` to surface them.
@@ -1900,8 +1942,15 @@ export interface BrainEngine {
   // Versions
   /**
    * Snapshot a page row into page_versions. Source-scoped via `opts.sourceId`;
-   * without it the bare-slug lookup snapshots whichever row Postgres returns
-   * first when the slug exists across multiple sources.
+   * without it the lookup is pinned to `'default'` (`?? 'default'` in both
+   * impls) — an unscoped call snapshots the default-source row or throws
+   * `createVersion failed … not found`, NEVER "whichever row Postgres
+   * returns first" (VT-9 doc fix, engine audit 2026-07-17: the old claim
+   * here was stale).
+   *
+   * VT-6: putPage now snapshots the pre-update state itself; do NOT pair
+   * createVersion with putPage (duplicate snapshots). createVersion remains
+   * for callers that need an explicit checkpoint outside a page write.
    */
   createVersion(slug: string, opts?: { sourceId?: string }): Promise<PageVersion>;
   /**
@@ -1912,8 +1961,21 @@ export interface BrainEngine {
   getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
-   * and the page revert. Without it, multi-source brains can revert the
-   * wrong row when the slug exists in 2+ sources.
+   * and the page revert.
+   *
+   * VT-7 + VT-4 (engine audit 2026-07-17) — the atomic revert contract:
+   *   - THROWS when `versionId` does not belong to (slug[, source]) — no
+   *     more silent 0-row no-op behind a clean return.
+   *   - Banks the pre-revert head into page_versions in the same statement
+   *     (append-preserving at the engine, not by op-layer convention), and
+   *     skips the snapshot when current content already equals the target.
+   *   - Stamps `content_hash` with a `reverted:v<id>:<md5>` marker that can
+   *     never equal a computed content hash, so the next sync re-reconciles
+   *     through the versioned import path instead of hash-match-skipping
+   *     the reverted row (which silently re-clobbered reverts pre-fix).
+   *   - Restores ONLY compiled_truth + frontmatter — snapshots capture
+   *     nothing else. Title/type/timeline and chunks/search-index keep
+   *     their current values; the `revert_version` op discloses this.
    */
   revertToVersion(slug: string, versionId: number, opts?: { sourceId?: string }): Promise<void>;
 
@@ -2007,7 +2069,15 @@ export interface BrainEngine {
    * together).
    *
    * Skips soft-deleted rows (deleted_at filter). Idempotent — second call
-   * with the same args produces the same row state.
+   * with the same args produces the same row state (and, post-VT-3, mints
+   * no second snapshot).
+   *
+   * VT-3 (engine audit 2026-07-17): this path used to rewrite
+   * compiled_truth with NO version snapshot — the un-fixed sibling of the
+   * materialize "time-travel poison" (4a33b46). It now banks the
+   * pre-rewrite body into page_versions in the same statement whenever the
+   * body actually changes, honoring the version contract (a version row at
+   * T = the content that stood until T).
    */
   refreshPageBody(
     slug: string,
@@ -2024,10 +2094,13 @@ export interface BrainEngine {
    *
    * Used by `src/core/contextual-retrieval-service.ts:reembedPageWithContextualRetrieval`
    * at the end of its PHASE 2 transaction. Why narrow instead of routing
-   * through `putPage`: stamping the CR state alone shouldn't trigger the
-   * full page-version snapshot machinery (createVersion fires on every
-   * putPage with an existing row, which would bloat page_versions on every
-   * tier upgrade).
+   * through `putPage`: a putPage round-trip would rewrite every content
+   * column just to stamp two state columns. (Historical note: the old
+   * rationale here claimed "createVersion fires on every putPage with an
+   * existing row" back when that was enforced by caller convention at two
+   * sites — VT-6 made it true at the engine, with an IS DISTINCT FROM guard,
+   * so a CR-only putPage would actually mint nothing today. The narrow
+   * UPDATE remains the right shape regardless.)
    *
    * Skips soft-deleted rows (deleted_at filter). Idempotent — same args
    * twice produces the same row state. Both columns are NULL-tolerant

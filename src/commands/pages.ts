@@ -48,13 +48,15 @@ async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<voi
 
   const result = await engine.purgeDeletedPages(olderThanHours);
   if (json) {
-    console.log(JSON.stringify({ older_than_hours: olderThanHours, count: result.count, slugs: result.slugs }, null, 2));
+    console.log(JSON.stringify({ older_than_hours: olderThanHours, count: result.count, version_rows_destroyed: result.versionRowsDestroyed, slugs: result.slugs }, null, 2));
     return;
   }
   if (result.count === 0) {
     console.log(`No pages to purge (older than ${olderThanHours}h).`);
   } else {
-    console.log(`Purged ${result.count} page(s) (older than ${olderThanHours}h):`);
+    // VT-1: version-history destruction is the purge's irreversible loss —
+    // say it out loud.
+    console.log(`Purged ${result.count} page(s) (older than ${olderThanHours}h); ${result.versionRowsDestroyed} version row(s) destroyed with them:`);
     for (const slug of result.slugs) console.log(`  ${slug}`);
   }
 }

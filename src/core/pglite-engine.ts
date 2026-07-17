@@ -915,8 +915,22 @@ export class PGLiteEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
+    // VT-6 (engine audit 2026-07-17): parity with PostgresEngine.putPage —
+    // the `snapshot` CTE banks the pre-update state in the same statement as
+    // the upsert whenever compiled_truth/frontmatter actually change, making
+    // versioning an engine property instead of caller discipline. See the
+    // PostgresEngine.putPage comment for the full rationale.
     const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
+      `WITH prev AS (
+         SELECT id, compiled_truth, frontmatter FROM pages
+         WHERE source_id = $1 AND slug = $2
+       ), snapshot AS (
+         INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+         SELECT id, compiled_truth, frontmatter FROM prev
+         WHERE compiled_truth IS DISTINCT FROM $6
+            OR frontmatter IS DISTINCT FROM $8::jsonb
+       )
+       INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, 1), $14, $15, $16, $17, $18::timestamptz)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
@@ -996,6 +1010,9 @@ export class PGLiteEngine implements BrainEngine {
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {
     // Idempotent-as-null: only flip rows currently active. Source filter is
     // optional; without it the first matching row across sources gets soft-deleted.
+    // VT-5 (engine audit 2026-07-17): parity with PostgresEngine — the
+    // `lifecycle` CTE records the deletion in append-only ingest_log
+    // atomically with the flip.
     const sourceId = opts?.sourceId;
     const where: string[] = ['slug = $1', 'deleted_at IS NULL'];
     const params: unknown[] = [slug];
@@ -1004,14 +1021,53 @@ export class PGLiteEngine implements BrainEngine {
       where.push(`source_id = $${params.length}`);
     }
     const { rows } = await this.db.query(
-      `UPDATE pages SET deleted_at = now() WHERE ${where.join(' AND ')} RETURNING slug`,
+      `WITH flipped AS (
+         UPDATE pages SET deleted_at = now() WHERE ${where.join(' AND ')} RETURNING slug, source_id
+       ), lifecycle AS (
+         INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+         SELECT source_id, 'page_lifecycle', slug, jsonb_build_array(slug),
+                'soft-deleted (recoverable until the purge TTL; version history retained)'
+         FROM flipped
+       )
+       SELECT slug FROM flipped`,
       params
     );
     if (rows.length === 0) return null;
     return { slug: (rows[0] as { slug: string }).slug };
   }
 
+  /**
+   * VT-1 (engine audit 2026-07-17) — batch soft-delete primitive. Parity
+   * with PostgresEngine.softDeletePages; see that JSDoc for the contract.
+   */
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      `WITH flipped AS (
+         UPDATE pages SET deleted_at = now()
+         WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
+         RETURNING slug, source_id
+       ), lifecycle AS (
+         INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+         SELECT source_id, 'page_lifecycle', 'batch', jsonb_agg(slug),
+                'soft-deleted ' || count(*) || ' page(s) (recoverable until the purge TTL; version history retained)'
+         FROM flipped GROUP BY source_id
+       )
+       SELECT slug FROM flipped`,
+      [slugs, opts.sourceId],
+    );
+    return rows.map(r => r.slug);
+  }
+
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
+    // VT-5 (engine audit 2026-07-17): parity with PostgresEngine — record
+    // the deletion interval in ingest_log BEFORE nulling deleted_at erases
+    // the only copy of it.
     const sourceId = opts?.sourceId;
     const where: string[] = ['slug = $1', 'deleted_at IS NOT NULL'];
     const params: unknown[] = [slug];
@@ -1020,25 +1076,60 @@ export class PGLiteEngine implements BrainEngine {
       where.push(`source_id = $${params.length}`);
     }
     const { rows } = await this.db.query(
-      `UPDATE pages SET deleted_at = NULL WHERE ${where.join(' AND ')} RETURNING slug`,
+      `WITH tomb AS (
+         SELECT id, slug, source_id, deleted_at FROM pages WHERE ${where.join(' AND ')}
+       ), restored AS (
+         UPDATE pages SET deleted_at = NULL
+         FROM tomb WHERE pages.id = tomb.id
+         RETURNING pages.slug
+       ), lifecycle AS (
+         INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+         SELECT source_id, 'page_lifecycle', slug, jsonb_build_array(slug),
+                'restored; deletion interval [' || deleted_at::text || ' .. ' || now()::text ||
+                '] is preserved in this log row (the pages row no longer shows it)'
+         FROM tomb
+       )
+       SELECT slug FROM restored`,
       params
     );
     return rows.length > 0;
   }
 
-  async purgeDeletedPages(olderThanHours: number): Promise<{ slugs: string[]; count: number }> {
+  async purgeDeletedPages(
+    olderThanHours: number,
+  ): Promise<{ slugs: string[]; count: number; versionRowsDestroyed: number }> {
     // Clamp to non-negative integer; cascade through FKs (content_chunks,
-    // page_links, chunk_relations) on DELETE.
+    // page_links, chunk_relations — AND page_versions) on DELETE. VT-1
+    // (engine audit 2026-07-17): parity with PostgresEngine — the version-
+    // history destruction is counted, returned, and recorded in ingest_log
+    // (which has no pages FK and survives the purge) instead of silent.
     const hours = Math.max(0, Math.floor(olderThanHours));
     const { rows } = await this.db.query(
-      `DELETE FROM pages
-       WHERE deleted_at IS NOT NULL
-         AND deleted_at < now() - ($1 || ' hours')::interval
-       RETURNING slug`,
+      `WITH doomed AS (
+         SELECT id, slug, source_id FROM pages
+         WHERE deleted_at IS NOT NULL
+           AND deleted_at < now() - ($1 || ' hours')::interval
+       ), vcount AS (
+         SELECT count(*)::int AS n
+         FROM page_versions pv JOIN doomed d ON d.id = pv.page_id
+       ), lifecycle AS (
+         INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+         SELECT d.source_id, 'page_lifecycle', 'purge', jsonb_agg(DISTINCT d.slug),
+                'purged ' || count(DISTINCT d.id) || ' page(s) past the soft-delete TTL; '
+                || count(pv.id) || ' version row(s) destroyed with them (page_versions ON DELETE CASCADE); this log row is the surviving record'
+         FROM doomed d LEFT JOIN page_versions pv ON pv.page_id = d.id
+         GROUP BY d.source_id
+       ), del AS (
+         DELETE FROM pages WHERE id IN (SELECT id FROM doomed)
+         RETURNING slug
+       )
+       SELECT del.slug, (SELECT n FROM vcount) AS version_rows FROM del`,
       [hours]
     );
-    const slugs = (rows as { slug: string }[]).map((r) => r.slug);
-    return { slugs, count: slugs.length };
+    const typed = rows as Array<{ slug: string; version_rows: number | string }>;
+    const slugs = typed.map((r) => r.slug);
+    const versionRowsDestroyed = typed.length > 0 ? Number(typed[0].version_rows) : 0;
+    return { slugs, count: slugs.length, versionRowsDestroyed };
   }
 
   async refreshPageBody(
@@ -1051,8 +1142,21 @@ export class PGLiteEngine implements BrainEngine {
     // Parity with PostgresEngine.refreshPageBody: narrow UPDATE only.
     // The deleted_at filter prevents a redirect retry from reviving a
     // canonical that was already purged.
+    // VT-3 (engine audit 2026-07-17): the `snapshot` CTE banks the
+    // pre-rewrite body (guarded by IS DISTINCT FROM so the documented
+    // idempotency also means no snapshot spam). See PostgresEngine.
     await this.db.query(
-      `UPDATE pages
+      `WITH prev AS (
+         SELECT id, compiled_truth, frontmatter FROM pages
+         WHERE source_id = $4
+           AND slug = $5
+           AND deleted_at IS NULL
+       ), snapshot AS (
+         INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+         SELECT id, compiled_truth, frontmatter FROM prev
+         WHERE compiled_truth IS DISTINCT FROM $1
+       )
+       UPDATE pages
          SET compiled_truth = $1,
              timeline = $2,
              content_hash = $3,
@@ -4812,30 +4916,42 @@ export class PGLiteEngine implements BrainEngine {
     opts?: { sourceId?: string },
   ): Promise<void> {
     // v0.31.8 (D12): when opts.sourceId is set, scope BOTH the page lookup
-    // and the version row reference. Without it, multi-source brains can
-    // revert the wrong same-slug page (the one Postgres returns first).
-    if (opts?.sourceId) {
-      await this.db.query(
-        `UPDATE pages SET
-          compiled_truth = pv.compiled_truth,
-          frontmatter = pv.frontmatter,
-          updated_at = now()
-        FROM page_versions pv
-        WHERE pages.slug = $1 AND pages.source_id = $3
-              AND pv.id = $2 AND pv.page_id = pages.id`,
-        [slug, versionId, opts.sourceId]
-      );
-      return;
-    }
-    await this.db.query(
-      `UPDATE pages SET
-        compiled_truth = pv.compiled_truth,
-        frontmatter = pv.frontmatter,
-        updated_at = now()
-      FROM page_versions pv
-      WHERE pages.slug = $1 AND pv.id = $2 AND pv.page_id = pages.id`,
-      [slug, versionId]
+    // and the version row reference.
+    // VT-7 + VT-4 (engine audit 2026-07-17): parity with PostgresEngine —
+    // atomic validate + pre-revert snapshot + revert + content_hash revert
+    // marker in one statement; THROWS when the version does not belong to
+    // (slug, source) instead of returning cleanly on a no-op.
+    const sourceCondition = opts?.sourceId ? 'AND pages.source_id = $3' : '';
+    const params: unknown[] = opts?.sourceId ? [slug, versionId, opts.sourceId] : [slug, versionId];
+    const { rows } = await this.db.query(
+      `WITH target AS (
+         SELECT pages.id AS page_id,
+                pages.compiled_truth AS cur_truth, pages.frontmatter AS cur_fm,
+                pv.compiled_truth AS v_truth, pv.frontmatter AS v_fm
+         FROM pages
+         JOIN page_versions pv ON pv.page_id = pages.id
+         WHERE pages.slug = $1 AND pv.id = $2 ${sourceCondition}
+       ), snapshot AS (
+         INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+         SELECT page_id, cur_truth, cur_fm FROM target
+         WHERE cur_truth IS DISTINCT FROM v_truth OR cur_fm IS DISTINCT FROM v_fm
+       )
+       UPDATE pages SET
+         compiled_truth = t.v_truth,
+         frontmatter = t.v_fm,
+         content_hash = 'reverted:v' || $2 || ':' || md5(t.v_truth),
+         updated_at = now()
+       FROM target t
+       WHERE pages.id = t.page_id
+       RETURNING pages.slug`,
+      params
     );
+    if (rows.length === 0) {
+      throw new Error(
+        `revertToVersion failed: version ${versionId} not found for page "${slug}"` +
+        (opts?.sourceId ? ` (source=${opts.sourceId})` : ''),
+      );
+    }
   }
 
   // Stats + health

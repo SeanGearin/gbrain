@@ -1750,10 +1750,13 @@ export async function registerBuiltinHandlers(
     const olderThanHours = typeof job.data.olderThanHours === 'number' ? job.data.olderThanHours : 72;
     const dryRun = !!job.data.dryRun;
     let pagesPurged = 0;
+    let versionRowsDestroyed = 0;
     let sourcesPurged: string[] = [];
     if (scope === 'pages' || scope === 'all') {
       const result = await engine.purgeDeletedPages(olderThanHours);
       pagesPurged = result.count;
+      // VT-1: disclose the version-history destruction the purge cascade causes.
+      versionRowsDestroyed = result.versionRowsDestroyed;
     }
     if (scope === 'sources' || scope === 'all') {
       const { purgeExpiredSources } = await import('../core/destructive-guard.ts');
@@ -1762,7 +1765,7 @@ export async function registerBuiltinHandlers(
     // GC stale op_checkpoints rows (folded scope item +C from review).
     const { purgeStaleCheckpoints } = await import('../core/op-checkpoint.ts');
     const checkpointsPurged = await purgeStaleCheckpoints(engine, 7);
-    return { pagesPurged, sourcesPurged, checkpointsPurged, dryRun };
+    return { pagesPurged, versionRowsDestroyed, sourcesPurged, checkpointsPurged, dryRun };
   });
 
   // Phase-wrapper handlers — each delegates to runCycle({ phases: [name] }).

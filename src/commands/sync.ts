@@ -1378,9 +1378,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // page requires `gbrain pages purge-deleted` or a direct MCP delete.
   // Filed as v0.42+ follow-up for a `gbrain pages remove <slug>` surface.
   const unsyncableModified = manifest.modified.filter(p => !isSyncable(p, syncOpts));
-  // v0.18.0+ multi-source: scope getPage + deletePage to opts.sourceId so
+  // v0.18.0+ multi-source: scope getPage + the delete to opts.sourceId so
   // unsyncable cleanup in source A doesn't accidentally sweep same-slug
   // pages in sources B/C/D.
+  // VT-1 (engine audit 2026-07-17): SOFT delete. The old hard deletePage
+  // cascade-destroyed the page's entire page_versions history — sync, the
+  // PRIMARY ingest path, was silently annihilating the record's past. The
+  // row + history now survive until the disclosed purge TTL.
   const pageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   for (const path of unsyncableModified) {
     // v0.41.13 #1433: never delete on metafile classification.
@@ -1389,8 +1393,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     try {
       const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
-        await engine.deletePage(slug, pageOpts);
-        slog(`  Deleted un-syncable page: ${slug}`);
+        await engine.softDeletePage(slug, pageOpts);
+        slog(`  Soft-deleted un-syncable page (recoverable until purge TTL): ${slug}`);
       }
     } catch { /* ignore */ }
   }
@@ -1514,8 +1518,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // advancement at the bottom of this function.
   const failedFiles: Array<{ path: string; error: string; line?: number }> = [];
 
-  // v0.18.0+ multi-source: scope deletePage so we only delete the source-A
+  // v0.18.0+ multi-source: scope the delete so we only touch the source-A
   // row, not every same-slug row across all sources.
+  //
+  // VT-1 (engine audit 2026-07-17): every repo-driven delete below is a
+  // SOFT delete (softDeletePage/softDeletePages). The old hard
+  // deletePage/deletePages cascade-destroyed each page's ENTIRE
+  // page_versions history (schema.sql ON DELETE CASCADE) — a file removal
+  // (or a rename git didn't detect, which manifests as delete+add) made
+  // every as-of question answer "this page never existed". Rows + history
+  // now survive, hidden from search/get_page, until the autopilot purge
+  // phase hard-deletes past the TTL — and THAT loss is counted + logged.
+  // A re-added file resurrects the tombstone through the import path
+  // (snapshot-then-restore, VT-2).
   const deleteOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
 
   // v0.41.19.0 (T2/D6/D7/D16/D18 via /plan-eng-review + codex outside-voice):
@@ -1542,10 +1557,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //       │                                              frontmatter-fallback
   //       ▼                                              + missing-source-path
   //   try {
-  //     deleted = engine.deletePages(slugs, opts)    ◀── 1 SQL round-trip
+  //     deleted = engine.softDeletePages(slugs, opts) ◀── 1 SQL round-trip
   //     pagesAffected.push(...deleted)               ◀── D6: only confirmed
   //   } catch {                                          deletes, not phantoms
-  //     // D7 decompose: per-slug deletePage,
+  //     // D7 decompose: per-slug softDeletePage,
   //     // unrecoverable failures → failedFiles
   //   }
   //
@@ -1592,25 +1607,28 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
         const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p));
 
-        // Phase B: batch delete (1 round-trip per batch).
+        // Phase B: batch SOFT delete (1 round-trip per batch). VT-1: rows +
+        // version history survive until the disclosed purge TTL.
         try {
-          const deleted = await engine.deletePages(slugs, deleteScopedOpts);
-          // D6: only push slugs that were actually deleted. Filters phantom
-          // slugs (paths in filtered.deleted but with no DB row) so
-          // downstream extract/embed don't waste lookups.
+          const deleted = await engine.softDeletePages(slugs, deleteScopedOpts);
+          // D6: only push slugs that were actually flipped. Filters phantom
+          // slugs (paths in filtered.deleted but with no DB row, or rows
+          // already soft-deleted by a prior run) so downstream
+          // extract/embed don't waste lookups.
           pagesAffected.push(...deleted);
-          // v0.42.x (#1794): the whole batch is handled (deleted or already
-          // gone); checkpoint every path so a resume skips it.
+          // v0.42.x (#1794): the whole batch is handled (soft-deleted or
+          // already gone); checkpoint every path so a resume skips it.
           for (const p of batch) await markCompleted(p);
         } catch (err) {
           // D7 decompose: a transient blip on this batch shouldn't lose all
-          // 500 deletes. Fall back to per-slug deletePage for THIS batch
-          // only; unrecoverable per-slug failures land in failedFiles
+          // 500 deletes. Fall back to per-slug softDeletePage for THIS
+          // batch only; unrecoverable per-slug failures land in failedFiles
           // (matching the existing import-loop pattern at sync.ts:~1350).
           for (let j = 0; j < slugs.length; j++) {
             try {
-              await engine.deletePage(slugs[j], deleteScopedOpts);
-              pagesAffected.push(slugs[j]);
+              const flipped = await engine.softDeletePage(slugs[j], deleteScopedOpts);
+              // null = no row / already soft-deleted — handled, not affected.
+              if (flipped) pagesAffected.push(slugs[j]);
               await markCompleted(batch[j]);
             } catch (perSlugErr) {
               failedFiles.push({
@@ -1635,8 +1653,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
         const slug = await resolveSlugByPathOrSourcePath(engine, path, undefined);
         try {
-          await engine.deletePage(slug, deleteOpts);
-          pagesAffected.push(slug);
+          // VT-1: soft delete (see the deleteOpts comment above).
+          const flipped = await engine.softDeletePage(slug, deleteOpts);
+          if (flipped) pagesAffected.push(slug);
           await markCompleted(path);
         } catch (err) {
           failedFiles.push({
