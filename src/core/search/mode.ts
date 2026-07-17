@@ -706,7 +706,15 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // to take effect immediately (one-time global cache cold-miss on upgrade; refills
 // within cache.ttl_seconds). Same cache-key-contamination convention as the
 // autocut / title_boost / graph_signals bumps above.
-export const KNOBS_HASH_VERSION = 10;
+// bump 10→11 (SR-1, engine audit 2026-07-17): the query cache's row contract
+// changed from "whatever page slice the last write happened to hold" to
+// "an offset-0 PREFIX stamped with meta.cache_window = { limit, complete }".
+// Legacy rows may hold a page-N slice written by an offset>0 call (the
+// pagination-poison class) and carry no window record, so they must never be
+// served under the new serving rules. No new hash field — the version bump
+// alone invalidates every pre-fix row. Same one-time global cold-miss
+// pattern as prior bumps; refills within cache.ttl_seconds (3600s default).
+export const KNOBS_HASH_VERSION = 11;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The

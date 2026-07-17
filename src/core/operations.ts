@@ -1623,8 +1623,38 @@ const search: Operation = {
     const keywordOnly = (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
 
     if (keywordOnly) {
-      const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, ...scope });
-      const results = dedupResults(raw);
+      // SR-8 (engine audit 2026-07-17): dedup used to run on each raw SQL
+      // window (`searchKeyword({limit, offset})` then dedup) — rows deduped
+      // out of window [0,20) were permanently skipped by pagination, and on
+      // homogeneous corpora the 60%-type-cap shrank EVERY page so a
+      // page-until-short-page walker concluded "complete" on page 1. Now the
+      // op fetches the raw PREFIX [0, offset+limit+headroom), dedups the
+      // prefix once with prefix-stable layers, and slices the requested
+      // window from the deduped ordering — pages are full until the set is
+      // exhausted and nothing is silently dropped between pages.
+      // maxTypeRatio: 1 disables the type-diversity hard-drop on this
+      // pagination path: it is a page-composition heuristic whose
+      // len-dependence breaks stable paging, not a correctness dedup.
+      const PREFIX_BATCH = 100; // MAX_SEARCH_LIMIT — the engines' per-call clamp
+      const RAW_FETCH_CAP = 1000; // bound on pathological offsets
+      const needed = offset + limit;
+      let raw: SearchResult[] = [];
+      let deduped: SearchResult[] = [];
+      let sqlOffset = 0;
+      for (;;) {
+        const batch = await ctx.engine.searchKeyword(queryText, {
+          limit: PREFIX_BATCH,
+          offset: sqlOffset,
+          ...scope,
+        });
+        raw = raw.concat(batch);
+        sqlOffset += batch.length;
+        deduped = dedupResults(raw, { maxTypeRatio: 1 });
+        if (batch.length < PREFIX_BATCH) break; // SQL exhausted — prefix is complete
+        if (deduped.length >= needed) break;    // window provably full
+        if (sqlOffset >= RAW_FETCH_CAP) break;  // safety bound
+      }
+      const results = deduped.slice(offset, offset + limit);
       stampEvidenceSafe(results);
       // #1699: the keyword-only opt-out must STILL surface the content_flag
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
@@ -1632,7 +1662,12 @@ const search: Operation = {
       await stampContentFlags(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
-      return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
+      // SR-6 contract: configured keyword-only is NOT degraded — it is the
+      // operator's chosen mode, honestly labeled.
+      return {
+        results: isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results,
+        search_health: { degraded: false, vector_enabled: false, mode: 'keyword_only' },
+      };
     }
 
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
@@ -1653,11 +1688,46 @@ const search: Operation = {
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
-    return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
+    return {
+      results: isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results,
+      search_health: buildSearchHealth(capturedMeta),
+    };
   },
   scope: 'read',
   cliHints: { name: 'search', positional: ['query'] },
 };
+
+/**
+ * SR-6 (engine audit 2026-07-17) — the response-level honesty signal for the
+ * search/query ops. Derived from the meta hybridSearch emits on every return
+ * path:
+ *
+ *   degraded: true  → an arm that was EXPECTED to run FAILED (query embed
+ *                     threw, vector arm errored, cross-modal fell open). The
+ *                     result set may be missing semantic matches; an empty
+ *                     `results` MUST NOT be presented as a verified no-match.
+ *   degraded: false + vector_enabled: false → the brain is CONFIGURED
+ *                     without a vector arm (no embedding provider) — expected
+ *                     mode, not a failure.
+ *
+ * Pre-fix the flag lived only in the onMeta side-channel (eval capture) and
+ * a degraded [] was byte-identical to a healthy no-match on the wire.
+ */
+function buildSearchHealth(meta: HybridSearchMeta | null): {
+  degraded: boolean;
+  vector_enabled: boolean;
+  mode: string;
+  reason?: string;
+} {
+  return {
+    degraded: meta?.degraded === true,
+    vector_enabled: meta?.vector_enabled ?? false,
+    mode: 'hybrid',
+    ...(meta?.degraded === true
+      ? { reason: meta?.degraded_reason ?? 'search_arm_failed' }
+      : {}),
+  };
+}
 
 const query: Operation = {
   name: 'query',
@@ -1792,7 +1862,13 @@ const query: Operation = {
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
       });
-      return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
+      // SR-6 envelope: this branch has no swallow — an embedMultimodal
+      // failure throws to the op error path — so reaching here means the
+      // vector arm actually ran.
+      return {
+        results: isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results,
+        search_health: { degraded: false, vector_enabled: true, mode: 'image_vector' },
+      };
     }
 
     if (!queryText) {
@@ -1899,7 +1975,10 @@ const query: Operation = {
       );
     }
 
-    return isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results;
+    return {
+      results: isCustomerScopedRemoteRead(ctx) ? minimizeSearchResults(results) : results,
+      search_health: buildSearchHealth(capturedMeta),
+    };
   },
   scope: 'read',
   cliHints: { name: 'query', positional: ['query'] },
@@ -3969,8 +4048,8 @@ const recall: Operation = {
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (expired_at + superseded_by both set).' },
     limit: { type: 'number', description: 'Max rows to return. Default 50, cap 100.' },
-    offset: { type: 'number', description: 'Skip the first N rows (for pagination over the >100-row case). Default 0. Stable order is created_at DESC, id DESC, so paging by offset until a short page walks the full set with no gaps or dupes.' },
-    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
+    offset: { type: 'number', description: 'Skip the first N rows (for pagination). Default 0. Stable order is created_at DESC, id DESC (expired_at DESC for supersessions). The response reports `total` (true matching-row count), `has_more`, and `window` — page while has_more is true.' },
+    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive, literal — no wildcards). Applied in SQL BEFORE limit/offset, so grep+pagination walks every match and `total` counts only matches.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
   scope: 'read',
@@ -3984,7 +4063,27 @@ const recall: Operation = {
       ? Math.max(0, Math.floor(p.offset))
       : 0;
     const includeExpired = p.include_expired === true;
-    const grep = typeof p.grep === 'string' ? p.grep.toLowerCase() : null;
+    // SR-3: grep is now an ENGINE predicate (ILIKE, escaped-literal), applied
+    // before LIMIT/OFFSET — no more cap-before-filter starvation. Case
+    // handling lives in ILIKE, so the raw value passes through.
+    const grep = typeof p.grep === 'string' && p.grep.length > 0 ? p.grep : undefined;
+
+    // SR-9: an unparseable `since` used to silently degrade to
+    // {facts: [], total: 0} — a parse failure asserting "no facts". Reject
+    // loudly instead; "no results" and "your parameter was invalid" must be
+    // distinguishable.
+    let sinceParsed: Date | undefined;
+    if (p.since !== undefined) {
+      const parsed = parseSinceParam(p.since);
+      if (!parsed) {
+        throw new OperationError(
+          'invalid_since',
+          `Unparseable since value: ${JSON.stringify(p.since)}.`,
+          'Use ISO-8601 (e.g. 2026-07-17T00:00:00Z), epoch millis, or duration shorthand like "8 hours ago" / "30m" / "2d".',
+        );
+      }
+      sinceParsed = parsed;
+    }
 
     // Visibility filter: remote callers see world-only unless their token
     // grants elevated visibility (future-proofing; v0.31 ships world-only
@@ -4018,30 +4117,38 @@ const recall: Operation = {
             : null);
 
     const runRecallQuery = async (engine: BrainEngine) => {
-      const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId };
+      // SR-3: grep rides in listOpts so every branch filters BEFORE its
+      // SQL LIMIT. SR-2: countOpts carries the IDENTICAL shared predicate
+      // set so the COUNT below is provably the same filter, pre-LIMIT.
+      const listOpts = { activeOnly: !includeExpired, limit, offset, visibility, ownerSourceId, grep };
+      const countShared = { activeOnly: !includeExpired, visibility, ownerSourceId, grep };
 
       let rows: Awaited<ReturnType<typeof engine.listFactsByEntity>> = [];
+      let total = 0;
 
       if (p.supersessions === true) {
-        const since = parseSinceParam(p.since);
-        rows = await engine.listSupersessions(sourceId, { since: since ?? undefined, limit });
+        // SR-5 + SR-4: full listOpts threading — offset paging works and the
+        // visibility/owner filter applies (pre-fix a remote world-only caller
+        // read private expired fact text through this branch, and history
+        // beyond 100 rows was unreachable).
+        rows = await engine.listSupersessions(sourceId, { ...listOpts, since: sinceParsed });
+        total = await engine.countFacts(sourceId, { ...countShared, supersessions: true, since: sinceParsed });
       } else if (typeof p.entity === 'string' && p.entity.length > 0) {
         const { resolveEntitySlug } = await import('./entities/resolve.ts');
         const slug = (await resolveEntitySlug(engine, sourceId, p.entity)) ?? p.entity;
         rows = await engine.listFactsByEntity(sourceId, slug, listOpts);
+        total = await engine.countFacts(sourceId, { ...countShared, entitySlug: slug });
       } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
         rows = await engine.listFactsBySession(sourceId, p.session_id, listOpts);
-      } else if (p.since !== undefined) {
-        const since = parseSinceParam(p.since);
-        if (since) {
-          rows = await engine.listFactsSince(sourceId, since, listOpts);
-        }
+        total = await engine.countFacts(sourceId, { ...countShared, sessionId: p.session_id });
+      } else if (sinceParsed) {
+        rows = await engine.listFactsSince(sourceId, sinceParsed, listOpts);
+        total = await engine.countFacts(sourceId, { ...countShared, since: sinceParsed });
       } else {
         // No filter: return recent across the source.
         rows = await engine.listFactsSince(sourceId, new Date(0), listOpts);
+        total = await engine.countFacts(sourceId, countShared);
       }
-
-      if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 
       // v0.32: optional pending-consolidation count piggy-backed on the recall
       // response. Single round trip on thin-client; omitted when not requested
@@ -4060,10 +4167,10 @@ const recall: Operation = {
         }
       }
 
-      return { rows, pending_consolidation_count };
+      return { rows, total, pending_consolidation_count };
     };
 
-    const { rows, pending_consolidation_count } =
+    const { rows, total, pending_consolidation_count } =
       ctx.remote !== false && !ctx.sourceScopeActive
         ? await ctx.engine.withSourceScope(sourceId, runRecallQuery)
         : await runRecallQuery(ctx.engine);
@@ -4095,11 +4202,26 @@ const recall: Operation = {
       provenance: r.provenance ?? null,
       created_at: r.created_at.toISOString(),
     }));
+    // SR-2 — the honest-completeness contract:
+    //   total    = COUNT(*) of ALL rows matching this request's filter
+    //              (branch + grep + visibility + activeOnly), computed
+    //              pre-LIMIT in the same scope. NEVER the page length.
+    //   has_more = offset + facts.length < total (the derivation workers
+    //              already use — now against a number that can be trusted).
+    //   window   = { offset, limit (CLAMPED effective page cap), returned }
+    //              so a caller can always distinguish "the whole set" from
+    //              "a window of it".
+    // Pre-fix this returned `total: rows.length` — the post-limit page
+    // length dressed as the record's total, so has_more always said
+    // "complete" (the false-completeness class the worker band-aided).
+    const effectiveLimit = clampSearchLimit(limit, 50, 100);
     const payload = {
       facts: isCustomerScopedRemoteRead(ctx)
         ? facts.map(({ source_session: _sourceSession, ...rest }) => rest)
         : facts,
-      total: rows.length,
+      total,
+      has_more: offset + rows.length < total,
+      window: { offset, limit: effectiveLimit, returned: rows.length },
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
     };
     return payload;

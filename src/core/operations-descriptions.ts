@@ -62,6 +62,9 @@ export const LIST_PAGES_DESCRIPTION =
 
 export const QUERY_DESCRIPTION =
   "Hybrid search with vector + keyword + multi-query expansion. " +
+  "Returns {results: [...], search_health: {degraded, vector_enabled, mode, reason?}} — " +
+  "when search_health.degraded is true a pipeline arm failed and empty results " +
+  "must NOT be treated as a verified no-match. " +
   "For personal/emotional questions ('what's going on with me', 'anything notable', " +
   "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
   "get_recent_transcripts. Semantic search returns polished pages and misses " +
@@ -69,7 +72,11 @@ export const QUERY_DESCRIPTION =
   "mean impressive — they often mean difficult or emotionally charged.";
 
 export const SEARCH_DESCRIPTION =
-  "Keyword search using full-text search. For personal/emotional questions, " +
+  "Keyword search using full-text search. " +
+  "Returns {results: [...], search_health: {degraded, vector_enabled, mode, reason?}} — " +
+  "when search_health.degraded is true a pipeline arm failed and empty results " +
+  "must NOT be treated as a verified no-match. " +
+  "For personal/emotional questions, " +
   "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
   "without needing a search term. " +
   "For code-symbol questions (callers, callees, definitions, blast radius), use " +

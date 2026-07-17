@@ -1482,6 +1482,30 @@ export interface HybridSearchMeta {
    * non-hybridSearch capture paths (keyword-only `search` op).
    */
   embedding_column?: string;
+  /**
+   * SR-6 (engine audit 2026-07-17): TRUE when a pipeline arm that was
+   * supposed to run FAILED (query embed threw, vector arm errored,
+   * cross-modal fell open) and the result set may therefore be missing
+   * matches the healthy pipeline would have found. Distinct from
+   * `vector_enabled: false` with `degraded` unset/false, which means the
+   * brain is CONFIGURED without a vector arm (no embedding provider /
+   * keyword-only opt-out) — expected mode, not a failure. The search/query
+   * ops surface this to callers via `search_health` so a degraded [] is
+   * distinguishable from a verified no-match.
+   */
+  degraded?: boolean;
+  /** Machine-readable cause when degraded (e.g. 'query_embed_or_vector_failed'). */
+  degraded_reason?: string;
+  /**
+   * SR-1 (engine audit 2026-07-17): stamped on cache WRITEBACK meta. The
+   * cached row always stores an offset-0 PREFIX of the result ordering;
+   * `limit` is the effective limit the fresh search ran with and `complete`
+   * is true iff the search exhausted the candidate pool below that limit
+   * (so the stored prefix IS the entire result set and any window sliced
+   * from it — including an empty deep page — is provable). The cache-hit
+   * path refuses to serve any window it cannot prove from this record.
+   */
+  cache_window?: { limit: number; complete: boolean };
 }
 
 // Config

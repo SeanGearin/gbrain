@@ -201,7 +201,8 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
       sourceId: 'src-b',
     };
     const result = await searchOp!.handler(ctx as any, { query: 'gadgets' });
-    const rows = result as Array<{ source_id?: string }>;
+    // SR-6 envelope (engine audit 2026-07-17): search returns { results, search_health }.
+    const rows = (result as { results: Array<{ source_id?: string }> }).results;
     expect(rows.length).toBeGreaterThan(0);
     for (const r of rows) {
       expect(r.source_id).toBe('src-b');
@@ -230,7 +231,8 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
       },
     };
     const result = await searchOp!.handler(ctx as any, { query: 'Important context' });
-    const rows = result as Array<{ source_id?: string }>;
+    // SR-6 envelope (engine audit 2026-07-17): unwrap { results }.
+    const rows = (result as { results: Array<{ source_id?: string }> }).results;
     const sources = new Set(rows.map(r => r.source_id));
     expect(sources.has('default')).toBe(true);
     expect(sources.has('src-b')).toBe(true);
@@ -259,7 +261,8 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
       },
     };
     const result = await searchOp!.handler(ctx as any, { query: 'Important context' });
-    const rows = result as Array<{ source_id?: string }>;
+    // SR-6 envelope (engine audit 2026-07-17): unwrap { results }.
+    const rows = (result as { results: Array<{ source_id?: string }> }).results;
     for (const r of rows) {
       expect(r.source_id).toBe('default');
     }

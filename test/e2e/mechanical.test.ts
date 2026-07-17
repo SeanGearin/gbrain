@@ -39,7 +39,15 @@ function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
 async function callOp(name: string, params: Record<string, unknown> = {}) {
   const op = operationsByName[name];
   if (!op) throw new Error(`Unknown operation: ${name}`);
-  return op.handler(makeCtx(), params);
+  const res = await op.handler(makeCtx(), params);
+  // SR-6 envelope (engine audit 2026-07-17): search/query return
+  // { results, search_health } — unwrap so this file's array-shaped
+  // assertions keep exercising the same result sets.
+  if ((name === 'search' || name === 'query') && res && !Array.isArray(res)) {
+    const env = res as { results?: unknown[] };
+    if (Array.isArray(env.results)) return env.results;
+  }
+  return res;
 }
 
 // ─────────────────────────────────────────────────────────────────

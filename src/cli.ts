@@ -770,8 +770,16 @@ function formatResult(opName: string, result: unknown): string {
     }
     case 'search':
     case 'query': {
-      const results = result as any[];
-      if (results.length === 0) return 'No results.\n';
+      // SR-6 (engine audit 2026-07-17): the ops now return
+      // {results, search_health} instead of a bare array so the degradation
+      // verdict reaches every consumer. Unwrap, and surface the warning.
+      const envelope = result as { results?: any[]; search_health?: { degraded?: boolean; reason?: string } };
+      const results = Array.isArray(result) ? (result as any[]) : (envelope.results ?? []);
+      const health = Array.isArray(result) ? undefined : envelope.search_health;
+      const degradedNote = health?.degraded
+        ? `⚠ search DEGRADED (${health.reason ?? 'a search arm failed'}) — results may be incomplete; an empty list is NOT a verified no-match.\n`
+        : '';
+      if (results.length === 0) return degradedNote + 'No results.\n';
       // v0.40.4 — --explain switches to per-stage attribution formatter.
       // Reads CliOptions.explain via the module-level singleton.
       const cliOpts = getCliOptions();
@@ -779,9 +787,9 @@ function formatResult(opName: string, result: unknown): string {
         // Lazy import keeps formatResult's startup hot path narrow for
         // the common non-explain case.
         const { formatResultsExplain } = require('./core/search/explain-formatter.ts');
-        return formatResultsExplain(results);
+        return degradedNote + formatResultsExplain(results);
       }
-      return results.map(r =>
+      return degradedNote + results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
     }

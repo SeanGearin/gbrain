@@ -603,6 +603,46 @@ export interface FactListOpts {
    * with a resolved source scope.
    */
   ownerSourceId?: string | null;
+  /**
+   * SR-3 (engine audit 2026-07-17): case-insensitive SUBSTRING filter on
+   * fact text, applied INSIDE the SQL WHERE — before LIMIT/OFFSET — so a
+   * grep can never be starved by the page window (pre-fix the recall op
+   * filtered in JS after the newest-`limit` fetch and asserted
+   * `{facts: [], total: 0}` while matches existed outside the window).
+   * The engine escapes LIKE metacharacters, so the value is always treated
+   * literally — parity with the old `fact.toLowerCase().includes(grep)`.
+   */
+  grep?: string;
+}
+
+/**
+ * SR-2 (engine audit 2026-07-17) — predicate options for `countFacts`, the
+ * COUNT(*) twin of the list-facts methods. One discriminated bag instead of
+ * one count method per list method: exactly one of `entitySlug` /
+ * `sessionId` / `supersessions` (or none, optionally with `since`) selects
+ * the branch, and the shared filters (activeOnly / kinds / visibility /
+ * ownerSourceId / grep) MUST be passed identically to the list call the
+ * count is paired with — the recall op derives both from one object so the
+ * `total` it reports is provably the same predicate, pre-LIMIT.
+ */
+export interface FactCountOpts {
+  activeOnly?: boolean;
+  kinds?: FactKind[];
+  visibility?: FactVisibility[];
+  ownerSourceId?: string | null;
+  grep?: string;
+  /** Count facts about this canonical entity slug (listFactsByEntity twin). */
+  entitySlug?: string;
+  /** Count facts captured in this session (listFactsBySession twin). */
+  sessionId?: string;
+  /**
+   * With `supersessions: false`/unset: count rows with created_at >= since
+   * (listFactsSince twin). With `supersessions: true`: expired_at >= since
+   * (listSupersessions twin).
+   */
+  since?: Date;
+  /** Count the supersession audit log (expired_at + superseded_by both set). */
+  supersessions?: boolean;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
@@ -699,6 +739,16 @@ export interface TrajectoryPoint {
 
 /** Maximum results returned by search operations. Internal bulk operations (listPages) are not clamped. */
 export const MAX_SEARCH_LIMIT = 100;
+
+/**
+ * SR-3 (engine audit 2026-07-17): build a `%…%` ILIKE pattern that matches
+ * the input LITERALLY — `%`, `_` and `\` are escaped so a grep value can
+ * never smuggle wildcards (parity with the JS `.includes` contract the
+ * recall op used to apply post-fetch). Pair with `ESCAPE '\'` in the SQL.
+ */
+export function likeContainsPattern(needle: string): string {
+  return `%${needle.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+}
 
 /** Clamp a user-provided search limit to a safe range. */
 export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, cap = MAX_SEARCH_LIMIT): number {
@@ -1827,12 +1877,29 @@ export interface BrainEngine {
 
   /**
    * Audit log: facts that were superseded (expired_at + superseded_by both set),
-   * newest first. Drives `gbrain recall --supersessions`.
+   * newest first (expired_at DESC, id DESC). Drives `gbrain recall --supersessions`.
+   *
+   * SR-5 + SR-4 (engine audit 2026-07-17): the signature is now the full
+   * FactListOpts — pre-fix it accepted only `{ since, limit }`, which (a)
+   * silently ignored `offset` so history beyond MAX_SEARCH_LIMIT rows was
+   * permanently unreachable, and (b) could not even RECEIVE the
+   * visibility/ownerSourceId filter, so remote world-only callers read
+   * private expired fact text through this branch. `activeOnly` is forced
+   * false internally (the audit log is BY DEFINITION expired rows);
+   * `since` filters on expired_at (the event the log records), not created_at.
    */
   listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number },
+    opts?: FactListOpts & { since?: Date },
   ): Promise<FactRow[]>;
+
+  /**
+   * SR-2 (engine audit 2026-07-17): COUNT(*) twin of the list-facts methods,
+   * same WHERE predicate, NO limit/offset — the provable `total` the recall
+   * op reports so callers can distinguish "this is the whole set" from
+   * "this is a window". See FactCountOpts for the pairing contract.
+   */
+  countFacts(source_id: string, opts?: FactCountOpts): Promise<number>;
 
   /**
    * v0.32: count facts that haven't been promoted to takes by the consolidate
