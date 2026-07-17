@@ -135,15 +135,19 @@ export async function runExtractFacts(
   // coat. Both columns are born with the facts table (v45), so they
   // are safe to reference in the pre-v93 fallback too.
   //
-  // Disclosed residual of the carve-out pair: a dead db-only row whose
-  // superseded_by points at a FENCE-BACKED row makes this page's
-  // reconcile wipe DELETE hit facts_superseded_by_fkey (NO ACTION) — a
-  // loud per-page phase failure, rolled back, no data loss. The shape
-  // pre-exists for client-authored dead rows (reachable since the
-  // v0.42.24 carve-out) and is producible by the B2 dedup supersede
-  // (custody-blind matchedId, save.ts). The alternative — counting
-  // dead rows here — froze ALL reconciliation instead. The root fix
-  // belongs to the FK/wipe custody model, not this guard.
+  // Residual of the carve-out pair — CLOSED by migration v116: a dead
+  // db-only row whose superseded_by points at a FENCE-BACKED row used
+  // to make this page's reconcile wipe DELETE hit
+  // facts_superseded_by_fkey (NO ACTION) — a loud per-page phase
+  // failure, rolled back, pages after it in the loop skipped that run.
+  // The shape pre-existed for client-authored dead rows (reachable
+  // since the v0.42.24 carve-out) and is producible by the B2 dedup
+  // supersede (custody-blind matchedId, save.ts). v116 rebuilds the FK
+  // as ON DELETE SET NULL: fence-backed ids are ephemeral
+  // (wipe-and-reinsert mints new ids each reconcile), so the
+  // cross-custody chain link honestly nulls when its target is wiped
+  // instead of aborting the phase. Pinned by
+  // test/facts-fk-abort-residual.test.ts.
   let legacy: Array<{ n: string }>;
   try {
     legacy = await engine.executeRaw<{ n: string }>(
