@@ -30,8 +30,9 @@
  *   - `~~claim~~` + anything else in context → active=false, both flags null
  *
  * The semantic layer (commit 3's `extract-from-fence.ts`) maps `forgotten`
- * to `valid_until = today` so the DB's `expired_at` derives correctly via
- * the existing `expired_at = valid_until + now()` rule.
+ * to `valid_until = today` AND (v0.42.24) derives `expired_at` directly —
+ * there is no DB-side `valid_until → expired_at` rule; the mapper is the
+ * only place inactive fence rows acquire their expiry state.
  *
  * Both fences share row-level helpers via `./fence-shared.ts` — see that
  * module for `parseRowCells`, `isSeparatorRow`, `stripStrikethrough`, and
@@ -99,6 +100,18 @@ export interface ParsedFact {
   supersededBy?: number;
   forgotten?: boolean;
   /**
+   * v0.42.24 (fence-resurrection class): DB-id supersession pointer.
+   * Set when `context` matches `/superseded by fact #(\d+)/i` — written by
+   * `facts/supersede.ts` when a B2 `save_facts` supersede strikes a
+   * fence-backed target. Distinct from `supersededBy` (which points at
+   * another FENCE ROW by row_num): the superseding fact here is a DB-only
+   * row (NULL source_markdown_slug) whose id is stable across rebuilds, so
+   * the id-pointer round-trips. The extract mapper re-derives
+   * `facts.superseded_by` + `expired_at` from this on every reconcile,
+   * which is what makes a B2 supersession survive `gbrain rebuild`.
+   */
+  supersededByFactId?: number;
+  /**
    * v0.35.4 typed-claim fields (D-CDX-5). Optional. When present, drives
    * `gbrain eval trajectory` + the `find_trajectory` MCP op chronological
    * regression detection. The fence layout widens from 10 to 14 columns
@@ -148,6 +161,19 @@ function parseNumericCell(raw: string): number | undefined {
 function parseSupersededByFromContext(context: string | undefined): number | undefined {
   if (!context) return undefined;
   const m = context.match(/superseded by #(\d+)/i);
+  if (!m) return undefined;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * v0.42.24: DB-id supersession marker — `superseded by fact #<id>`.
+ * Deliberately does NOT collide with the fence-row pointer above:
+ * `superseded by #N` requires "by #", this requires "by fact #".
+ */
+function parseSupersededByFactIdFromContext(context: string | undefined): number | undefined {
+  if (!context) return undefined;
+  const m = context.match(/superseded by fact #(\d+)/i);
   if (!m) return undefined;
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -269,6 +295,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
     const { text: claimText, struck } = stripStrikethrough(claimRaw);
     const context = parseStringCell(contextRaw);
     const supersededBy = parseSupersededByFromContext(context);
+    const supersededByFactId = parseSupersededByFactIdFromContext(context);
     const forgotten    = parseForgottenFromContext(context);
 
     facts.push({
@@ -284,6 +311,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       context,
       active: !struck,
       supersededBy,
+      supersededByFactId: struck ? supersededByFactId : undefined,
       forgotten: struck ? forgotten : false,
       // v0.35.4 — typed-claim fields, all optional.
       claimMetric: parseStringCell(claimMetricRaw),
@@ -327,21 +355,152 @@ export function renderFactsTable(facts: ParsedFact[]): string {
     f.claimUnit   !== undefined ||
     f.claimPeriod !== undefined,
   );
-  const header = anyTyped
-    ? `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |`
-    : `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |`;
-  const separator = anyTyped
-    ? `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|`
-    : `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|`;
-  const rows = facts.map(f => {
-    const claimCell = f.active ? f.claim : `~~${f.claim}~~`;
-    const base = `| ${f.rowNum} | ${escapeFenceCell(claimCell)} | ${f.kind} | ${formatConfidence(f.confidence)} | ${f.visibility} | ${f.notability} | ${escapeFenceCell(f.validFrom ?? '')} | ${escapeFenceCell(f.validUntil ?? '')} | ${escapeFenceCell(f.source ?? '')} | ${escapeFenceCell(f.context ?? '')} |`;
-    if (!anyTyped) return base;
-    const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
-    return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
-  });
+  const header = anyTyped ? FENCE_HEADER_WIDE : FENCE_HEADER_NARROW;
+  const separator = anyTyped ? FENCE_SEPARATOR_WIDE : FENCE_SEPARATOR_NARROW;
+  const rows = facts.map(f => renderFactRowLine(f, anyTyped));
   const inner = ['', header, separator, ...rows, ''].join('\n');
   return `${FACTS_FENCE_BEGIN}${inner}${FACTS_FENCE_END}`;
+}
+
+const FENCE_HEADER_NARROW = `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |`;
+const FENCE_HEADER_WIDE = `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |`;
+const FENCE_SEPARATOR_NARROW = `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|`;
+const FENCE_SEPARATOR_WIDE = `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|`;
+
+/**
+ * Render a single fence row line. Extracted from renderFactsTable
+ * (byte-identical output) so the line-preserving write paths
+ * (`upsertFactRow`, `updateFactRowInFence`) can render ONE row without
+ * re-rendering — and thereby lossily normalizing — the whole table.
+ */
+function renderFactRowLine(f: ParsedFact, wide: boolean): string {
+  const claimCell = f.active ? f.claim : `~~${f.claim}~~`;
+  const base = `| ${f.rowNum} | ${escapeFenceCell(claimCell)} | ${f.kind} | ${formatConfidence(f.confidence)} | ${f.visibility} | ${f.notability} | ${escapeFenceCell(f.validFrom ?? '')} | ${escapeFenceCell(f.validUntil ?? '')} | ${escapeFenceCell(f.source ?? '')} | ${escapeFenceCell(f.context ?? '')} |`;
+  if (!wide) return base;
+  const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
+  return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
+}
+
+/**
+ * Classify the physical lines between the fence markers. Pure lexical
+ * pass — no validation. Used by the line-preserving write paths to find
+ * where a row lives (or where to append) WITHOUT dropping lines the
+ * parser can't understand (hand-edit typos, prose comments, collision
+ * rows). Erasing those on an unrelated write was the FE-2 lossy-rewrite
+ * bug: the re-render replaced the whole fence with only the rows that
+ * survived the lenient parse, permanently deleting everything else from
+ * the system of record.
+ */
+interface FenceLineScan {
+  /** Inner text between the markers, split on '\n' (verbatim, unparsed). */
+  lines: string[];
+  /** Index into `lines` of the header row, or -1 when no header found. */
+  headerIdx: number;
+  /** True when the header is the 14-cell typed-claim shape. */
+  wide: boolean;
+  /** Index into `lines` of the LAST pipe-shaped line (row/sep/header), or -1. */
+  lastPipeIdx: number;
+  /** Highest numeric first-cell across ALL pipe lines (incl. malformed rows). */
+  maxRowNum: number;
+  /** First line index (per row_num) for every numeric first-cell seen. */
+  rowLineIdx: Map<number, number>;
+}
+
+function scanFenceLines(inner: string): FenceLineScan {
+  const lines = inner.split('\n');
+  let headerIdx = -1;
+  let wide = false;
+  let lastPipeIdx = -1;
+  let maxRowNum = 0;
+  const rowLineIdx = new Map<number, number>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const cells = parseRowCells(lines[i]);
+    if (!cells) continue;
+    lastPipeIdx = i;
+    if (headerIdx === -1) {
+      const lower = cells.map(c => c.toLowerCase());
+      if (lower.includes('claim') && lower.includes('kind')) {
+        headerIdx = i;
+        wide = cells.length >= 14;
+        continue;
+      }
+    }
+    if (isSeparatorRow(cells)) continue;
+    const n = parseInt(cells[0], 10);
+    if (Number.isFinite(n) && n > 0) {
+      if (n > maxRowNum) maxRowNum = n;
+      if (!rowLineIdx.has(n)) rowLineIdx.set(n, i);
+    }
+  }
+  return { lines, headerIdx, wide, lastPipeIdx, maxRowNum, rowLineIdx };
+}
+
+/**
+ * True when `post` contains a warning that isn't accounted for in `pre`
+ * (multiset semantics — a duplicated warning string counts per
+ * occurrence). The line-preserving write paths' validate gate
+ * (fence-write append, forget strike, supersede strike): pre-existing
+ * fence damage is preserved rather than blocking, but an edit that
+ * introduces NEW damage is refused (.tmp quarantined by the caller).
+ */
+export function introducesNewWarnings(pre: string[], post: string[]): boolean {
+  const budget = new Map<string, number>();
+  for (const w of pre) budget.set(w, (budget.get(w) ?? 0) + 1);
+  for (const w of post) {
+    const left = budget.get(w) ?? 0;
+    if (left === 0) return true;
+    budget.set(w, left - 1);
+  }
+  return false;
+}
+
+/**
+ * Surgically replace ONE fence row line, preserving every other line
+ * between the markers byte-for-byte (prose, malformed rows, collision
+ * rows — everything the lenient parser would drop on a re-render).
+ *
+ * The row must round-trip through parseFactsFence (a hand-mangled target
+ * row returns null so the caller can fall back with disclosure). The
+ * mutated row renders at the physical line's own cell-width, so a
+ * narrow row in a wide table (or vice versa) keeps its shape.
+ *
+ * Returns null when: no balanced fence, the row_num has no physical
+ * line, or the parser could not produce a ParsedFact for it.
+ */
+export function updateFactRowInFence(
+  body: string,
+  rowNum: number,
+  mutate: (f: ParsedFact) => ParsedFact,
+): { body: string; before: ParsedFact; after: ParsedFact } | null {
+  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+  const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  if (beginIdx === -1 || endIdx === -1 || endIdx < beginIdx) return null;
+
+  const parsed = parseFactsFence(body);
+  const before = parsed.facts.find(f => f.rowNum === rowNum);
+  if (!before) return null;
+
+  const innerStart = beginIdx + FACTS_FENCE_BEGIN.length;
+  const inner = body.slice(innerStart, endIdx);
+  const scan = scanFenceLines(inner);
+  const lineIdx = scan.rowLineIdx.get(rowNum);
+  if (lineIdx === undefined) return null;
+
+  const lineCells = parseRowCells(scan.lines[lineIdx]);
+  const lineWide = (lineCells?.length ?? 0) >= 14;
+  const after = mutate({ ...before });
+  // row_num is the row's identity — a mutation must not renumber it.
+  after.rowNum = before.rowNum;
+
+  const newLines = [...scan.lines];
+  newLines[lineIdx] = renderFactRowLine(after, lineWide);
+  const newInner = newLines.join('\n');
+  return {
+    body: body.slice(0, innerStart) + newInner + body.slice(endIdx),
+    before,
+    after,
+  };
 }
 
 /**
@@ -349,9 +508,28 @@ export function renderFactsTable(facts: ParsedFact[]): string {
  * row is added to the end of it. If not, a new `## Facts` section + fence
  * is created at the end of the body.
  *
- * Append-only — row_num is set to (max existing rowNum in the fence) + 1.
- * Stable forever, so cross-page refs like `<slug>#F<N>` keep pointing at
- * the same row.
+ * Append-only — row_num is set to (max numeric first-cell across ALL
+ * physical fence lines) + 1. The max scans physical lines rather than
+ * parsed rows so a malformed row's number is never re-issued. Stable
+ * forever, so cross-page refs like `<slug>#F<N>` keep pointing at the
+ * same row.
+ *
+ * v0.42.24 (FE-2 lossy-rewrite fix): the append is LINE-PRESERVING. The
+ * pre-fix implementation re-rendered the whole fence from the lenient
+ * parse, which silently and permanently erased anything the parser
+ * dropped (hand-edit typos, prose comments inside the markers, collision
+ * rows) from the system-of-record file — and the atomic-write validate
+ * gate could not catch it because the re-rendered body was already
+ * clean. Now the new row is rendered as a single line and spliced in
+ * after the last table line; every other byte between the markers is
+ * preserved verbatim.
+ *
+ * v0.42.24 (FE-5 strikethrough-inversion fix): an ACTIVE claim whose
+ * text is wrapped in `~~…~~` (pasted markdown strikethrough) would
+ * render verbatim and then parse back as struck → the fact was born
+ * expired with a success receipt. The fence format reserves whole-cell
+ * strikethrough for inactive rows, so the wrap is stripped up front —
+ * the stored claim equals what every later parse would deliver anyway.
  */
 export function upsertFactRow(
   body: string,
@@ -360,46 +538,110 @@ export function upsertFactRow(
     active?: boolean;
   },
 ): { body: string; rowNum: number } {
-  const { facts } = parseFactsFence(body);
-  const nextRowNum = newRow.rowNum
-    ?? (facts.length > 0 ? Math.max(...facts.map(f => f.rowNum)) + 1 : 1);
+  // FE-5: normalize an active claim that would round-trip as struck.
+  let claim = newRow.claim;
+  if (newRow.active !== false) {
+    const { text, struck } = stripStrikethrough(claim);
+    if (struck) claim = text;
+  }
 
-  const allRows: ParsedFact[] = [
-    ...facts,
-    {
-      rowNum: nextRowNum,
-      claim: newRow.claim,
-      kind: newRow.kind,
-      confidence: newRow.confidence,
-      visibility: newRow.visibility,
-      notability: newRow.notability,
-      validFrom: newRow.validFrom,
-      validUntil: newRow.validUntil,
-      source: newRow.source,
-      context: newRow.context,
-      active: newRow.active ?? true,
-      // v0.35.4 — typed-claim pass-through. When undefined the renderer
-      // stays at the 10-cell shape so unrelated edits don't widen the
-      // fence.
-      claimMetric: newRow.claimMetric,
-      claimValue:  newRow.claimValue,
-      claimUnit:   newRow.claimUnit,
-      claimPeriod: newRow.claimPeriod,
-    },
-  ];
+  const rowNeedsWide =
+    newRow.claimMetric !== undefined ||
+    newRow.claimValue  !== undefined ||
+    newRow.claimUnit   !== undefined ||
+    newRow.claimPeriod !== undefined;
 
-  const newFence = renderFactsTable(allRows);
+  const makeRow = (rowNum: number): ParsedFact => ({
+    rowNum,
+    claim,
+    kind: newRow.kind,
+    confidence: newRow.confidence,
+    visibility: newRow.visibility,
+    notability: newRow.notability,
+    validFrom: newRow.validFrom,
+    validUntil: newRow.validUntil,
+    source: newRow.source,
+    context: newRow.context,
+    active: newRow.active ?? true,
+    // v0.35.4 — typed-claim pass-through. When undefined the renderer
+    // stays at the 10-cell shape so unrelated edits don't widen the
+    // fence.
+    claimMetric: newRow.claimMetric,
+    claimValue:  newRow.claimValue,
+    claimUnit:   newRow.claimUnit,
+    claimPeriod: newRow.claimPeriod,
+  });
 
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
   const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  let out: string;
-  if (beginIdx !== -1 && endIdx !== -1) {
-    out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
-  } else {
+
+  if (beginIdx === -1 || endIdx === -1) {
+    // No fence — create one at the end of the body (unchanged behavior).
+    const row = makeRow(newRow.rowNum ?? 1);
+    const newFence = renderFactsTable([row]);
     const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    out = `${body}${sep}## Facts\n\n${newFence}\n`;
+    return { body: `${body}${sep}## Facts\n\n${newFence}\n`, rowNum: row.rowNum };
   }
-  return { body: out, rowNum: nextRowNum };
+
+  const innerStart = beginIdx + FACTS_FENCE_BEGIN.length;
+  const inner = body.slice(innerStart, endIdx);
+  const scan = scanFenceLines(inner);
+  const nextRowNum = newRow.rowNum ?? scan.maxRowNum + 1;
+  const row = makeRow(nextRowNum);
+
+  if (scan.headerIdx === -1) {
+    // Fence markers exist but no recognizable table. When the inner
+    // region is effectively empty, render a fresh table (nothing to
+    // lose). When it carries content we can't classify, preserve it and
+    // start the table after it.
+    const table = renderFactsTable([row]);
+    const tableInner = table.slice(FACTS_FENCE_BEGIN.length, table.length - FACTS_FENCE_END.length);
+    const preserved = inner.trim().length === 0 ? '' : `${inner.replace(/\s*$/, '')}\n`;
+    const newInner = `${preserved}${tableInner}`;
+    return {
+      body: body.slice(0, innerStart) + newInner + body.slice(endIdx),
+      rowNum: nextRowNum,
+    };
+  }
+
+  if (rowNeedsWide && !scan.wide) {
+    // Widening rewrites every line, so it is only safe when the whole
+    // fence is losslessly parseable (a lossy widen would erase whatever
+    // the parser dropped — the exact FE-2 failure). No production write
+    // path currently appends typed-claim rows via this function; refuse
+    // loudly rather than lose data if one ever does against a fence
+    // carrying unparseable content.
+    const parsed = parseFactsFence(body);
+    const classifiable = scan.lines.every((line, i) => {
+      if (!line.trim()) return true;
+      const cells = parseRowCells(line);
+      if (!cells) return false; // prose inside the fence — would be erased
+      if (i === scan.headerIdx) return true;
+      if (isSeparatorRow(cells)) return true;
+      const n = parseInt(cells[0], 10);
+      return Number.isFinite(n) && parsed.facts.some(f => f.rowNum === n);
+    });
+    if (parsed.warnings.length > 0 || !classifiable) {
+      throw new Error(
+        `FACTS_FENCE_WIDEN_LOSSY: cannot widen a fence to the typed-claim shape while it carries unparseable content (${parsed.warnings.length} parse warning(s)); fix the fence or append without typed fields`,
+      );
+    }
+    const newFence = renderFactsTable([...parsed.facts, row]);
+    return {
+      body: body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length),
+      rowNum: nextRowNum,
+    };
+  }
+
+  // Line-preserving append: splice the rendered row after the last
+  // pipe-shaped line (always >= headerIdx here).
+  const newLines = [...scan.lines];
+  newLines.splice(scan.lastPipeIdx + 1, 0, renderFactRowLine(row, scan.wide));
+  const newInner = newLines.join('\n');
+  return {
+    body: body.slice(0, innerStart) + newInner + body.slice(endIdx),
+    rowNum: nextRowNum,
+  };
 }
 
 export interface StripFactsFenceOpts {

@@ -19,9 +19,10 @@
  * batch insert.
  *
  * Strikethrough → date derivation:
- *   - `forgotten` rows get `valid_until = today` so the DB's existing
- *     `expired_at = valid_until + now()` rule produces the same forget
- *     state after `gbrain rebuild` (v0.32.3) as before.
+ *   - `forgotten` rows get `valid_until = today` AND (v0.42.24)
+ *     `expired_at` derived directly — the "`expired_at = valid_until +
+ *     now()` rule" this comment used to cite never existed in the DB,
+ *     which meant struck rows resurrected as active on every rebuild.
  *   - `supersededBy` rows preserve their existing `validUntil` if set;
  *     otherwise leave `valid_until = null` (the consolidator phase fills
  *     this in based on the newer row's `valid_from`).
@@ -43,6 +44,25 @@ import type { ParsedFact } from '../facts-fence.ts';
 export type FenceExtractedFact = NewFact & {
   row_num: number;
   source_markdown_slug: string;
+  /**
+   * v0.42.24 (fence-resurrection class): derived expiry state for
+   * inactive fence rows. Comments across this file family used to cite
+   * an "`expired_at = valid_until + now()` rule" in the DB — that rule
+   * NEVER EXISTED: no trigger, no insert-path derivation, and every
+   * active-fact query filters on `expired_at IS NULL` alone. So every
+   * struck fence row (forgotten, superseded, hand-struck) re-minted by
+   * the reconcile wipe-and-reinsert came back ACTIVE in query terms,
+   * resurrecting forgets and supersessions on every rebuild. The mapper
+   * now derives `expired_at` here and `insertFacts` persists it.
+   */
+  expired_at?: Date | null;
+  /**
+   * v0.42.24: DB-id supersession pointer re-derived from the fence's
+   * `superseded by fact #<id>` context marker, so a B2 supersede chain
+   * survives the reconcile re-mint. Persisted via a guarded subselect —
+   * a dangling id degrades to NULL instead of failing the batch.
+   */
+  superseded_by?: number | null;
 };
 
 /**
@@ -204,6 +224,17 @@ export function extractFactsFromFenceText(
       validUntil = null;
     }
 
+    // v0.42.24 — expired_at derivation (fence-resurrection fix). Every
+    // struck row must land expired in DB-query terms (`expired_at IS
+    // NULL` is THE active predicate; there is no valid_until-based
+    // fallback anywhere). Deterministic: the explicit validUntil date
+    // when present (both forget and supersede write one), else today's
+    // UTC midnight — same stability posture as the valid_until
+    // derivation above. Active rows never get expired_at here, even
+    // with a past valid_until: temporal validity and expiry remain
+    // separate axes for active facts (pre-existing query semantics).
+    const expiredAt: Date | null = f.active ? null : (explicitUntil ?? validUntil ?? today);
+
     const row: FenceExtractedFact = {
       fact: f.claim,
       kind: f.kind as FactKind,
@@ -217,6 +248,8 @@ export function extractFactsFromFenceText(
       confidence: f.confidence,
       row_num: f.rowNum,
       source_markdown_slug: slug,
+      expired_at: expiredAt,
+      superseded_by: f.supersededByFactId ?? null,
       // v0.35.4 (D-CDX-5) — typed-claim threading. Metric label normalized
       // here so the DB-side index hits use the canonical name; value /
       // unit / period stored verbatim.

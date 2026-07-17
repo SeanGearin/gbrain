@@ -4073,7 +4073,7 @@ const recall: Operation = {
 
 const forget_fact: Operation = {
   name: 'forget_fact',
-  description: 'v0.32.2: forget a fact. Rewrites the page\'s `## Facts` fence to strike through the row and set valid_until=today (the DB\'s expired_at derives via valid_until + now() on the next reconcile so the forget survives `gbrain rebuild`). Falls back to legacy DB-only expire for pre-v51 / thin-client rows. Idempotent on already-expired or unknown ids.',
+  description: 'v0.32.2: forget a fact. Rewrites the page\'s `## Facts` fence to strike through the row and set valid_until=today (the reconcile re-derives valid_until + expired_at from the struck row, so the forget survives `gbrain rebuild`). Falls back to legacy DB-only expire for pre-v51 / thin-client rows; the response\'s `durable` flag is false when a fence-backed row got only the DB stamp (the next reconcile of that page would resurrect the fact). Idempotent on already-expired or unknown ids.',
   params: {
     id: { type: 'number', required: true, description: 'Fact id to forget.' },
     reason: { type: 'string', required: false, description: 'Optional reason; written to the fence row\'s context cell as "forgotten: <reason>". Default: "forgotten".' },
@@ -4092,7 +4092,7 @@ const forget_fact: Operation = {
     if (!result.ok && result.path === 'already_expired') {
       throw new OperationError('fact_already_expired', `Fact id ${id} already expired.`);
     }
-    return { id, expired: true, path: result.path, reason: result.reason };
+    return { id, expired: true, path: result.path, reason: result.reason, durable: result.durable };
   },
 };
 

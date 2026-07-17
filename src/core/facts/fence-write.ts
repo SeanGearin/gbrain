@@ -39,7 +39,7 @@ import { join, dirname } from 'node:path';
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
-import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
+import { upsertFactRow, parseFactsFence, introducesNewWarnings } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 
@@ -211,6 +211,14 @@ export async function writeFactsToFence(
         body = stubEntityPage(target.slug);
       }
 
+      // v0.42.24 (FE-2): capture the ORIGINAL body's parse warnings.
+      // upsertFactRow is now line-preserving, so pre-existing fence
+      // damage (hand-edit typos, prose, collision rows) survives the
+      // append instead of being silently erased — which means the
+      // validate gate below must fail only on NEW warnings, not on
+      // damage that predates this write.
+      const preWarnings = parseFactsFence(body).warnings;
+
       // 2. Upsert each fact onto the fence in input order. row_num
       //    monotonically increases (max-existing + 1 per call, append-only).
       const assignedRowNums: number[] = [];
@@ -235,11 +243,15 @@ export async function writeFactsToFence(
       writeFileSync(tmpPath, body, 'utf-8');
 
       // 4. Parse-before-rename: re-read the .tmp content and verify the
-      //    fence is well-formed. Anything malformed → leave .tmp in
-      //    place as quarantine, write JSONL, do NOT insert to DB.
+      //    APPEND didn't corrupt the fence. The gate is "no NEW
+      //    warnings" (v0.42.24): pre-existing damage is preserved by
+      //    the line-preserving append and must neither be erased nor
+      //    turn every subsequent write into an outage. Anything the
+      //    append itself broke → leave .tmp in place as quarantine,
+      //    write JSONL, do NOT insert to DB.
       const tmpBody = readFileSync(tmpPath, 'utf-8');
       const parsed = parseFactsFence(tmpBody);
-      if (parsed.warnings.length > 0) {
+      if (introducesNewWarnings(preWarnings, parsed.warnings)) {
         recordWriteFailure(target.slug, target.sourceId, parsed.warnings, filePath);
         return { inserted: 0, ids: [], fenceWriteFailed: true };
       }

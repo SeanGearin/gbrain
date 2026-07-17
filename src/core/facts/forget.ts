@@ -9,27 +9,45 @@
  *
  * The fix: forget becomes a fence rewrite. Strike through the target
  * row's `claim` cell, set its `valid_until` to today, append
- * `forgotten: <reason>` to its `context` cell. The DB's existing
- * `expired_at = valid_until + now()` rule reconstructs the forget
- * state on every rebuild because the fence is canonical.
+ * `forgotten: <reason>` to its `context` cell. On every rebuild the
+ * extract-from-fence mapper re-derives `valid_until` AND (v0.42.24)
+ * `expired_at` from the struck row, so the forget state survives.
+ * (Older comments cited an "`expired_at = valid_until + now()` rule"
+ * in the DB — that rule never existed; the mapper derivation is the
+ * real mechanism.)
  *
  * Strikethrough parse contract (extends commit 2's two-mode design):
- *   `~~claim~~` + `context: superseded by #N`    → supersededBy=N
- *   `~~claim~~` + `context: forgotten: <reason>` → forgotten=true
- *   `~~claim~~` + anything else                  → active=false; the
+ *   `~~claim~~` + `context: superseded by #N`       → supersededBy=N
+ *   `~~claim~~` + `context: superseded by fact #N`  → supersededByFactId=N
+ *   `~~claim~~` + `context: forgotten: <reason>`    → forgotten=true
+ *   `~~claim~~` + anything else                     → active=false; the
  *      mapper treats this as forgotten for DB-derivation purposes.
+ *
+ * v0.42.24 (FE-2 lossy-rewrite fix): the fence rewrite is now a
+ * SURGICAL single-line replacement via `updateFactRowInFence` — every
+ * byte the forget doesn't intend to touch (prose comments, hand-edit
+ * typo rows, collision rows) is preserved verbatim. The pre-fix
+ * implementation re-rendered the whole fence from the lenient parse,
+ * silently erasing anything the parser dropped, and the validate gate
+ * couldn't catch it because the re-render was already clean. The gate
+ * is now "no NEW parse warnings": pre-existing fence damage neither
+ * blocks the forget nor gets erased by it.
  *
  * Two-tier fallback for cross-state safety:
  *   1. If the target row has v51 columns (row_num + source_markdown_slug
  *      + sources.local_path), do the fence rewrite. The forget survives
- *      rebuild.
- *   2. If any of those is missing (pre-v51 legacy row, NULL entity_slug,
- *      no local_path on the source), fall through to the legacy
+ *      rebuild (`durable: true`).
+ *   2. If any of those is missing, fall through to the legacy
  *      `engine.expireFact(id)` direct-DB path. A once-per-process
  *      stderr warning names the case so operators see the degraded
- *      mode. These forgets DO NOT survive rebuild — the architecture
- *      doc names this as the explicit DB-only exception for legacy
- *      / thin-client state.
+ *      mode. The result's `durable` flag is the honest per-call
+ *      disclosure: rows with NO `source_markdown_slug` are never
+ *      touched by the fence reconcile, so a DB-only forget of one IS
+ *      durable; rows that ARE fence-backed but couldn't be rewritten
+ *      (file deleted, row_num drift, validate failure) get
+ *      `durable: false` — the next reconcile of that page resurrects
+ *      the fact. Callers must surface that instead of implying the
+ *      forget survives rebuild.
  */
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
@@ -37,7 +55,7 @@ import { join } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
-import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fence.ts';
+import { parseFactsFence, updateFactRowInFence, introducesNewWarnings } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
   /** True iff the row was found AND a forget was applied (fence or DB). */
@@ -46,6 +64,16 @@ export interface ForgetFactResult {
   path: 'fence' | 'legacy_db' | 'not_found' | 'already_expired';
   /** Human-readable reason captured in `context`; mirrors back what was written. */
   reason: string;
+  /**
+   * v0.42.24 — honest durability disclosure. True when the forget
+   * survives a rebuild/reconcile: either the fence was rewritten
+   * (`path: 'fence'`) or the row is not fence-backed (NULL
+   * `source_markdown_slug`, so the reconcile wipe never touches it).
+   * False when the row IS fence-backed but only the DB was stamped —
+   * the next `extract_facts` reconcile of that page will resurrect the
+   * fact. Meaningful only when `ok` is true.
+   */
+  durable: boolean;
 }
 
 interface FactDbRow {
@@ -93,12 +121,17 @@ export async function forgetFactInFence(
     [factId],
   );
   if (rows.length === 0) {
-    return { ok: false, path: 'not_found', reason };
+    return { ok: false, path: 'not_found', reason, durable: true };
   }
   const row = rows[0];
 
+  // DB-only expire is durable iff the row is NOT fence-backed: the
+  // reconcile wipe (`deleteFactsForPage`) keys on `source_markdown_slug`,
+  // so NULL-slug rows are never re-minted from a fence.
+  const dbOnlyDurable = row.source_markdown_slug === null;
+
   if (row.expired_at !== null) {
-    return { ok: false, path: 'already_expired', reason };
+    return { ok: false, path: 'already_expired', reason, durable: true };
   }
 
   // Fence path requires: v51 columns set + source.local_path set.
@@ -108,9 +141,9 @@ export async function forgetFactInFence(
     row.entity_slug !== null;
 
   if (!canFence) {
-    // Legacy path — DB-only forget. Doesn't survive `gbrain rebuild`.
+    // Legacy path — DB-only forget. Durable only for non-fence-backed rows.
     const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+    return { ok, path: 'legacy_db', reason, durable: dbOnlyDurable };
   }
 
   // Look up source.local_path.
@@ -121,7 +154,7 @@ export async function forgetFactInFence(
   const localPath = sources[0]?.local_path ?? null;
   if (!localPath) {
     const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+    return { ok, path: 'legacy_db', reason, durable: dbOnlyDurable };
   }
 
   const slug = row.source_markdown_slug!;
@@ -134,64 +167,52 @@ export async function forgetFactInFence(
     // Legacy path is the safe behavior; the operator can fix the
     // tree mismatch separately.
     const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+    return { ok, path: 'legacy_db', reason, durable: dbOnlyDurable };
   }
 
   return withPageLock(slug, async () => {
     const body = readFileSync(filePath, 'utf-8');
-    const parsed = parseFactsFence(body);
-
-    // Find the target row in the fence by row_num.
-    const target = parsed.facts.find(f => f.rowNum === targetRowNum);
-    if (!target) {
-      // Fence is missing the row — DB drifted from markdown. Fall
-      // through to legacy expire so the user's intent succeeds; doctor
-      // surfaces the drift separately.
-      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-      return { ok, path: 'legacy_db', reason };
-    }
+    const preWarnings = parseFactsFence(body).warnings;
 
     // Mutate: strike out claim (already-strikethrough rows stay
     // strikethrough), set valid_until = today, append "forgotten:
-    // <reason>" to context (preserving any existing context).
+    // <reason>" to context (preserving any existing context). The
+    // separator is '; ' — NOT ' | ' — because a literal pipe in a cell
+    // is exactly the escape-asymmetry corruption trigger (FE-4:
+    // escape-on-write writes '\|' but the parser splits on every '|').
     const today = todayUtc();
-    const existingContext = target.context?.trim() ?? '';
-    const newContext = existingContext
-      ? `${existingContext} | forgotten: ${reason}`
-      : `forgotten: ${reason}`;
 
-    const updated: ParsedFact[] = parsed.facts.map(f =>
-      f.rowNum === targetRowNum
-        ? {
-            ...f,
-            active: false,        // strikethrough on render
-            validUntil: today,
-            context: newContext,
-            forgotten: true,
-          }
-        : f,
-    );
-
-    // Render + atomic .tmp + parse-validate + rename.
-    const newFence = renderFactsTable(updated);
-    const begin = body.indexOf('<!--- gbrain:facts:begin -->');
-    const end   = body.indexOf('<!--- gbrain:facts:end -->', begin + 1);
-    if (begin === -1 || end === -1) {
-      // Race / corruption: fence disappeared between parse and render.
-      // Legacy fallback.
+    // Surgical single-line replacement. Null → the fence is missing the
+    // row (DB drifted from markdown) or the row is hand-mangled beyond
+    // parsing: fall through to legacy expire so the user's intent
+    // succeeds; doctor surfaces the drift separately.
+    const edit = updateFactRowInFence(body, targetRowNum, f => {
+      const existingContext = f.context?.trim() ?? '';
+      return {
+        ...f,
+        active: false,        // strikethrough on render
+        validUntil: today,
+        context: existingContext
+          ? `${existingContext}; forgotten: ${reason}`
+          : `forgotten: ${reason}`,
+        forgotten: true,
+      };
+    });
+    if (!edit) {
       const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-      return { ok, path: 'legacy_db', reason };
+      return { ok, path: 'legacy_db' as const, reason, durable: dbOnlyDurable };
     }
-    const newBody = body.slice(0, begin) + newFence + body.slice(end + '<!--- gbrain:facts:end -->'.length);
 
-    writeFileSync(tmpPath, newBody, 'utf-8');
+    // Atomic .tmp + parse-validate + rename. The gate is "no NEW
+    // warnings": pre-existing fence damage is preserved (never erased —
+    // that was FE-2) and doesn't block the forget; damage INTRODUCED by
+    // this edit quarantines the .tmp and falls back to DB expire.
+    writeFileSync(tmpPath, edit.body, 'utf-8');
     const tmpBody = readFileSync(tmpPath, 'utf-8');
-    const validate = parseFactsFence(tmpBody);
-    if (validate.warnings.length > 0) {
-      // Quarantine .tmp; leave the canonical file alone; fall back to
-      // DB expire so the user's forget intent still succeeds.
+    const postWarnings = parseFactsFence(tmpBody).warnings;
+    if (introducesNewWarnings(preWarnings, postWarnings)) {
       const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-      return { ok, path: 'legacy_db', reason };
+      return { ok, path: 'legacy_db' as const, reason, durable: dbOnlyDurable };
     }
     renameSync(tmpPath, filePath);
 
@@ -205,6 +226,6 @@ export async function forgetFactInFence(
       [today, factId],
     );
 
-    return { ok: true, path: 'fence', reason };
+    return { ok: true, path: 'fence' as const, reason, durable: true };
   }, { timeoutMs: 5_000 });
 }

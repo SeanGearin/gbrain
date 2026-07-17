@@ -3965,7 +3965,12 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async insertFacts(
-    rows: Array<NewFact & { row_num: number; source_markdown_slug: string }>,
+    rows: Array<NewFact & {
+      row_num: number;
+      source_markdown_slug: string;
+      expired_at?: Date | null;
+      superseded_by?: number | null;
+    }>,
     ctx: { source_id: string },
   ): Promise<{ inserted: number; ids: number[] }> {
     if (rows.length === 0) return { inserted: 0, ids: [] };
@@ -4003,6 +4008,15 @@ export class PostgresEngine implements BrainEngine {
         const claimPeriod = input.claim_period ?? null;
         // v0.40.2.0 — event_type column (Commit 1 migration v89).
         const eventType   = input.event_type   ?? null;
+        // v0.42.24 — fence-resurrection fix: persist the mapper-derived
+        // expiry state + supersession pointer so struck fence rows come
+        // back EXPIRED from the reconcile wipe-and-reinsert instead of
+        // resurrecting as active. superseded_by goes through a guarded
+        // subselect: a dangling id (the superseding fact was itself
+        // re-minted or deleted) degrades to NULL instead of failing the
+        // whole batch on the facts self-FK.
+        const expiredAt    = input.expired_at    ?? null;
+        const supersededBy = input.superseded_by ?? null;
 
         const ins = await tx<Array<{ id: number }>>`
           INSERT INTO facts (
@@ -4011,14 +4025,16 @@ export class PostgresEngine implements BrainEngine {
             embedding, embedded_at,
             row_num, source_markdown_slug,
             claim_metric, claim_value, claim_unit, claim_period,
-            event_type
+            event_type,
+            expired_at, superseded_by
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
             ${input.row_num}, ${input.source_markdown_slug},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
-            ${eventType}
+            ${eventType},
+            ${expiredAt}, (SELECT f2.id FROM facts f2 WHERE f2.id = ${supersededBy})
           ) RETURNING id
         `;
         out.push(Number(ins[0].id));

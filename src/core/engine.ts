@@ -1710,7 +1710,26 @@ export interface BrainEngine {
    * fence-row → DB-id without a separate lookup.
    */
   insertFacts(
-    rows: Array<NewFact & { row_num: number; source_markdown_slug: string }>,
+    rows: Array<NewFact & {
+      row_num: number;
+      source_markdown_slug: string;
+      /**
+       * v0.42.24 (fence-resurrection fix): expiry state derived by the
+       * extract-from-fence mapper for struck rows. Without persisting
+       * this, every reconcile re-minted forgotten/superseded fence rows
+       * as ACTIVE — `expired_at IS NULL` is the sole active predicate;
+       * the "valid_until + now()" derivation older comments cited never
+       * existed in the DB.
+       */
+      expired_at?: Date | null;
+      /**
+       * v0.42.24: supersession chain pointer re-derived from the fence's
+       * `superseded by fact #<id>` marker. Engines persist it through a
+       * guarded subselect so a dangling id degrades to NULL instead of
+       * failing the whole batch on the self-FK.
+       */
+      superseded_by?: number | null;
+    }>,
     ctx: { source_id: string },
   ): Promise<{ inserted: number; ids: number[] }>;
 
@@ -1726,8 +1745,8 @@ export interface BrainEngine {
    * disappears from markdown corresponds to a fact the user removed
    * entirely from history; the DB mirrors that. Forgotten facts that
    * stay in the fence as strikethrough rows survive the wipe because
-   * the re-insert puts them back with `valid_until = today` per the
-   * `extract-from-fence` derivation contract.
+   * the re-insert puts them back with `valid_until` AND (v0.42.24)
+   * `expired_at` per the `extract-from-fence` derivation contract.
    *
    * Pre-v51 rows (NULL `source_markdown_slug`) are NEVER deleted by this
    * call — the partial UNIQUE index on `row_num IS NOT NULL` is the

@@ -3693,7 +3693,12 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async insertFacts(
-    rows: Array<NewFact & { row_num: number; source_markdown_slug: string }>,
+    rows: Array<NewFact & {
+      row_num: number;
+      source_markdown_slug: string;
+      expired_at?: Date | null;
+      superseded_by?: number | null;
+    }>,
     ctx: { source_id: string },
   ): Promise<{ inserted: number; ids: number[] }> {
     if (rows.length === 0) return { inserted: 0, ids: [] };
@@ -3725,11 +3730,20 @@ export class PGLiteEngine implements BrainEngine {
         const claimPeriod = input.claim_period ?? null;
         // v0.40.2.0 — event_type column (Commit 1 migration v89).
         const eventType   = input.event_type   ?? null;
+        // v0.42.24 — fence-resurrection fix (postgres-engine parity):
+        // persist mapper-derived expiry state + supersession pointer so
+        // struck fence rows come back EXPIRED from the reconcile
+        // wipe-and-reinsert. The superseded_by subselect degrades a
+        // dangling id to NULL instead of failing the batch on the
+        // facts self-FK.
+        const expiredAt    = input.expired_at    ?? null;
+        const supersededBy = input.superseded_by ?? null;
 
         // Param-positional dispatch: embedStr presence shifts the trailing
         // slots by one. Order of named slots stays stable across both
         // branches: embedded_at, row_num, source_markdown_slug,
-        // claim_metric, claim_value, claim_unit, claim_period, event_type.
+        // claim_metric, claim_value, claim_unit, claim_period, event_type,
+        // expired_at, superseded_by.
         const ins = await tx.query<{ id: number }>(
           embedStr === null
             ? `INSERT INTO facts (
@@ -3738,13 +3752,15 @@ export class PGLiteEngine implements BrainEngine {
                  embedding, embedded_at,
                  row_num, source_markdown_slug,
                  claim_metric, claim_value, claim_unit, claim_period,
-                 event_type
+                 event_type,
+                 expired_at, superseded_by
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  NULL, $13,
                  $14, $15,
                  $16, $17, $18, $19,
-                 $20
+                 $20,
+                 $21, (SELECT f2.id FROM facts f2 WHERE f2.id = $22)
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
@@ -3752,17 +3768,19 @@ export class PGLiteEngine implements BrainEngine {
                  embedding, embedded_at,
                  row_num, source_markdown_slug,
                  claim_metric, claim_value, claim_unit, claim_period,
-                 event_type
+                 event_type,
+                 expired_at, superseded_by
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  $13::vector, $14,
                  $15, $16,
                  $17, $18, $19, $20,
-                 $21
+                 $21,
+                 $22, (SELECT f2.id FROM facts f2 WHERE f2.id = $23)
                ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType, expiredAt, supersededBy]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType, expiredAt, supersededBy],
         );
         out.push(ins.rows[0].id);
       }

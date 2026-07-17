@@ -8,7 +8,10 @@
  *
  * Source-of-truth contract: the fence is canonical. For each page in
  * the affected slug set, this phase:
- *   1. Reads the markdown body (DB-side fetch via engine.getPage).
+ *   1. Reads the markdown body — from DISK when the source has a
+ *      local_path and the file exists (v0.42.24 FE-3 fix: the fence
+ *      writers write disk, so the disk fence is canonical; the DB body
+ *      can be stale between syncs), else via engine.getPage.
  *   2. Parses the `## Facts` fence with parseFactsFence.
  *   3. Maps ParsedFact → FenceExtractedFact via extractFactsFromFenceText.
  *   4. Wipes the page's DB index via deleteFactsForPage.
@@ -31,11 +34,15 @@
  * while legacy rows linger in the DB.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import type { BrainEngine } from '../engine.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
+import { lookupSourceLocalPath } from '../facts/fence-write.ts';
 import {
   runPhantomRedirectPass,
   emptyPhantomPassResult,
@@ -109,9 +116,27 @@ export async function runExtractFacts(
   // entity_slug NOT NULL), refuse to run the destructive
   // reconciliation pass. The v0_32_2 orchestrator must complete
   // first.
-  const legacy = await engine.executeRaw<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
-  );
+  //
+  // v0.42.24 carve-out: B7 `save_facts` rows (client_authored = TRUE,
+  // migration v93) are entity-slugged but deliberately fence-less —
+  // they are NOT v0.31 legacy rows pending backfill. Without the
+  // carve-out, ONE save_facts claim with a resolvable subject
+  // permanently tripped this guard and froze fence reconciliation for
+  // the whole brain (misreported as a pending migration) — which also
+  // meant fence forgets/supersessions could never re-derive their
+  // expiry state. Pre-v93 schemas lack the column; fall back to the
+  // original predicate.
+  let legacy: Array<{ n: string }>;
+  try {
+    legacy = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM facts
+        WHERE row_num IS NULL AND entity_slug IS NOT NULL AND client_authored = FALSE`,
+    );
+  } catch {
+    legacy = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
+    );
+  }
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
   if (legacyCount > 0) {
@@ -186,6 +211,24 @@ export async function runExtractFacts(
     slugs = Array.from(slugSet);
   }
 
+  // ── v0.42.24 (FE-3): resolve the source's local_path once ─────
+  // The fence writers (`writeFactsToFence`, `forgetFactInFence`,
+  // `supersedeFactDurably`) write DISK, deliberately not putPage — the
+  // on-disk fence is the system of record for local-path sources. This
+  // phase used to reconcile from the DB page body (`compiled_truth`),
+  // so any run that wasn't immediately preceded by a sync over the same
+  // slugs reconciled from a STALE body: just-receipted fence inserts
+  // were deleted, and fence forgets resurrected, until the next sync.
+  // Reading the disk file (when it exists) aligns the reconcile with
+  // the invariant. DB-only pages (thin-client sources, construct-
+  // materialized bodies) still fall back to `compiled_truth`.
+  let sourceLocalPath: string | null = null;
+  try {
+    sourceLocalPath = await lookupSourceLocalPath(engine, sourceId);
+  } catch {
+    sourceLocalPath = null; // fail-safe: behave exactly as before
+  }
+
   // ── Reconcile each page ───────────────────────────────────────
   for (const slug of slugs) {
     result.pagesScanned += 1;
@@ -197,7 +240,17 @@ export async function runExtractFacts(
       continue;
     }
 
-    const body = page.compiled_truth ?? '';
+    let body = page.compiled_truth ?? '';
+    if (sourceLocalPath) {
+      const filePath = join(sourceLocalPath, `${slug}.md`);
+      try {
+        if (existsSync(filePath)) {
+          body = readFileSync(filePath, 'utf-8');
+        }
+      } catch {
+        // Disk read hiccup — keep the DB body (pre-v0.42.24 behavior).
+      }
+    }
     const parsed = parseFactsFence(body);
     if (parsed.warnings.length > 0) {
       result.warnings.push(
