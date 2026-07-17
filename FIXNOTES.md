@@ -61,3 +61,28 @@ Deliberate non-fixes (watch, don't churn): expanded keyword arms tilt RRF slight
 After deploying the fixes above, F5 went green but every wrapper/compound case stayed hard-empty — and the honest cache exposed that yesterday's "second-person wrapper works" evidence had itself been an F5 cache mirage. Live probes then isolated the true binding cause: the tenant plane's `requireLexicalAnchor` gate anchors on whole-phrase keyword hits, and Postgres FTS ANDs terms — one out-of-corpus word ("what do you KNOW about Boltline", "Boltline INVOLVEMENT deal") empties the keyword arm, the anchor set goes empty, and the gate annihilates every vector hit. Probes: "about Boltline" → hits (stopword drops); "know about Boltline" → []; "purple elephant Boltline" → [].
 
 Fix: when the whole-phrase keyword arms produce zero anchors and fused results exist, probe the query's significant terms individually (`anchorProbeTerms`, cap 6, filler-filtered) and anchor on their hits. A true off-world query still anchors to nothing and still gates to empty — the guard's purpose is preserved; conversational phrasing about real entities stops being annihilated. Tests: "conversational phrase … survives the gate via per-term anchors" + "true off-world query still gates to empty".
+
+## fix/engine-recall-quality — 2026-07-16 (compound-parity acceptance landed + the time-travel version stamp)
+
+Branch base: `b8-acceptance` (= `b8-box-staging` + the black-box acceptance corpus). Two recall-quality items:
+
+### 1. Compound-query union — VERIFIED EXISTING, acceptance test landed on this line
+
+The F1/F5 fix stack above (union expanded keyword results, empty-escalation at resolved-low, per-term anchor probe + union, honest cache) already sits in this line's history; the entity-chunk gap (entity pages with 0 content_chunks invisible to search_brain) was closed earlier by the construct/materialize pair (`06e9301` stub chunks at save, `7fa5bc7` facts→compiled_truth materialize). What was missing HERE was the acceptance invariant: `test/compound-query-parity.serial.test.ts` (cherry-picked from `b7-compound-query-union`, orig `04d2442`) pins, under the tenant-plane shape (`requireLexicalAnchor`):
+
+- a compound question returns a SUPERSET of every sub-question run alone;
+- a decomposer yielding nothing (or throwing) degrades to the raw query as a single search — never to empty.
+
+Red-first receipt: at pre-fix base `6d0a526` the superset invariant fails (compound loses sub-question results to the anchor gate — the live [] class); on this branch 3/3 pass.
+
+### 2. save_facts materialize now version-stamps (the time-travel poison)
+
+`materializeEntityPages` rewrote entity pages via the low-level `putPage` upsert with no pre-update snapshot — a NON-versioning rewrite. Every save_facts batch that touched an entity moved `updated_at` with no `page_versions` row, so as-of reconstruction (worker `open_note_as_of`: "a snapshot at T holds the content that stood until T") could only refuse (`no_history`) for exactly the pages save_facts keeps current — permanent poison, worsening with every save.
+
+Fix (`src/core/facts/construct.ts` Phase 3): snapshot the pre-update state via `createVersion` before each materialize rewrite — the same contract the put_page op (`import-file.ts` versions-on-existing) and `revert_version` (snapshot-before-revert) already honor. Phase 1's identical-body skip keeps the chain 1:1 with real content changes (duplicates/no-op batches mint nothing). Tenant-plane safe: plain INSERT..SELECT under grants `gbrain_tenant` already holds (`b7-role.sql` page_versions DML + sequence USAGE); the source-scoped feeding SELECT satisfies the b7 WITH CHECK.
+
+Back-compat: pre-fix rewrites destroyed their pre-states — nothing can invent them. The first post-fix rewrite banks the page's CURRENT state, so the chain is whole from that rewrite forward; the older gap keeps the worker's honest `no_history` disclosure (updated_at moved, no covering snapshot) instead of today's text being served as the past.
+
+Tests: `test/facts-materialize-versioning.test.ts` — red-first 0/4 pre-fix → 4/4 post-fix (stub banked on first materialize; prior body banked on the next — the as-of seam; no version spam on duplicate/no-op; poisoned legacy state banked on first post-fix touch).
+
+Deploy: engine-side only, no schema migration (page_versions + grants already live). Box deploy is Sean-gated, as always.
