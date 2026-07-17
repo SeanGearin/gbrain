@@ -5193,6 +5193,70 @@ export const MIGRATIONS: Migration[] = [
       $$;
     `,
   },
+  {
+    version: 116,
+    name: 'facts_superseded_by_fk_on_delete_set_null',
+    // C2 FK-abort residual (2026-07-17). The reconcile wipe
+    // (deleteFactsForPage) DELETEs a page's fence-backed rows wholesale; any
+    // wipe-SURVIVING row (db-only save_facts/put_page rows — row_num NULL, no
+    // source_markdown_slug) whose superseded_by points into the wiped set
+    // turned the NO ACTION self-FK from v45 into a per-page reconcile abort:
+    // extract_facts threw, rolled back, and every page after it in the loop
+    // was skipped that run. Producible by the B2 dedup supersede (save.ts
+    // expireFact(target, { supersededBy: matchedId }) — matchedId is
+    // custody-blind and can be fence-backed).
+    //
+    // Fence-backed ids are EPHEMERAL — wipe-and-reinsert mints new ids every
+    // reconcile — so a pointer at a fence row can never be durable. ON DELETE
+    // SET NULL makes the FK encode what the insert path already chose (its
+    // guarded superseded_by subselect degrades a dangling id to NULL): when
+    // the target row goes away, the chain link honestly nulls instead of
+    // aborting the delete. One declarative fix covers EVERY facts delete path
+    // (reconcile wipe, phantom-redirect, consolidate's wipe+reinsert,
+    // extract-conversation-facts cleanup) in both engine twins at once.
+    //
+    // One DO block = ONE statement, immune to the postgres.js unsafe()
+    // multi-statement hazard recorded at the v45 facts DDL (inline REFERENCES
+    // observed silently dropped on Postgres in the v0.31 e2e run). Because of
+    // exactly that hazard a live box may carry NO facts_superseded_by_fkey at
+    // all — and therefore dangling superseded_by values — so the pre-clean
+    // UPDATE nulls those first and the validated ADD CONSTRAINT cannot fail:
+    // the migration CONVERGES both schema states to the same enforced FK.
+    // The partial index keeps the per-deleted-row RI scan (SET NULL fires an
+    // UPDATE per wiped row; NO ACTION did a referencing-scan too) off seq
+    // scans. Pinned by test/facts-fk-abort-residual.test.ts.
+    idempotent: true,
+    sql: `
+      DO $$
+      BEGIN
+        UPDATE facts f SET superseded_by = NULL
+         WHERE f.superseded_by IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM facts t WHERE t.id = f.superseded_by);
+
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'facts_superseded_by_fkey'
+             AND conrelid = 'facts'::regclass
+             AND confdeltype <> 'n'
+        ) THEN
+          ALTER TABLE facts DROP CONSTRAINT facts_superseded_by_fkey;
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'facts_superseded_by_fkey'
+             AND conrelid = 'facts'::regclass
+        ) THEN
+          ALTER TABLE facts
+            ADD CONSTRAINT facts_superseded_by_fkey
+            FOREIGN KEY (superseded_by) REFERENCES facts(id) ON DELETE SET NULL;
+        END IF;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_superseded_by
+          ON facts(superseded_by) WHERE superseded_by IS NOT NULL;
+      END $$;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
