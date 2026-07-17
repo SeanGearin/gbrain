@@ -48,6 +48,24 @@ function embedText(text: string, dims: number): number[] {
 }
 
 beforeAll(async () => {
+  // Configure the gateway BEFORE initSchema: since the v0.37 wave the PGlite
+  // schema tracks the ACTIVE gateway default at schema-generation time, and
+  // the legacy-embedding preload re-pins OpenAI/1536 only in a global
+  // beforeEach — which does NOT run before another file's beforeAll. So when
+  // this file executes after any suite whose teardown ends in resetGateway()
+  // (bun's file order is filename-dependent, not CLI order), an empty slot
+  // here used to build halfvec(1280), the vector()-only introspection below
+  // fell back to 1536, and the seed died in halfvec.c CheckExpectedDim
+  // ("expected 1280 dimensions, not 1536") — killing this whole suite in
+  // co-runs while it passed alone. Pin this suite's shape deterministically;
+  // the introspection stays as a cross-check and now always agrees.
+  resetGateway();
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: DIM,
+    env: { OPENAI_API_KEY: 'sk-test' },
+  });
+
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -59,7 +77,6 @@ beforeAll(async () => {
   const m = /vector\((\d+)\)/.exec(rows[0]?.t ?? '');
   DIM = m ? Number(m[1]) : 1536;
 
-  resetGateway();
   configureGateway({
     embedding_model: 'openai:text-embedding-3-large',
     embedding_dimensions: DIM,
