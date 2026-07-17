@@ -256,6 +256,10 @@ async function runRecallOnce(
 
   let rows: FactRow[];
   let pendingCount: number | undefined;
+  // SR-2 (engine audit 2026-07-17): the TRUE matching-row count (pre-LIMIT),
+  // carried from the recall op on thin-client and computed via countFacts
+  // locally. null only if the count is unavailable (older remote engine).
+  let trueTotal: number | null = null;
 
   if (thinClient) {
     const cfg = loadConfig();
@@ -279,24 +283,34 @@ async function runRecallOnce(
     }>(raw);
     rows = unpacked.facts.map(remoteFactToRow);
     pendingCount = unpacked.pending_consolidation_count;
+    // Post-SR-2 engines return the real pre-LIMIT total; trust it. (An older
+    // engine's total === facts.length carries no extra information, but is
+    // still the best available answer.)
+    trueTotal = typeof unpacked.total === 'number' ? unpacked.total : null;
   } else {
     rows = await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
+    trueTotal = await countRowsLocal(engine, flags, sourceId, resolvedSince);
     if (flags.pending) {
       pendingCount = await engine.countUnconsolidatedFacts(sourceId);
     }
   }
 
-  if (flags.grep) {
-    const g = flags.grep;
-    rows = rows.filter(r => r.fact.toLowerCase().includes(g));
-  }
+  // SR-3 (engine audit 2026-07-17): grep now filters INSIDE the engine SQL
+  // (thin-client: inside the recall op) BEFORE the limit window — the old JS
+  // post-filter here could only see the newest-`limit` rows, so "No matching
+  // facts." was asserted while matches existed outside the window.
 
   const rollup = flags.rollup ? computeRollup(rows) : null;
 
   if (flags.json) {
+    // SR-2: `total` is the true pre-LIMIT matching-row count, `returned` the
+    // page size — pre-fix total was rows.length (the page length dressed as
+    // the record's total).
     const payload: Record<string, unknown> = {
       facts: rows.map(factRowToJson),
-      total: rows.length,
+      total: trueTotal ?? rows.length,
+      returned: rows.length,
+      has_more: trueTotal !== null ? rows.length < trueTotal : false,
     };
     if (rollup) payload.top_entities = rollup;
     if (pendingCount !== undefined) payload.pending_consolidation_count = pendingCount;
@@ -328,10 +342,14 @@ async function fetchRowsLocal(
   sourceId: string,
   resolvedSince: Date | null,
 ): Promise<FactRow[]> {
+  // SR-3: grep threads into the engine predicate (ILIKE before LIMIT) on
+  // every branch — see the recall op for the starvation class this closes.
+  const grep = flags.grep || undefined;
   if (flags.supersessions) {
     return engine.listSupersessions(sourceId, {
       since: resolvedSince ?? undefined,
       limit: flags.limit,
+      grep,
     });
   }
   if (flags.entity) {
@@ -339,24 +357,61 @@ async function fetchRowsLocal(
     return engine.listFactsByEntity(sourceId, slug, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      grep,
     });
   }
   if (flags.sessionId) {
     return engine.listFactsBySession(sourceId, flags.sessionId, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      grep,
     });
   }
   if (resolvedSince) {
     return engine.listFactsSince(sourceId, resolvedSince, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      grep,
     });
   }
   return engine.listFactsSince(sourceId, new Date(0), {
     activeOnly: !flags.includeExpired,
     limit: flags.limit,
+    grep,
   });
+}
+
+/**
+ * SR-2 (engine audit 2026-07-17): the COUNT twin of fetchRowsLocal — same
+ * branch selection, same predicates, no LIMIT — so the CLI's JSON `total`
+ * reports the record's true matching-row count instead of the page length.
+ */
+async function countRowsLocal(
+  engine: BrainEngine,
+  flags: ParsedFlags,
+  sourceId: string,
+  resolvedSince: Date | null,
+): Promise<number> {
+  const grep = flags.grep || undefined;
+  if (flags.supersessions) {
+    return engine.countFacts(sourceId, {
+      supersessions: true,
+      since: resolvedSince ?? undefined,
+      grep,
+    });
+  }
+  const activeOnly = !flags.includeExpired;
+  if (flags.entity) {
+    const slug = (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity;
+    return engine.countFacts(sourceId, { activeOnly, entitySlug: slug, grep });
+  }
+  if (flags.sessionId) {
+    return engine.countFacts(sourceId, { activeOnly, sessionId: flags.sessionId, grep });
+  }
+  if (resolvedSince) {
+    return engine.countFacts(sourceId, { activeOnly, since: resolvedSince, grep });
+  }
+  return engine.countFacts(sourceId, { activeOnly, grep });
 }
 
 /**

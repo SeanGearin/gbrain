@@ -181,12 +181,13 @@ describe('op-layer capture — query', () => {
       config: makeConfig({ capture: false }),
     });
 
-    const results = await queryOp.handler(ctx, {
+    // SR-6 envelope (engine audit 2026-07-17): unwrap { results }.
+    const { results } = await queryOp.handler(ctx, {
       query: 'sourceoverrideunique',
       source_id: 'testsrc',
       expand: false,
       use_cache: false,
-    }) as Array<{ slug: string }>;
+    }) as { results: Array<{ slug: string }> };
 
     expect(results.map(r => r.slug)).toContain('notes/source-override-testsrc');
     expect(results.map(r => r.slug)).not.toContain('notes/source-override-default');
@@ -256,9 +257,9 @@ describe('op-layer capture — failure isolation (F1/F2)', () => {
     await (engine as any).db.exec('DROP TABLE eval_candidates');
     const queryOp = operations.find(o => o.name === 'query')!;
     const ctx = makeCtx();
-    // Op must still succeed and return results.
-    const results = await queryOp.handler(ctx, { query: 'alice' });
-    expect(Array.isArray(results)).toBe(true);
+    // Op must still succeed and return results (SR-6 envelope shape).
+    const res = await queryOp.handler(ctx, { query: 'alice' }) as { results: unknown[] };
+    expect(Array.isArray(res.results)).toBe(true);
 
     await waitForCapture();
     // Failure should have landed in the companion table.

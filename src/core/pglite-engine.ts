@@ -13,11 +13,11 @@ import type {
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
   FactRow, FactKind, FactVisibility, FactInsertStatus,
-  NewFact, FactListOpts, FactsHealth,
+  NewFact, FactListOpts, FactCountOpts, FactsHealth,
   SourceRow,
   EntitySplitInput, EntitySplitResult,
 } from './engine.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { MAX_SEARCH_LIMIT, clampSearchLimit, likeContainsPattern } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import { runMigrations } from './migrate.ts';
@@ -3826,7 +3826,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number },
+    opts?: FactListOpts & { since?: Date },
   ): Promise<FactRow[]> {
     const where: string[] = [`expired_at IS NOT NULL`, `superseded_by IS NOT NULL`];
     const params: Record<string, unknown> = {};
@@ -3834,13 +3834,77 @@ export class PGLiteEngine implements BrainEngine {
       where.push(`expired_at >= $since`);
       params.since = opts.since;
     }
+    // SR-5 + SR-4 (engine audit 2026-07-17): thread the FULL FactListOpts —
+    // offset (history beyond MAX_SEARCH_LIMIT was permanently unreachable)
+    // and visibility/ownerSourceId (remote world-only callers could read
+    // private expired fact text) now flow through _listFacts like every
+    // sibling branch. activeOnly is forced false: the audit log IS the
+    // expired rows.
     return this._listFacts(source_id, {
+      ...opts,
       activeOnly: false,
-      limit: opts?.limit,
       whereClauses: where,
       whereParams: params,
       order: 'expired_at DESC, id DESC',
     });
+  }
+
+  /**
+   * SR-2 (engine audit 2026-07-17): COUNT(*) twin of the list-facts methods.
+   * Builds the SAME predicate set as the corresponding list call (see
+   * FactCountOpts pairing contract in engine.ts) with no LIMIT/OFFSET, so
+   * the recall op's `total` is the provable matching-row count.
+   */
+  async countFacts(source_id: string, opts?: FactCountOpts): Promise<number> {
+    const whereParts: string[] = [`source_id = $source_id`];
+    const params: Record<string, unknown> = { source_id };
+    if (opts?.supersessions === true) {
+      whereParts.push(`expired_at IS NOT NULL`);
+      whereParts.push(`superseded_by IS NOT NULL`);
+      if (opts.since) {
+        whereParts.push(`expired_at >= $since`);
+        params.since = opts.since;
+      }
+    } else {
+      if (opts?.activeOnly !== false) whereParts.push(`expired_at IS NULL`);
+      if (opts?.since) {
+        whereParts.push(`created_at >= $since`);
+        params.since = opts.since;
+      }
+    }
+    if (opts?.entitySlug) {
+      whereParts.push(`entity_slug = $entitySlug`);
+      params.entitySlug = opts.entitySlug;
+    }
+    if (opts?.sessionId) {
+      whereParts.push(`source_session = $sessionId`);
+      params.sessionId = opts.sessionId;
+    }
+    if (opts?.kinds && opts.kinds.length > 0) {
+      whereParts.push(`kind = ANY($kinds)`);
+      params.kinds = opts.kinds;
+    }
+    if (opts?.visibility && opts.visibility.length > 0) {
+      const ownerSourceId = opts.ownerSourceId ?? null;
+      if (ownerSourceId) {
+        whereParts.push(`(visibility = ANY($visibility) OR source_id = $ownerSourceId)`);
+        params.visibility = opts.visibility;
+        params.ownerSourceId = ownerSourceId;
+      } else {
+        whereParts.push(`visibility = ANY($visibility)`);
+        params.visibility = opts.visibility;
+      }
+    }
+    if (opts?.grep) {
+      whereParts.push(`fact ILIKE $grepPattern ESCAPE '\\'`);
+      params.grepPattern = likeContainsPattern(opts.grep);
+    }
+    const orderedKeys = Object.keys(params);
+    const indexFor = (name: string): number => orderedKeys.indexOf(name) + 1;
+    const sql = `SELECT COUNT(*)::int AS count FROM facts
+       WHERE ${whereParts.join(' AND ').replace(/\$(\w+)/g, (_m, k) => `$${indexFor(k)}`)}`;
+    const result = await this.db.query<{ count: number }>(sql, orderedKeys.map(k => params[k]));
+    return Number(result.rows[0]?.count ?? 0);
   }
 
   async countUnconsolidatedFacts(source_id: string): Promise<number> {
@@ -4128,6 +4192,13 @@ export class PGLiteEngine implements BrainEngine {
         whereParts.push(`visibility = ANY($visibility)`);
         params.visibility = opts.visibility;
       }
+    }
+    if (opts.grep) {
+      // SR-3 (engine audit 2026-07-17): substring filter INSIDE the WHERE,
+      // before LIMIT/OFFSET — pre-fix the recall op grepped in JS after the
+      // page fetch and starved matches outside the newest-limit window.
+      whereParts.push(`fact ILIKE $grepPattern ESCAPE '\\'`);
+      params.grepPattern = likeContainsPattern(opts.grep);
     }
     for (const c of opts.whereClauses ?? []) whereParts.push(c);
     Object.assign(params, opts.whereParams ?? {});

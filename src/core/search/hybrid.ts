@@ -882,7 +882,15 @@ export async function hybridSearch(
 
   const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
-  const innerLimit = Math.min(limit * 2, MAX_SEARCH_LIMIT);
+  // SR-1 companion fix: the candidate pool must be at least offset+limit deep
+  // or `returnPool.slice(offset, offset + limit)` below returns a false-empty
+  // page for ANY offset beyond the pool — the fresh-path sibling of the cache
+  // poison (and the path every unprovable cache window now falls back to).
+  // offset=0 calls are byte-identical to the old `limit * 2` sizing. The
+  // MAX_SEARCH_LIMIT cap is the engines' own per-arm clamp, so pagination
+  // depth is structurally bounded at ~MAX_SEARCH_LIMIT rows per arm — an
+  // honest, documented ceiling rather than a silent one.
+  const innerLimit = Math.min((limit + offset) * 2, MAX_SEARCH_LIMIT);
 
   // v0.32.x search-lite: classify intent once up front. Drives BOTH the
   // legacy auto-detail / salience / recency suggestions AND the new
@@ -1174,6 +1182,10 @@ export async function hybridSearch(
   let queryEmbedding: Float32Array | null = null;
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
+  // SR-6 (engine audit 2026-07-17): non-null iff the text-path query embed /
+  // vector arm THREW (as opposed to being unconfigured). Threaded into the
+  // emitted meta so the op layer can tell callers the response is degraded.
+  let vectorArmFailure: string | null = null;
   // Facts-vector arm (C): fact-table hits, fused into RRF below. Populated only
   // on the text path (facts live in the text/zembed-1 space), reusing the SAME
   // query embedding the chunk arm computed — no added embedding/model call.
@@ -1300,8 +1312,13 @@ export async function hybridSearch(
           factsList = [];
         }
       }
-    } catch {
-      // Embedding failure is non-fatal, fall back to keyword-only
+    } catch (err) {
+      // Embedding failure is non-fatal, fall back to keyword-only — but
+      // SR-6: RECORD it. Pre-fix this swallow made a provider outage
+      // byte-identical to a healthy keyword-only brain, and a degraded
+      // empty response indistinguishable from a verified no-match.
+      vectorArmFailure =
+        err instanceof Error && err.message ? err.message : 'query embed or vector arm failed';
     }
   }
 
@@ -1337,6 +1354,12 @@ export async function hybridSearch(
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
+      // SR-6: this return path is reached when the vector arm was EXPECTED
+      // to run (provider available) but failed — a degraded response, not a
+      // configured keyword-only brain (that one returns at the
+      // no-embedding-provider checkpoint above with degraded unset).
+      degraded: true,
+      degraded_reason: vectorArmFailure ?? 'query_embed_or_vector_failed',
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: kwBudgetMeta }
         : {}),
@@ -1607,6 +1630,13 @@ export async function hybridSearch(
     intent: suggestions.intent,
     mode: resolvedMode.resolved_mode,
     embedding_column: resolvedCol.name,
+    // SR-6: a cross-modal arm that fell open (unified/image embed failed and
+    // we continued text-only) is a PARTIAL degradation — results exist but
+    // the failed arm's matches are missing. Pre-fix this was console.error
+    // only.
+    ...(crossModalFellOpen
+      ? { degraded: true, degraded_reason: 'cross_modal_arm_fell_open' }
+      : {}),
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -1784,13 +1814,39 @@ export async function hybridSearchCached(
       knobsHash: cacheKnobsHash,
       queryText: query,
     });
+    // SR-1 (engine audit 2026-07-17) — serve ONLY provable windows. The row
+    // stores an offset-0 prefix (the writeback below never stores page-N
+    // slices) stamped with meta.cache_window = { limit, complete }. A window
+    // [offset, offset+limit) is provable when the stored prefix fully covers
+    // it, OR the row is complete (the fresh search exhausted its pool below
+    // its limit, so the prefix IS the whole result set and even an empty
+    // deep slice is honest). Anything else — pre-fix this served
+    // `hit.results.slice(20, 40)` of a 20-row page as an authoritative empty
+    // page 2 — is now a MISS that falls through to a fresh search at the
+    // caller's offset. Legacy page-slice rows can't reach this code at all:
+    // KNOBS_HASH_VERSION was bumped (10→11) so they never match the key.
+    //
+    // SR-10 (same audit): the default limit here was a hard-coded 20 while
+    // the fresh path uses the mode's searchLimit (10/25/50) — hit vs miss
+    // returned different result counts for the same call. resolvedForCache
+    // already folds opts.limit through resolveSearchMode, so use the same
+    // `opts.limit || mode default` rule as bare hybridSearch.
     if (hit.hit && hit.results) {
+      const limit = opts?.limit || resolvedForCache.searchLimit;
+      const offset = opts?.offset || 0;
+      const win = hit.meta?.cache_window;
+      const windowCovered = hit.results.length >= offset + limit;
+      const provable = windowCovered || win?.complete === true;
+      if (!provable) {
+        // Treat as a miss: the cache cannot prove what lives in this window.
+        // cacheStatus stays 'miss'; the fresh search below runs with the
+        // caller's offset and (being offset>0 or longer-limit) either
+        // refreshes the prefix row or skips writeback entirely.
+      } else {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
       cacheAge = hit.ageSeconds;
 
-      const limit = opts?.limit || 20;
-      const offset = opts?.offset || 0;
       const sliced = hit.results.slice(offset, offset + limit);
 
       // Budget enforcement — same pipeline tail as fresh path.
@@ -1814,6 +1870,9 @@ export async function hybridSearchCached(
         ...(hit.meta?.embedding_column ? { embedding_column: hit.meta.embedding_column } : {}),
         ...(hit.meta?.adaptive_return ? { adaptive_return: hit.meta.adaptive_return } : {}),
         ...(hit.meta?.autocut ? { autocut: hit.meta.autocut } : {}),
+        // SR-1: carry the stored window record so observability (and any
+        // re-serve decision upstream) sees what the row can prove.
+        ...(win ? { cache_window: win } : {}),
         ...(opts?.tokenBudget && opts.tokenBudget > 0
           ? { token_budget: budgetMeta }
           : {}),
@@ -1824,6 +1883,7 @@ export async function hybridSearchCached(
         // swallow — telemetry is best-effort
       }
       return budgeted;
+      }
     }
   }
 
@@ -1846,6 +1906,23 @@ export async function hybridSearchCached(
   });
   const innerMeta = innerMetaBox.current;
 
+  // SR-1 — the writeback record. Only offset-0 pages are ever stored (see
+  // below), so the row is a PREFIX of the result ordering. `effectiveLimit`
+  // mirrors bare hybridSearch's `opts.limit || mode searchLimit` resolution;
+  // `complete` is true iff the fresh search returned fewer rows than it was
+  // allowed to — i.e. the pool is exhausted and the prefix is the WHOLE
+  // result set — and no trim stage (autocut / adaptive return) shortened the
+  // page, because a trimmed short page proves nothing about the pool.
+  const requestOffset = opts?.offset || 0;
+  const effectiveLimit = opts?.limit || resolvedForCache.searchLimit;
+  const trimApplied =
+    innerMeta?.autocut?.applied === true ||
+    innerMeta?.adaptive_return?.applied === true;
+  const cacheWindow: { limit: number; complete: boolean } = {
+    limit: effectiveLimit,
+    complete: results.length < effectiveLimit && !trimApplied,
+  };
+
   // Token budget pass (no-op when not set).
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(results, opts?.tokenBudget);
 
@@ -1864,6 +1941,12 @@ export async function hybridSearchCached(
     ...(innerMeta?.embedding_column ? { embedding_column: innerMeta.embedding_column } : {}),
     ...(innerMeta?.adaptive_return ? { adaptive_return: innerMeta.adaptive_return } : {}),
     ...(innerMeta?.autocut ? { autocut: innerMeta.autocut } : {}),
+    // SR-6 — propagate the degradation verdict from the inner search so the
+    // op layer can surface it in the response (pre-fix it died here).
+    ...(innerMeta?.degraded ? { degraded: true } : {}),
+    ...(innerMeta?.degraded_reason ? { degraded_reason: innerMeta.degraded_reason } : {}),
+    // SR-1 — the window record stored alongside the results on writeback.
+    cache_window: cacheWindow,
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -1876,8 +1959,13 @@ export async function hybridSearchCached(
 
   // Best-effort writeback (skip when search returned empty so we don't
   // cache zero-result queries forever — they often indicate a typo).
+  // SR-1: ALSO skip when the request had an offset — a page-N slice stored
+  // as the row's whole result set is exactly the poison this audit closed
+  // (the next offset-0 lookup would serve rows N+1..N+k AS page 1). Only
+  // offset-0 prefixes are cacheable.
   if (
     cacheStatus === 'miss' &&
+    requestOffset === 0 &&
     queryEmbedding &&
     results.length > 0 &&
     (innerMeta?.vector_enabled ?? false)

@@ -10,7 +10,7 @@ import type {
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
   FactRow, FactKind, FactVisibility, FactInsertStatus,
-  NewFact, FactListOpts, FactsHealth,
+  NewFact, FactListOpts, FactCountOpts, FactsHealth,
   SourceRow,
   EntitySplitInput, EntitySplitResult,
 } from './engine.ts';
@@ -19,7 +19,7 @@ import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatch
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { MAX_SEARCH_LIMIT, clampSearchLimit, likeContainsPattern } from './engine.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { runMigrations } from './migrate.ts';
@@ -4048,6 +4048,7 @@ export class PostgresEngine implements BrainEngine {
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const ownerSourceId = opts?.ownerSourceId ?? null;
+    const grepPattern = opts?.grep ? likeContainsPattern(opts.grep) : null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4059,6 +4060,7 @@ export class PostgresEngine implements BrainEngine {
               ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
               : sql`AND visibility = ANY(${visibility}::text[])`)
           : sql``}
+        ${grepPattern ? sql`AND fact ILIKE ${grepPattern} ESCAPE '\\'` : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -4078,6 +4080,7 @@ export class PostgresEngine implements BrainEngine {
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const ownerSourceId = opts?.ownerSourceId ?? null;
     const entitySlug = opts?.entitySlug ?? null;
+    const grepPattern = opts?.grep ? likeContainsPattern(opts.grep) : null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4090,6 +4093,7 @@ export class PostgresEngine implements BrainEngine {
               ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
               : sql`AND visibility = ANY(${visibility}::text[])`)
           : sql``}
+        ${grepPattern ? sql`AND fact ILIKE ${grepPattern} ESCAPE '\\'` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -4108,6 +4112,7 @@ export class PostgresEngine implements BrainEngine {
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const ownerSourceId = opts?.ownerSourceId ?? null;
+    const grepPattern = opts?.grep ? likeContainsPattern(opts.grep) : null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
@@ -4119,6 +4124,7 @@ export class PostgresEngine implements BrainEngine {
               ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
               : sql`AND visibility = ANY(${visibility}::text[])`)
           : sql``}
+        ${grepPattern ? sql`AND fact ILIKE ${grepPattern} ESCAPE '\\'` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -4127,21 +4133,73 @@ export class PostgresEngine implements BrainEngine {
 
   async listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number },
+    opts?: FactListOpts & { since?: Date },
   ): Promise<FactRow[]> {
+    // SR-5 + SR-4 (engine audit 2026-07-17): full FactListOpts — offset
+    // (history beyond MAX_SEARCH_LIMIT was permanently unreachable) and
+    // visibility/ownerSourceId (remote world-only callers could read private
+    // expired fact text) now apply exactly like every sibling list method.
+    // activeOnly is definitionally false here (the audit log IS expired rows).
     const sql = this.sql;
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
+    const offset = Math.max(0, opts?.offset ?? 0);
     const since = opts?.since ?? null;
+    const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
+    const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
+    const grepPattern = opts?.grep ? likeContainsPattern(opts.grep) : null;
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND expired_at IS NOT NULL
         AND superseded_by IS NOT NULL
         ${since ? sql`AND expired_at >= ${since}` : sql``}
+        ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
+        ${grepPattern ? sql`AND fact ILIKE ${grepPattern} ESCAPE '\\'` : sql``}
       ORDER BY expired_at DESC, id DESC
-      LIMIT ${limit}
+      LIMIT ${limit} OFFSET ${offset}
     `;
     return rows.map(rowToFactPg);
+  }
+
+  /**
+   * SR-2 (engine audit 2026-07-17): COUNT(*) twin of the list-facts methods —
+   * same predicate, no LIMIT/OFFSET. See FactCountOpts pairing contract.
+   */
+  async countFacts(source_id: string, opts?: FactCountOpts): Promise<number> {
+    const sql = this.sql;
+    const supersessions = opts?.supersessions === true;
+    const activeOnly = !supersessions && opts?.activeOnly !== false;
+    const since = opts?.since ?? null;
+    const entitySlug = opts?.entitySlug ?? null;
+    const sessionId = opts?.sessionId ?? null;
+    const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
+    const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+    const ownerSourceId = opts?.ownerSourceId ?? null;
+    const grepPattern = opts?.grep ? likeContainsPattern(opts.grep) : null;
+    const rows = await sql<{ count: number }[]>`
+      SELECT COUNT(*)::int AS count FROM facts
+      WHERE source_id = ${source_id}
+        ${supersessions ? sql`AND expired_at IS NOT NULL AND superseded_by IS NOT NULL` : sql``}
+        ${supersessions && since ? sql`AND expired_at >= ${since}` : sql``}
+        ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${!supersessions && since ? sql`AND created_at >= ${since}` : sql``}
+        ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
+        ${sessionId ? sql`AND source_session = ${sessionId}` : sql``}
+        ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
+        ${visibility
+          ? (ownerSourceId
+              ? sql`AND (visibility = ANY(${visibility}::text[]) OR source_id = ${ownerSourceId})`
+              : sql`AND visibility = ANY(${visibility}::text[])`)
+          : sql``}
+        ${grepPattern ? sql`AND fact ILIKE ${grepPattern} ESCAPE '\\'` : sql``}
+    `;
+    return Number(rows[0]?.count ?? 0);
   }
 
   async countUnconsolidatedFacts(source_id: string): Promise<number> {

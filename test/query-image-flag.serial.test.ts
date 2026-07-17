@@ -69,12 +69,15 @@ describe('query op with --image (v0.27.1 follow-up)', () => {
 
     const queryOp = OPERATIONS.find(o => o.name === 'query')!;
     const ctx = { engine, config: null, logger: console, dryRun: false, remote: false } as any;
-    const results = await queryOp.handler(ctx, {
+    // SR-6 envelope (engine audit 2026-07-17): query returns
+    // { results, search_health } instead of a bare array.
+    const { results, search_health } = await queryOp.handler(ctx, {
       image: Buffer.from('fake image bytes').toString('base64'),
       image_mime: 'image/jpeg',
       limit: 5,
-    }) as Array<{ slug: string }>;
+    }) as { results: Array<{ slug: string }>; search_health: { degraded: boolean } };
 
+    expect(search_health.degraded).toBe(false);
     expect(results.length).toBeGreaterThanOrEqual(2);
     expect(results[0].slug).toBe('photos/b');
   });
@@ -118,11 +121,12 @@ describe('query op with --image (v0.27.1 follow-up)', () => {
 
     const queryOp = OPERATIONS.find(o => o.name === 'query')!;
     const ctx = { engine, config: null, logger: console, dryRun: false, remote: false } as any;
-    const results = await queryOp.handler(ctx, {
+    // SR-6 envelope (engine audit 2026-07-17): unwrap { results }.
+    const { results } = await queryOp.handler(ctx, {
       image: 'aGVsbG8=', // 'hello'
       image_mime: 'image/png',
       limit: 10,
-    }) as Array<{ slug: string }>;
+    }) as { results: Array<{ slug: string }> };
 
     const slugs = results.map(r => r.slug);
     expect(slugs).toContain('photos/img');
