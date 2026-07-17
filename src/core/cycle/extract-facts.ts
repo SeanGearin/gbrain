@@ -134,6 +134,16 @@ export async function runExtractFacts(
   // on any brain with a dead legacy row, the B7-freeze class in a new
   // coat. Both columns are born with the facts table (v45), so they
   // are safe to reference in the pre-v93 fallback too.
+  //
+  // Disclosed residual of the carve-out pair: a dead db-only row whose
+  // superseded_by points at a FENCE-BACKED row makes this page's
+  // reconcile wipe DELETE hit facts_superseded_by_fkey (NO ACTION) — a
+  // loud per-page phase failure, rolled back, no data loss. The shape
+  // pre-exists for client-authored dead rows (reachable since the
+  // v0.42.24 carve-out) and is producible by the B2 dedup supersede
+  // (custody-blind matchedId, save.ts). The alternative — counting
+  // dead rows here — froze ALL reconciliation instead. The root fix
+  // belongs to the FK/wipe custody model, not this guard.
   let legacy: Array<{ n: string }>;
   try {
     legacy = await engine.executeRaw<{ n: string }>(

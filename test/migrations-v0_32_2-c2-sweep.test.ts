@@ -25,6 +25,13 @@
  *   - "degrades when client_authored absent" "would fence 2" counted the
  *     dead row on the old schema (phase A floors at v51; client_authored
  *     only exists from v93/v114; expired_at/superseded_by born at v45)
+ *
+ * Post-adversary hardening (red against 53598c6, the first C2 commit,
+ * not f15c468): "probe failure fails CLOSED" (the probe's catch used to
+ * swallow transport errors and proceed WITHOUT the client filter — the
+ * exact C2 class on a healthy-column schema) and "empty-string
+ * local_path" (dry-run counted '' sources as writable while the write
+ * path skips any falsy local_path).
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -302,6 +309,62 @@ describe('C2 — dry-run/write parity (the preview must not lie)', () => {
     expect(write.status).toBe('complete');
     expect(write.detail).toContain('fenced=0');
     expect(write.detail).toContain('skipped_no_local_path=1');
+  });
+
+  test('empty-string local_path previews exactly as the write path skips it', async () => {
+    // The write path treats any FALSY local_path as unwritable; the
+    // preview must count '' the same as NULL.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(`UPDATE sources SET local_path = '' WHERE id = 'default'`);
+    await seedFact({ entity_slug: 'people/alice', fact: 'Unwritable claim' });
+
+    const dry = await __testing.phaseBFenceFacts(engine, DRY_OPTS);
+    expect(dry.detail).toContain('would fence 0 rows');
+    expect(dry.detail).toContain('1 skipped (source has no local_path)');
+
+    const write = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(write.status).toBe('complete');
+    expect(write.detail).toContain('fenced=0');
+    expect(write.detail).toContain('skipped_no_local_path=1');
+  });
+});
+
+describe('C2 — probe failure fails CLOSED', () => {
+  test('a failing client_authored probe fails the phase instead of silently sweeping client rows', async () => {
+    const held = await seedFact({
+      entity_slug: 'people/nia', fact: 'Client-held claim about Nia', client_authored: true,
+    });
+
+    // Simulate a transient infrastructure failure on the probe only —
+    // everything else about the engine works. A swallowed probe error
+    // would omit the client filter and sweep the row (the exact C2
+    // class); the phase must fail closed instead.
+    const probeFailing = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return (sql: string, params?: unknown[]) => {
+            if (sql.includes('information_schema')) {
+              throw new Error('probe transport failure');
+            }
+            return target.executeRaw(sql, params);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as unknown as PGLiteEngine;
+
+    const dry = await __testing.phaseBFenceFacts(probeFailing, DRY_OPTS);
+    expect(dry.status).toBe('failed');
+    expect(dry.detail).toContain('probe transport failure');
+
+    const write = await __testing.phaseBFenceFacts(probeFailing, OPTS);
+    expect(write.status).toBe('failed');
+    expect(write.detail).toContain('probe transport failure');
+
+    // The client row was never touched.
+    const row = await rawFact(held);
+    expect(row.row_num).toBeNull();
+    expect(row.source_markdown_slug).toBeNull();
   });
 });
 

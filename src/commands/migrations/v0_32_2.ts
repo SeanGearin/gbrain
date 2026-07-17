@@ -170,15 +170,17 @@ function sweepEligiblePredicate(hasClientAuthored: boolean): string {
 }
 
 async function factsHasClientAuthored(engine: BrainEngine): Promise<boolean> {
-  try {
-    const rows = await engine.executeRaw<{ column_name: string }>(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_name = 'facts' AND column_name = 'client_authored'`,
-    );
-    return rows.length > 0;
-  } catch {
-    return false;
-  }
+  // A missing column does NOT throw here — information_schema simply
+  // returns zero rows (the schema-floor test exercises exactly that).
+  // Deliberately NO catch: a genuine probe failure must fail the phase
+  // CLOSED, because proceeding with the client filter omitted on a
+  // schema that HAS the column would sweep client_authored rows — the
+  // exact class this predicate exists to prevent.
+  const rows = await engine.executeRaw<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_name = 'facts' AND column_name = 'client_authored'`,
+  );
+  return rows.length > 0;
 }
 
 async function countSweepExclusions(
@@ -240,10 +242,13 @@ async function phaseBFenceFacts(
         `SELECT COUNT(*) AS n FROM facts WHERE ${pred} AND entity_slug IS NULL`,
       );
       const noEntityCount = parseInt(noEntity[0]?.n ?? '0', 10);
+      // NULL and '' both read as "no local_path" — the write path
+      // treats any falsy local_path as unwritable.
       const noLocal = await engine.executeRaw<{ n: string }>(
         `SELECT COUNT(*) AS n FROM facts f
           LEFT JOIN sources s ON s.id = f.source_id
-         WHERE ${pred} AND f.entity_slug IS NOT NULL AND s.local_path IS NULL`,
+         WHERE ${pred} AND f.entity_slug IS NOT NULL
+           AND (s.local_path IS NULL OR s.local_path = '')`,
       );
       const noLocalCount = parseInt(noLocal[0]?.n ?? '0', 10);
       const excluded = await countSweepExclusions(engine, hasClientAuthored);
@@ -296,6 +301,12 @@ async function phaseBFenceFacts(
         WHERE ${sweepEligiblePredicate(hasClientAuthored)}
         ORDER BY source_id, entity_slug, id`,
     );
+
+    // Exclusion counts, taken BEFORE the sweep: the sweep only stamps
+    // row_num on eligible rows, so these values are identical before
+    // and after — but counting up front means a count failure can't
+    // misreport already-committed fence work as a failed phase.
+    const excluded = await countSweepExclusions(engine, hasClientAuthored);
 
     const outcome: PhaseBOutcome = {
       scanned: legacy.length,
@@ -422,7 +433,6 @@ async function phaseBFenceFacts(
       }
     }
 
-    const excluded = await countSweepExclusions(engine, hasClientAuthored);
     const detail = `scanned=${outcome.scanned} fenced=${outcome.fenced} ` +
       `pages=${outcome.pages_touched} skipped_no_entity=${outcome.skipped_no_entity} ` +
       `skipped_no_local_path=${outcome.skipped_no_local_path} ` +
