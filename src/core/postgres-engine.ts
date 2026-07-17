@@ -4264,6 +4264,53 @@ export class PostgresEngine implements BrainEngine {
     return rows.map(rowToFactPg);
   }
 
+  // N1 — third dedup check: exact-text correction-tombstone lookup + bounded
+  // superseded_by walk to the chain head, in one recursive CTE. The walk's
+  // join re-checks source_id (belt-and-suspenders alongside RLS) so a
+  // cross-source pointer can never leak a row; the depth guard bounds cycles
+  // and pathological chains. The deepest chain row is where the walk stopped:
+  // the ACTIVE head (superseded_by NULL ends the recursion), or an expired /
+  // dangling stop the caller treats as "no live head" (head_active false).
+  async findSupersededTombstone(
+    source_id: string,
+    factText: string,
+  ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
+    const sql = this.sql;
+    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    const rows = await sql<Array<{ tombstone_id: number; head_id: number; head_active: boolean }>>`
+      WITH RECURSIVE tomb AS (
+        SELECT id, superseded_by FROM facts
+        WHERE source_id = ${source_id}
+          AND superseded_by IS NOT NULL
+          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+        ORDER BY id DESC
+        LIMIT 1
+      ),
+      chain AS (
+        SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth
+        FROM facts f JOIN tomb t ON f.id = t.id
+        UNION ALL
+        SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1
+        FROM chain c
+        JOIN facts nxt ON nxt.id = c.superseded_by AND nxt.source_id = ${source_id}
+        WHERE c.superseded_by IS NOT NULL AND c.depth < 32
+      )
+      SELECT t.id AS tombstone_id,
+             c.id AS head_id,
+             (c.expired_at IS NULL) AS head_active
+      FROM tomb t, chain c
+      ORDER BY c.depth DESC
+      LIMIT 1
+    `;
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      tombstone_id: Number(r.tombstone_id),
+      head_id: Number(r.head_id),
+      head_active: Boolean(r.head_active),
+    };
+  }
+
   async consolidateFact(id: number, takeId: number): Promise<void> {
     const sql = this.sql;
     await sql`UPDATE facts SET consolidated_at = now(), consolidated_into = ${takeId} WHERE id = ${id}`;

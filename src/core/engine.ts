@@ -1847,6 +1847,33 @@ export interface BrainEngine {
   ): Promise<FactRow[]>;
 
   /**
+   * N1 (engine audit 2026-07-17) — the THIRD dedup check: correction
+   * tombstones. Exact-text only, using the same normalized form as
+   * findFactTextDuplicates' exact arm (lower / trim / whitespace-collapse),
+   * scoped to rows expired BY CORRECTION (`superseded_by IS NOT NULL`).
+   * Forget/decay tombstones (`superseded_by` NULL) never match, so
+   * deliberate deletion stays reversible by a plain re-save.
+   *
+   * On a hit, walks the `superseded_by` chain (bounded at 32 hops,
+   * source-confined) and returns the matched tombstone plus where the walk
+   * stopped: the chain head and whether that head is ACTIVE. Callers refuse
+   * the re-mint ONLY when `head_active` — a dead chain (the correction was
+   * itself forgotten, or a dangling pointer) must fall through and mint,
+   * or the forget would become sticky against the original text.
+   *
+   * Runs on the active-dedup MISS path only (save.ts), so the cost is one
+   * extra query per genuinely-new claim. Deliberately NO trgm/cosine arm:
+   * the replay/retry threat carries the original bytes verbatim, and making
+   * the main dedup queries expired-inclusive would disqualify every partial
+   * `expired_at IS NULL` index (including HNSW) — the decision memo's
+   * rejected variant.
+   */
+  findSupersededTombstone(
+    source_id: string,
+    factText: string,
+  ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null>;
+
+  /**
    * Mark a fact as consolidated into a take. Sets consolidated_at + consolidated_into.
    * Never DELETE — facts stay as audit trail.
    */

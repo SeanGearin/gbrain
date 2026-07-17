@@ -163,10 +163,14 @@ describe('supersedeFactDurably — fence route (the P0 #1 scenario)', () => {
     const stamped = await rawFact(targetId);
     expect(stamped.expired_at).not.toBeNull();
 
-    // Follow-up: the module recognizes the already-stamped chain and
-    // still strikes the fence (skipping the DB stamp).
+    // Follow-up: the caller DECLARES this is the insert-path follow-up
+    // (followUp: true) — the module verifies the already-stamped chain
+    // and strikes the fence, skipping the DB stamp. Without the flag an
+    // already-expired target is always a no-op, so a dedup-path retry
+    // can never re-strike the fence (N1 wiring, save.ts).
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: ins.id,
+      followUp: true,
     });
     expect(res.applied).toBe(true);
     expect(res.path).toBe('fence');

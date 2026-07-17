@@ -3963,6 +3963,52 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows.map(rowToFact);
   }
 
+  // N1 — third dedup check: exact-text correction-tombstone lookup + bounded
+  // superseded_by walk to the chain head, in one recursive CTE. Twin of the
+  // postgres-engine impl (identical SQL semantics; PGLite is real Postgres,
+  // so the recursive CTE + depth guard behave the same). The deepest chain
+  // row is where the walk stopped: the ACTIVE head, or an expired/dangling
+  // stop the caller treats as "no live head" (head_active false).
+  async findSupersededTombstone(
+    source_id: string,
+    factText: string,
+  ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
+    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    const result = await this.db.query<{ tombstone_id: number | string; head_id: number | string; head_active: boolean }>(
+      `WITH RECURSIVE tomb AS (
+         SELECT id, superseded_by FROM facts
+         WHERE source_id = $1
+           AND superseded_by IS NOT NULL
+           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $2
+         ORDER BY id DESC
+         LIMIT 1
+       ),
+       chain AS (
+         SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth
+         FROM facts f JOIN tomb t ON f.id = t.id
+         UNION ALL
+         SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1
+         FROM chain c
+         JOIN facts nxt ON nxt.id = c.superseded_by AND nxt.source_id = $1
+         WHERE c.superseded_by IS NOT NULL AND c.depth < 32
+       )
+       SELECT t.id AS tombstone_id,
+              c.id AS head_id,
+              (c.expired_at IS NULL) AS head_active
+       FROM tomb t, chain c
+       ORDER BY c.depth DESC
+       LIMIT 1`,
+      [source_id, normalized],
+    );
+    if (result.rows.length === 0) return null;
+    const r = result.rows[0];
+    return {
+      tombstone_id: Number(r.tombstone_id),
+      head_id: Number(r.head_id),
+      head_active: Boolean(r.head_active),
+    };
+  }
+
   async findTrajectory(opts: import('./engine.ts').TrajectoryOpts): Promise<import('./engine.ts').TrajectoryPoint[]> {
     const limit = clampSearchLimit(opts.limit, 100, 500);
     const sinceDate = opts.since ? new Date(opts.since) : null;

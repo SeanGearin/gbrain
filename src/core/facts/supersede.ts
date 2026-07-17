@@ -35,12 +35,17 @@
  *     The next reconcile of that page resurrects the claim. Callers
  *     MUST surface this instead of receipting a durable supersession.
  *
- * Follow-up mode: when the target is already expired WITH
- * `superseded_by` equal to `supersededByFactId`, this call is the
- * fence follow-up to the engine's atomic insert+expire path — the DB
- * stamp is skipped and only the fence is struck. Any other
- * already-expired target is a no-op (`applied: false`), mirroring
- * `expireFact`'s idempotent-as-false contract.
+ * Follow-up mode (`followUp: true`): the CALLER declares this call is
+ * the fence follow-up to the engine's atomic insert+expire path. For a
+ * target already expired WITH `superseded_by` equal to
+ * `supersededByFactId`, the DB stamp is skipped and only the fence is
+ * struck. WITHOUT the flag, EVERY already-expired target is a no-op
+ * (`applied: false`), mirroring `expireFact`'s idempotent-as-false
+ * contract — a correction-batch retry on the dedup path must neither
+ * re-count the supersession nor re-strike the fence (each re-strike
+ * would append the context marker again). The mode is caller-declared
+ * rather than state-inferred precisely so a retry is distinguishable
+ * from the insert path's legitimate immediate follow-up.
  */
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
@@ -54,8 +59,10 @@ export interface SupersedeFactResult {
   /**
    * True iff the supersession is recorded (DB stamped and/or fence
    * struck). False for unknown / RLS-invisible / already-expired
-   * targets — mirrors the `expireFact` no-op contract so callers can
-   * keep counting `superseded` the same way.
+   * targets (the declared insert-path follow-up — `followUp: true`
+   * with a matching `superseded_by` — being the one exception) —
+   * mirrors the `expireFact` no-op contract so callers can keep
+   * counting `superseded` the same way.
    */
   applied: boolean;
   /** Which route recorded it. */
@@ -107,7 +114,7 @@ function todayUtc(): string {
 export async function supersedeFactDurably(
   engine: BrainEngine,
   targetId: number,
-  opts: { supersededByFactId: number },
+  opts: { supersededByFactId: number; followUp?: boolean },
 ): Promise<SupersedeFactResult> {
   const supersededByFactId = opts.supersededByFactId;
 
@@ -125,12 +132,14 @@ export async function supersedeFactDurably(
 
   const dbOnlyDurable = row.source_markdown_slug === null;
 
-  // Already expired: only proceed when this call is the fence follow-up
-  // to the engine's atomic insert+expire (superseded_by already points
-  // at the superseding fact). Anything else is a no-op.
+  // Already expired: only proceed when the caller DECLARED this call the
+  // fence follow-up to the engine's atomic insert+expire (followUp: true)
+  // AND superseded_by already points at the superseding fact. Anything
+  // else — including a correction-batch retry replaying the same
+  // supersede — is a no-op, so retries neither re-count nor re-strike.
   const alreadyStamped =
     row.expired_at !== null && Number(row.superseded_by) === supersededByFactId;
-  if (row.expired_at !== null && !alreadyStamped) {
+  if (row.expired_at !== null && !(alreadyStamped && opts.followUp === true)) {
     return { applied: false, path: 'already_expired', durable: true };
   }
 

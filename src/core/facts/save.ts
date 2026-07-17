@@ -47,6 +47,7 @@ import { cosineSimilarity } from './classify.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
 import { constructGraphFromClaim, materializeEntityPages } from './construct.ts';
+import { supersedeFactDurably } from './supersede.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -94,6 +95,11 @@ export interface SaveFactsContext {
  *                 report the chain.
  *   'duplicate' — no new row; fact_id is the CANONICAL existing row the claim
  *                 matched (dedup Layer 1/2, or the engine's advisory-lock race).
+ *   'duplicate_superseded' — N1 (Option A): no new row; the claim's text
+ *                 matches a fact expired BY CORRECTION (superseded_by set).
+ *                 fact_id is the LIVE HEAD of the supersession chain
+ *                 (bounded walk); superseded_from is the matched tombstone.
+ *                 Counts under the batch `duplicate` tally.
  *   'dropped'   — restricted-data scrub (PCI card / SSN / credential); the
  *                 claim was never inserted. Carries the `category` ONLY —
  *                 the value itself is never returned or logged, but the
@@ -101,7 +107,40 @@ export interface SaveFactsContext {
  *                 user WHY the memory was refused instead of losing it silently.
  */
 export type SaveFactsClaimResult =
-  | { index: number; status: 'inserted' | 'duplicate'; fact_id: number }
+  | {
+      index: number;
+      status: 'inserted' | 'duplicate';
+      fact_id: number;
+      /**
+       * B2 durability disclosure (v0.42.24 wiring): present ONLY when this
+       * claim carried `supersedes` and the durable-supersede route could NOT
+       * make the correction survive a fence reconcile (facts/supersede.ts
+       * returned durable:false — a fence-backed target whose fence couldn't
+       * be struck). The correction IS applied in the DB now; the next
+       * extract_facts reconcile of that page resurrects it, and the caller
+       * must not imply otherwise. Absent on every durable outcome, so
+       * already-green receipts stay byte-identical.
+       */
+      supersede_durable?: false;
+      /** Present iff supersede_durable is — names why the fence wasn't struck. */
+      supersede_reason?: string;
+    }
+  | {
+      /**
+       * N1: replaying corrected-away text (MCP retry after an interleaved
+       * correction, stale-export replay, a stale agent context window) is
+       * refused honestly instead of minting a silent live resurrection.
+       * Escape hatch: carry `supersedes` (the live head id) to re-assert
+       * deliberately — the claim then skips the tombstone check entirely and
+       * re-mints through the atomic insert+expire path with the chain intact.
+       * Rows expired by forget/decay (superseded_by NULL) never produce this
+       * status — deliberate deletion stays reversible by a plain save.
+       */
+      index: number;
+      status: 'duplicate_superseded';
+      fact_id: number;
+      superseded_from: number;
+    }
   | { index: number; status: 'dropped'; category: RestrictedCategory };
 
 export type SaveFactsResult =
@@ -128,13 +167,18 @@ export type SaveFactsResult =
        * Always present (0 when no claim asked to supersede).
        *
        * Counting is honest on the dedup path (the correction's text already
-       * existed, so the target is expired via `expireFact`, counted iff a row
-       * was actually updated). On the INSERT path it counts an atomic
-       * insert+expire the engine DISPATCHED against an in-source target; an
-       * invalid / foreign / already-expired target is a safe no-op on the old
-       * row (RLS + the engine's `expired_at IS NULL` guard) while the new fact
-       * still inserts, and the atomic path does not report whether the old row
-       * was touched. Authoritative supersession state is always readable via
+       * existed, so the target is superseded via the durable route —
+       * facts/supersede.ts, which strikes fence-backed targets in their fence
+       * and stamps the DB — counted iff `applied`; unknown / foreign /
+       * already-expired targets no-op, so a correction-batch retry never
+       * re-counts). On the INSERT path it counts an atomic insert+expire the
+       * engine DISPATCHED against an in-source target; an invalid / foreign /
+       * already-expired target is a safe no-op on the old row (RLS + the
+       * engine's `expired_at IS NULL` guard) while the new fact still
+       * inserts, and the atomic path does not report whether the old row was
+       * touched. Non-durable outcomes (the fence couldn't be struck) are
+       * disclosed per-claim via `supersede_durable: false` on `results`.
+       * Authoritative supersession state is always readable via
        * recall(supersessions: true).
        */
       superseded: number;
@@ -503,22 +547,63 @@ export async function runSaveFacts(
     const supersedeTargetId = typeof c.supersedes === 'number' ? c.supersedes : null;
 
     if (matchedId !== null) {
-      // duplicate+supersedes → still apply the supersede. The correction's text
-      // already exists as canonical row `matchedId`, so no new row is written;
-      // expire the superseded target and point it at that canonical row.
-      // RLS-confined + idempotent: a target in another tenant, already expired,
-      // or unknown is a silent no-op (expireFact returns false → not counted).
-      // Self-supersession (target === the canonical dup) is skipped.
+      // duplicate+supersedes → still apply the supersede, DURABLY (v0.42.24):
+      // the correction's text already exists as canonical row `matchedId`, so
+      // no new row is written; supersedeFactDurably expires the target and —
+      // for fence-backed targets — strikes the fence row so the supersession
+      // survives the extract_facts reconcile (the resurrection class the bare
+      // expireFact here used to reopen). RLS-confined + idempotent: a target
+      // in another tenant, already expired, or unknown is a silent no-op
+      // (applied: false → not counted; a correction-batch retry neither
+      // re-counts nor re-strikes the fence). Self-supersession (target ===
+      // the canonical dup) is skipped.
+      let supersedeDisclosure: { supersede_durable?: false; supersede_reason?: string } = {};
       if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
-        const applied = await ctx.engine.expireFact(supersedeTargetId, { // gbrain-allow-direct-insert: B2 supersedes on the dedup path — the engine's native RLS-confined, idempotent expire of the corrected fact; no fence/markdown source to reconcile through (same sanction as this file's insertFact site)
-          supersededBy: matchedId,
+        const res = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
+          supersededByFactId: matchedId,
         });
-        if (applied) superseded += 1;
+        if (res.applied) superseded += 1;
+        if (res.applied && !res.durable) {
+          // Honest receipt: the correction applies NOW, but the target's
+          // fence still lists the claim active — the next reconcile of that
+          // page resurrects it. Say so instead of implying durability.
+          supersedeDisclosure = {
+            supersede_durable: false,
+            supersede_reason: res.reason ?? 'fence not rewritten',
+          };
+        }
       }
       duplicate += 1;
       fact_ids.push(matchedId);
-      results[index] = { index, status: 'duplicate', fact_id: matchedId };
+      results[index] = { index, status: 'duplicate', fact_id: matchedId, ...supersedeDisclosure };
       continue;
+    }
+
+    // --- N1 tombstone check (third dedup layer, active-miss only) ----------
+    // Exact-text lookup against rows expired BY CORRECTION (superseded_by IS
+    // NOT NULL), firing only when Layers 1+2 missed AND the claim does not
+    // carry `supersedes`. A supersedes-carrying re-assertion is the escape
+    // hatch: it skips this check and falls through to the atomic
+    // insert+expire below, re-minting with the chain intact (correction-of-
+    // the-correction needs no new field — B2 already expresses the intent).
+    // Forget/decay tombstones (superseded_by NULL) never match, so deliberate
+    // deletion stays reversible by a plain save. Refuse ONLY when the chain
+    // walk lands on an ACTIVE head — the receipt then points at live truth;
+    // a dead chain (the correction was itself forgotten) mints, or the
+    // forget would become sticky against the original text.
+    if (supersedeTargetId === null) {
+      const tomb = await ctx.engine.findSupersededTombstone(ctx.sourceId, cleaned);
+      if (tomb !== null && tomb.head_active) {
+        duplicate += 1;
+        fact_ids.push(tomb.head_id);
+        results[index] = {
+          index,
+          status: 'duplicate_superseded',
+          fact_id: tomb.head_id,
+          superseded_from: tomb.tombstone_id,
+        };
+        continue;
+      }
     }
 
     // --- entity resolution (insert branch only — duplicates skip it) ------
@@ -569,10 +654,30 @@ export async function runSaveFacts(
     // tally the supersession.
     if (result.status === 'inserted' || result.status === 'superseded') {
       inserted += 1;
-      if (result.status === 'superseded') superseded += 1;
+      let supersedeDisclosure: { supersede_durable?: false; supersede_reason?: string } = {};
+      if (result.status === 'superseded' && supersedeTargetId !== null) {
+        superseded += 1;
+        // v0.42.24 fence follow-up: the atomic tx above stamped the DB; this
+        // DECLARED follow-up (followUp: true) strikes the target's fence row
+        // so the supersession survives the extract_facts reconcile, and
+        // discloses when it can't. Counting stays on the dispatch above
+        // (`superseded` semantics unchanged); the follow-up contributes
+        // durability + disclosure only. Non-fence-backed targets are a
+        // durable db_only no-op inside the module.
+        const followUp = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
+          supersededByFactId: result.id,
+          followUp: true,
+        });
+        if (followUp.applied && !followUp.durable) {
+          supersedeDisclosure = {
+            supersede_durable: false,
+            supersede_reason: followUp.reason ?? 'fence not rewritten',
+          };
+        }
+      }
       // B3: a superseding insert is still a NEW row → 'inserted' (the batch
       // `superseded` counter reports the chain; see SaveFactsClaimResult).
-      results[index] = { index, status: 'inserted', fact_id: result.id };
+      results[index] = { index, status: 'inserted', fact_id: result.id, ...supersedeDisclosure };
       // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
       // this claim's people[]/entities[] into entity stub pages + bidirectional
       // co-occurrence edges so traverse_graph / find_experts have a graph to
