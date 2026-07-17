@@ -1279,7 +1279,7 @@ const restore_page: Operation = {
 
 const purge_deleted_pages: Operation = {
   name: 'purge_deleted_pages',
-  description: 'v0.26.5 — admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72). Cascades through content_chunks, page_links, chunk_relations. Local CLI only (not exposed over HTTP MCP). Manual escape hatch alongside the autopilot purge phase.',
+  description: 'v0.26.5 — admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72). Cascades through content_chunks, page_links, chunk_relations AND page_versions — each purged page\'s version history is destroyed with it (disclosed in version_rows_destroyed + an ingest_log record). Local CLI only (not exposed over HTTP MCP). Manual escape hatch alongside the autopilot purge phase.',
   params: {
     older_than_hours: { type: 'number', description: 'Age cutoff in hours. Default 72.' },
   },
@@ -1290,7 +1290,14 @@ const purge_deleted_pages: Operation = {
     const olderThanHours = (p.older_than_hours as number | undefined) ?? 72;
     if (ctx.dryRun) return { dry_run: true, action: 'purge_deleted_pages', older_than_hours: olderThanHours };
     const result = await ctx.engine.purgeDeletedPages(olderThanHours);
-    return { status: 'purged', count: result.count, slugs: result.slugs };
+    // VT-1 (engine audit 2026-07-17): version-history destruction is the
+    // purge's one irreversible loss — surface it, don't bury it.
+    return {
+      status: 'purged',
+      count: result.count,
+      slugs: result.slugs,
+      version_rows_destroyed: result.versionRowsDestroyed,
+    };
   },
   cliHints: { name: 'purge-deleted' },
 };
@@ -2567,7 +2574,7 @@ const get_versions: Operation = {
 
 const revert_version: Operation = {
   name: 'revert_version',
-  description: 'Revert page to a previous version',
+  description: 'Revert page to a previous version (restores compiled_truth + frontmatter only — snapshots capture nothing else)',
   params: {
     slug: { type: 'string', required: true },
     version_id: { type: 'number', required: true },
@@ -2577,12 +2584,40 @@ const revert_version: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
-    // intended page row instead of whichever same-slug row Postgres returns
-    // first.
+    // intended page row.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.createVersion(p.slug as string, sourceOpts);
-    await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
-    return { status: 'reverted' };
+    // VT-7 (engine audit 2026-07-17): the engine's revertToVersion is now
+    // atomic — it validates that version_id belongs to (slug, source),
+    // banks the pre-revert head, and applies the revert in ONE statement.
+    // The old two-call shape here (createVersion, then fire-and-forget
+    // revertToVersion) minted a spurious snapshot and reported 'reverted'
+    // even when the revert matched 0 rows — the customer proceeded on a
+    // false belief, with a fabricated extra version row as the receipt.
+    try {
+      await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/not found/i.test(msg)) {
+        throw new OperationError(
+          'version_not_found',
+          `Cannot revert: ${msg}`,
+          'List this page\'s versions with get_versions and pass one of ITS ids — version ids from other pages do not apply.',
+        );
+      }
+      throw err;
+    }
+    // VT-4 honesty disclosure: a snapshot holds only compiled_truth +
+    // frontmatter, so that is all a revert can restore. Title/type/timeline
+    // keep their current ("future") values, and chunks/search still reflect
+    // the pre-revert content until the page is next re-imported or
+    // reindexed — the engine marks content_hash so the next sync
+    // re-reconciles instead of silently skipping the reverted row.
+    return {
+      status: 'reverted',
+      restored: ['compiled_truth', 'frontmatter'],
+      not_restored: ['title', 'type', 'timeline', 'search_index'],
+      note: 'Search/chunks reflect the pre-revert content until the next sync or reindex of this page; title/type/timeline are not captured by snapshots and keep their current values.',
+    };
   },
   cliHints: { name: 'revert', positional: ['slug', 'version_id'] },
 };

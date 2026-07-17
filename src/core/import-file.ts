@@ -558,7 +558,19 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+  // VT-2 (engine audit 2026-07-17): read THROUGH the tombstone. putPage's
+  // upsert targets (source_id, slug) regardless of deleted_at, so an import
+  // over a soft-deleted row was silently clobbering recoverable content —
+  // with no version snapshot (the `existing` check saw null) and without
+  // resurrecting the row (the "successful" import stayed invisible). Fetch
+  // with includeDeleted so the soft-deleted case is handled explicitly:
+  // putPage banks the tombstone's content (engine-level snapshot, VT-6) and
+  // the transaction below restores the row.
+  const existingAny = await engine.getPage(slug, { includeDeleted: true, ...(sourceId ? { sourceId } : {}) });
+  const softDeletedExisting = existingAny?.deleted_at ? existingAny : null;
+  const existing = existingAny && !existingAny.deleted_at ? existingAny : null;
+  // Hash-skip applies to LIVE rows only: a soft-deleted row with identical
+  // content must still fall through so the import resurrects it.
   if (existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
@@ -730,23 +742,27 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = sourceId ? { sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    // VT-6 (engine audit 2026-07-17): the explicit `if (existing)
+    // createVersion` that stood here is gone — putPage itself now banks the
+    // pre-update state atomically whenever content actually changes (for
+    // BOTH live and soft-deleted existing rows). Keeping the explicit call
+    // would mint duplicate snapshots.
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
     // (put_page MCP op fallback). updatedAt/createdAt use the existing
-    // page's timestamps when present; otherwise NOW() (the row about to
-    // be created). The result drives the recency boost and since/until
-    // filters when callers opt in; nothing in the default search path
-    // consults it.
+    // page's timestamps when present (including a soft-deleted row being
+    // resurrected); otherwise NOW() (the row about to be created). The
+    // result drives the recency boost and since/until filters when callers
+    // opt in; nothing in the default search path consults it.
     const filenameForChain = opts.filename ?? slug.split('/').pop() ?? slug;
     const nowDate = new Date();
     const { date: effectiveDate, source: effectiveDateSource } = computeEffectiveDate({
       slug,
       frontmatter: parsed.frontmatter,
       filename: filenameForChain,
-      updatedAt: existing?.updated_at ?? nowDate,
-      createdAt: existing?.created_at ?? nowDate,
+      updatedAt: existingAny?.updated_at ?? nowDate,
+      createdAt: existingAny?.created_at ?? nowDate,
     });
 
     await tx.putPage(slug, {
@@ -774,6 +790,15 @@ export async function importFromContent(
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
     }, txOpts);
+
+    // VT-2 (engine audit 2026-07-17): the import wrote through a tombstone —
+    // resurrect it so the "imported" receipt matches a page the user can
+    // actually see. putPage already banked the tombstone's final content
+    // (engine-level snapshot), and restorePage records the deletion
+    // interval in ingest_log before erasing deleted_at (VT-5).
+    if (softDeletedExisting) {
+      await tx.restorePage(slug, txOpts);
+    }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
@@ -1081,7 +1106,13 @@ export async function importCodeFile(
     .update(JSON.stringify({ title, type: 'code', content, lang, chunker_version: CHUNKER_VERSION }))
     .digest('hex');
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+  // VT-2 (engine audit 2026-07-17): read through the tombstone — same
+  // posture as importFromContent. The hash-skip applies to LIVE rows only;
+  // a soft-deleted row falls through so the import resurrects it (putPage
+  // banks its content at the engine layer first).
+  const existingAny = await engine.getPage(slug, { includeDeleted: true, ...(sourceId ? { sourceId } : {}) });
+  const softDeletedExisting = existingAny?.deleted_at ? existingAny : null;
+  const existing = existingAny && !existingAny.deleted_at ? existingAny : null;
   if (!opts.force && existing?.content_hash === hash) {
     return { slug, status: 'skipped', chunks: 0 };
   }
@@ -1156,7 +1187,8 @@ export async function importCodeFile(
   // brains write to the correct (source_id, slug) row instead of duplicating
   // under the schema DEFAULT.
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    // VT-6: the explicit createVersion-on-existing is gone — putPage banks
+    // the pre-update state itself (atomically, content-change-guarded).
 
     await tx.putPage(slug, {
       type: 'code' as string,
@@ -1167,6 +1199,13 @@ export async function importCodeFile(
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
     }, txOpts);
+
+    // VT-2: resurrect a tombstoned code page the import just wrote through
+    // (its prior content was banked by putPage; restorePage records the
+    // deletion interval in ingest_log).
+    if (softDeletedExisting) {
+      await tx.restorePage(slug, txOpts);
+    }
 
     await tx.addTag(slug, 'code', txOpts);
     await tx.addTag(slug, lang, txOpts);
@@ -1284,7 +1323,20 @@ const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
  */
 export interface ImportTransactionSpec {
   slug: string;
+  /**
+   * Caller-observed "row existed before this import". Retained for caller
+   * context/telemetry; snapshotting no longer keys off it — putPage banks
+   * the pre-update state itself (VT-6, engine audit 2026-07-17).
+   */
   hadExisting: boolean;
+  /**
+   * VT-9 (engine audit 2026-07-17): source scope for EVERY call inside the
+   * transaction. Pre-fix nothing in here carried a sourceId — the moment a
+   * caller ran under a non-default source, putPage wrote (and the old
+   * createVersion snapshotted) the WRONG source's row, or the import
+   * aborted on a page that existed in the right source.
+   */
+  sourceId?: string;
   page: PageInput;
   /** When undefined, no chunk write happens. When [], deletes any prior chunks. */
   chunks?: ChunkInput[];
@@ -1298,23 +1350,30 @@ export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (spec.hadExisting) await tx.createVersion(spec.slug);
-    await tx.putPage(spec.slug, spec.page);
+    // VT-6: no explicit createVersion — putPage snapshots the pre-update
+    // state atomically when content changes (see BrainEngine.putPage).
+    await tx.putPage(spec.slug, spec.page, txOpts);
+    // VT-2: an import is an assertion the page lives. If the upsert wrote
+    // through a soft-deleted row, resurrect it (no-op when the row is
+    // live; records the deletion interval in ingest_log when it isn't).
+    await tx.restorePage(spec.slug, txOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug);
+      const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
+        source_id: spec.file.source_id ?? spec.sourceId,
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks);
+        await tx.upsertChunks(spec.slug, spec.chunks, txOpts);
       } else {
-        await tx.deleteChunks(spec.slug);
+        await tx.deleteChunks(spec.slug, txOpts);
       }
     }
     if (spec.after) await spec.after(tx);
@@ -1547,7 +1606,16 @@ export async function importImageFile(
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const existing = await engine.getPage(imageSlug);
+  // VT-9 + VT-2 (engine audit 2026-07-17): source-scope the existing-check
+  // (it was unscoped — wrong row under a non-default source) and read
+  // through the tombstone so the live-row hash-skip can't leave a
+  // soft-deleted image page invisible after a "successful" re-import
+  // (withImportTransaction resurrects it).
+  const existingAny = await engine.getPage(imageSlug, {
+    includeDeleted: true,
+    ...(opts.sourceId ? { sourceId: opts.sourceId } : {}),
+  });
+  const existing = existingAny && !existingAny.deleted_at ? existingAny : null;
   if (existing?.content_hash === hash) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1623,6 +1691,8 @@ export async function importImageFile(
   await withImportTransaction(engine, {
     slug: imageSlug,
     hadExisting: !!existing,
+    // VT-9: thread the caller's source into every write in the transaction.
+    sourceId: opts.sourceId,
     page: {
       type: 'image',
       page_kind: 'image',

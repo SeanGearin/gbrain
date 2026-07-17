@@ -1111,7 +1111,37 @@ export class PostgresEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
+    // VT-6 (engine audit 2026-07-17): versioning is an ENGINE property, not
+    // caller discipline. The `snapshot` CTE banks the pre-update state (the
+    // content that stood until now — the contract as-of reconstruction
+    // depends on) in the SAME statement as the upsert, for EVERY caller:
+    // import paths, save_facts materialize, cycle/orchestrator writers
+    // (synthesize-concepts, synthesize, think, extract-atoms, output writer,
+    // receipt writer), and any future caller. Pre-fix only two call sites
+    // remembered to call createVersion first; every other overwrite silently
+    // destroyed the prior content from history.
+    //   - The IS DISTINCT FROM guard keeps the chain 1:1 with real content
+    //     changes: no version spam from idempotent rewrites, and title/type-
+    //     only changes mint nothing because snapshots cannot capture them.
+    //   - No deleted_at filter on `prev`: an upsert over a soft-deleted row
+    //     clobbers it either way (VT-2), so its content is banked too.
+    //   - Data-modifying CTEs all read the same statement snapshot, so
+    //     `prev` sees the pre-upsert row by construction, and the snapshot
+    //     is atomic with the upsert (no crash window).
+    //   - Tenant-plane RLS: gbrain_tenant holds page_versions DML + sequence
+    //     USAGE (sql/b7-role.sql), and the feeding SELECT is source-scoped,
+    //     so the b7 WITH CHECK is satisfied — same posture the explicit
+    //     createVersion in the materialize path already proved on-plane.
     const rows = await sql`
+      WITH prev AS (
+        SELECT id, compiled_truth, frontmatter FROM pages
+        WHERE source_id = ${sourceId} AND slug = ${slug}
+      ), snapshot AS (
+        INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+        SELECT id, compiled_truth, frontmatter FROM prev
+        WHERE compiled_truth IS DISTINCT FROM ${page.compiled_truth}
+           OR frontmatter IS DISTINCT FROM ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}::jsonb
+      )
       INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
       VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, 1), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
       ON CONFLICT (source_id, slug) DO UPDATE SET
@@ -1195,41 +1225,134 @@ export class PostgresEngine implements BrainEngine {
     const sourceId = opts?.sourceId;
     // Idempotent-as-null contract: only flip rows that are currently active.
     // RETURNING projects the slug so we can tell hit-vs-miss without a probe.
+    // VT-5 (engine audit 2026-07-17): the `lifecycle` CTE writes an
+    // append-only ingest_log record of the deletion in the same statement —
+    // pre-fix, nothing anywhere recorded that a page was ever deleted, so
+    // restore erased the interval and as-of reads inside it were
+    // unfalsifiably wrong. Tenant-plane RLS: gbrain_tenant holds ingest_log
+    // DML + sequence USAGE (sql/b7-role.sql) and the row's source_id comes
+    // from the flipped row itself, satisfying the b7 WITH CHECK.
     const sourceCondition = sourceId ? sql`AND source_id = ${sourceId}` : sql``;
     const rows = await sql`
-      UPDATE pages SET deleted_at = now()
-      WHERE slug = ${slug} AND deleted_at IS NULL ${sourceCondition}
-      RETURNING slug
+      WITH flipped AS (
+        UPDATE pages SET deleted_at = now()
+        WHERE slug = ${slug} AND deleted_at IS NULL ${sourceCondition}
+        RETURNING slug, source_id
+      ), lifecycle AS (
+        INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+        SELECT source_id, 'page_lifecycle', slug, jsonb_build_array(slug),
+               'soft-deleted (recoverable until the purge TTL; version history retained)'
+        FROM flipped
+      )
+      SELECT slug FROM flipped
     `;
     if (rows.length === 0) return null;
     return { slug: rows[0].slug as string };
   }
 
+  /**
+   * VT-1 (engine audit 2026-07-17) — batch soft-delete primitive for sync's
+   * repo-driven deletes. Same shape/contract as deletePages (single
+   * round-trip, DELETE_BATCH_SIZE cap, RETURNING projects the actually-
+   * flipped set) but the rows — and their page_versions history — survive
+   * until the disclosed purge TTL instead of being hard-DELETE cascaded.
+   * Already-deleted and missing slugs are skipped (idempotent), matching
+   * softDeletePage's idempotent-as-null posture. One ingest_log lifecycle
+   * row per call records what was flipped.
+   */
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const sql = this.sql;
+    const rows = await sql<{ slug: string }[]>`
+      WITH flipped AS (
+        UPDATE pages SET deleted_at = now()
+        WHERE slug = ANY(${slugs}::text[]) AND source_id = ${opts.sourceId} AND deleted_at IS NULL
+        RETURNING slug, source_id
+      ), lifecycle AS (
+        INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+        SELECT source_id, 'page_lifecycle', 'batch', jsonb_agg(slug),
+               'soft-deleted ' || count(*) || ' page(s) (recoverable until the purge TTL; version history retained)'
+        FROM flipped GROUP BY source_id
+      )
+      SELECT slug FROM flipped
+    `;
+    return rows.map(r => r.slug);
+  }
+
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
     const sql = this.sql;
     const sourceId = opts?.sourceId;
+    // VT-5 (engine audit 2026-07-17): nulling deleted_at destroys the only
+    // record that the page was ever deleted — an as-of read inside
+    // [deleted, restored] would present the page as live at a time it was
+    // invisible, and the data needed to catch the error would no longer
+    // exist. The `lifecycle` CTE records the deletion interval in
+    // append-only ingest_log BEFORE the flip erases it, atomically.
     const sourceCondition = sourceId ? sql`AND source_id = ${sourceId}` : sql``;
     const rows = await sql`
-      UPDATE pages SET deleted_at = NULL
-      WHERE slug = ${slug} AND deleted_at IS NOT NULL ${sourceCondition}
-      RETURNING slug
+      WITH tomb AS (
+        SELECT id, slug, source_id, deleted_at FROM pages
+        WHERE slug = ${slug} AND deleted_at IS NOT NULL ${sourceCondition}
+      ), restored AS (
+        UPDATE pages SET deleted_at = NULL
+        FROM tomb WHERE pages.id = tomb.id
+        RETURNING pages.slug
+      ), lifecycle AS (
+        INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+        SELECT source_id, 'page_lifecycle', slug, jsonb_build_array(slug),
+               'restored; deletion interval [' || deleted_at::text || ' .. ' || now()::text ||
+               '] is preserved in this log row (the pages row no longer shows it)'
+        FROM tomb
+      )
+      SELECT slug FROM restored
     `;
     return rows.length > 0;
   }
 
-  async purgeDeletedPages(olderThanHours: number): Promise<{ slugs: string[]; count: number }> {
+  async purgeDeletedPages(
+    olderThanHours: number,
+  ): Promise<{ slugs: string[]; count: number; versionRowsDestroyed: number }> {
     const sql = this.sql;
     // Clamp to non-negative integer; runaway purge protection. The DELETE
-    // cascades through content_chunks, page_links, chunk_relations via FKs.
+    // cascades through content_chunks, page_links, chunk_relations — AND
+    // page_versions (schema.sql `ON DELETE CASCADE`): this is the point
+    // where a page's version history is genuinely destroyed. VT-1 (engine
+    // audit 2026-07-17): that loss used to be silent and the old comment
+    // here didn't even name page_versions. It cannot be avoided without a
+    // schema change (page_versions is FK-keyed to pages.id), so it is made
+    // EXPLICIT instead: the destroyed-version count is returned to every
+    // caller and an append-only ingest_log row (which has no pages FK and
+    // therefore survives the purge) records what was destroyed, per source.
     const hours = Math.max(0, Math.floor(olderThanHours));
     const rows = await sql`
-      DELETE FROM pages
-      WHERE deleted_at IS NOT NULL
-        AND deleted_at < now() - (${hours} || ' hours')::interval
-      RETURNING slug
+      WITH doomed AS (
+        SELECT id, slug, source_id FROM pages
+        WHERE deleted_at IS NOT NULL
+          AND deleted_at < now() - (${hours} || ' hours')::interval
+      ), vcount AS (
+        SELECT count(*)::int AS n
+        FROM page_versions pv JOIN doomed d ON d.id = pv.page_id
+      ), lifecycle AS (
+        INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
+        SELECT d.source_id, 'page_lifecycle', 'purge', jsonb_agg(DISTINCT d.slug),
+               'purged ' || count(DISTINCT d.id) || ' page(s) past the soft-delete TTL; '
+               || count(pv.id) || ' version row(s) destroyed with them (page_versions ON DELETE CASCADE); this log row is the surviving record'
+        FROM doomed d LEFT JOIN page_versions pv ON pv.page_id = d.id
+        GROUP BY d.source_id
+      ), del AS (
+        DELETE FROM pages WHERE id IN (SELECT id FROM doomed)
+        RETURNING slug
+      )
+      SELECT del.slug, (SELECT n FROM vcount) AS version_rows FROM del
     `;
     const slugs = rows.map((r) => r.slug as string);
-    return { slugs, count: slugs.length };
+    const versionRowsDestroyed = rows.length > 0 ? Number(rows[0].version_rows) : 0;
+    return { slugs, count: slugs.length, versionRowsDestroyed };
   }
 
   async refreshPageBody(
@@ -1243,7 +1366,23 @@ export class PostgresEngine implements BrainEngine {
     // Narrow UPDATE — leaves frontmatter, type, chunks, links, embeddings,
     // tags, takes untouched. Skips soft-deleted rows so a redirect retry
     // can't accidentally reanimate the body of a deleted canonical.
+    // VT-3 (engine audit 2026-07-17): this path rewrote compiled_truth with
+    // NO version snapshot — the un-fixed sibling of the materialize
+    // "time-travel poison" closed in 4a33b46. The `snapshot` CTE banks the
+    // pre-rewrite body in the same statement; the IS DISTINCT FROM guard
+    // keeps the documented idempotency (same args twice = same row state,
+    // and now also: no second snapshot).
     await sql`
+      WITH prev AS (
+        SELECT id, compiled_truth, frontmatter FROM pages
+        WHERE source_id = ${sourceId}
+          AND slug = ${slug}
+          AND deleted_at IS NULL
+      ), snapshot AS (
+        INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+        SELECT id, compiled_truth, frontmatter FROM prev
+        WHERE compiled_truth IS DISTINCT FROM ${compiledTruth}
+      )
       UPDATE pages
       SET compiled_truth = ${compiledTruth},
           timeline = ${timeline},
@@ -4940,29 +5079,55 @@ export class PostgresEngine implements BrainEngine {
     opts?: { sourceId?: string },
   ): Promise<void> {
     const sql = this.sql;
-    // v0.31.8 (D12): two-branch. With opts.sourceId, scope BOTH the page lookup
-    // AND the version reference. Without it, multi-source brains can revert
-    // the wrong same-slug page.
-    if (opts?.sourceId) {
-      await sql`
-        UPDATE pages SET
-          compiled_truth = pv.compiled_truth,
-          frontmatter = pv.frontmatter,
-          updated_at = now()
-        FROM page_versions pv
-        WHERE pages.slug = ${slug} AND pages.source_id = ${opts.sourceId}
-              AND pv.id = ${versionId} AND pv.page_id = pages.id
-      `;
-      return;
-    }
-    await sql`
+    // v0.31.8 (D12): with opts.sourceId, scope BOTH the page lookup AND the
+    // version reference. Without it the pv.id + page join still pins exactly
+    // one page (version ids are globally unique), so a multi-source slug can
+    // no longer revert the wrong row.
+    //
+    // VT-7 + VT-4 (engine audit 2026-07-17) — revert is now atomic, honest,
+    // and append-preserving at the ENGINE level:
+    //   - `target` validates that versionId actually belongs to (slug,
+    //     source). 0 rows → THROW instead of the old fire-and-forget void
+    //     that let the op report 'reverted' on a no-op.
+    //   - `snapshot` banks the pre-revert head in the same statement (the
+    //     append-only property used to live only in the op layer's separate,
+    //     non-atomic pre-flight createVersion — a crash between the two
+    //     calls left a stray snapshot and no revert). Skipped when the
+    //     current content already equals the target (no spurious rows).
+    //   - content_hash is stamped with a revert marker that can never equal
+    //     a computed content hash (VT-4): the next sync sees drift and
+    //     re-reconciles through the versioned import path instead of
+    //     hash-match-skipping — which silently re-clobbered the revert and
+    //     left search/chunks quoting the pre-revert text forever.
+    const sourceCondition = opts?.sourceId ? sql`AND pages.source_id = ${opts.sourceId}` : sql``;
+    const rows = await sql`
+      WITH target AS (
+        SELECT pages.id AS page_id,
+               pages.compiled_truth AS cur_truth, pages.frontmatter AS cur_fm,
+               pv.compiled_truth AS v_truth, pv.frontmatter AS v_fm
+        FROM pages
+        JOIN page_versions pv ON pv.page_id = pages.id
+        WHERE pages.slug = ${slug} AND pv.id = ${versionId} ${sourceCondition}
+      ), snapshot AS (
+        INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
+        SELECT page_id, cur_truth, cur_fm FROM target
+        WHERE cur_truth IS DISTINCT FROM v_truth OR cur_fm IS DISTINCT FROM v_fm
+      )
       UPDATE pages SET
-        compiled_truth = pv.compiled_truth,
-        frontmatter = pv.frontmatter,
+        compiled_truth = t.v_truth,
+        frontmatter = t.v_fm,
+        content_hash = 'reverted:v' || ${String(versionId)} || ':' || md5(t.v_truth),
         updated_at = now()
-      FROM page_versions pv
-      WHERE pages.slug = ${slug} AND pv.id = ${versionId} AND pv.page_id = pages.id
+      FROM target t
+      WHERE pages.id = t.page_id
+      RETURNING pages.slug
     `;
+    if (rows.length === 0) {
+      throw new Error(
+        `revertToVersion failed: version ${versionId} not found for page "${slug}"` +
+        (opts?.sourceId ? ` (source=${opts.sourceId})` : ''),
+      );
+    }
   }
 
   // Stats + health
