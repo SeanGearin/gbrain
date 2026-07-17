@@ -123,13 +123,20 @@ describe('customer-scoped remote reads', () => {
     expect(recall.facts[0].id).toBe(factId);
     expect(recall.facts[0]).not.toHaveProperty('source_session');
 
-    const query = parsePayload<Array<Record<string, unknown>>>(
+    // SR-6 (engine audit 2026-07-17): query now returns the
+    // {results, search_health} envelope — the minimization contract applies
+    // to the rows INSIDE it (operations.ts wraps minimizeSearchResults at
+    // every envelope build site).
+    const query = parsePayload<{
+      results: Array<Record<string, unknown>>;
+      search_health: Record<string, unknown>;
+    }>(
       await dispatchToolCall(engine, 'query', { query: 'minimization needle', limit: 1, expand: false }, customerOpts),
     );
-    expect(query[0].slug).toBe(SLUG);
-    expect(query[0]).not.toHaveProperty('page_id');
-    expect(query[0]).not.toHaveProperty('chunk_id');
-    expect(query[0]).not.toHaveProperty('source_id');
+    expect(query.results[0].slug).toBe(SLUG);
+    expect(query.results[0]).not.toHaveProperty('page_id');
+    expect(query.results[0]).not.toHaveProperty('chunk_id');
+    expect(query.results[0]).not.toHaveProperty('source_id');
 
     const timeline = parsePayload<Array<Record<string, unknown>>>(
       await dispatchToolCall(engine, 'get_timeline', { slug: SLUG }, customerOpts),
