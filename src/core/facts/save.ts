@@ -510,7 +510,7 @@ export async function runSaveFacts(
       // or unknown is a silent no-op (expireFact returns false → not counted).
       // Self-supersession (target === the canonical dup) is skipped.
       if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
-        const applied = await ctx.engine.expireFact(supersedeTargetId, {
+        const applied = await ctx.engine.expireFact(supersedeTargetId, { // gbrain-allow-direct-insert: B2 supersedes on the dedup path — the engine's native RLS-confined, idempotent expire of the corrected fact; no fence/markdown source to reconcile through (same sanction as this file's insertFact site)
           supersededBy: matchedId,
         });
         if (applied) superseded += 1;
