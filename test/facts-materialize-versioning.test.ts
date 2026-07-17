@@ -63,6 +63,7 @@ function claim(text: string) {
 async function versions(sourceId: string) {
   const rows = await engine.getVersions(SLUG, { sourceId });
   return rows.map((v) => ({
+    origin: v.origin,
     compiled_truth: v.compiled_truth,
     snapshot_at: v.snapshot_at,
   }));
@@ -73,7 +74,7 @@ describe('save_facts materialize snapshots the pre-update page state', () => {
   const FACT_1 = 'Boltline is negotiating a distribution deal in Ohio';
   const FACT_2 = 'Boltline hired a new head of sales';
 
-  test('first save: the stub the materialize replaced is banked as version 1', async () => {
+  test('first save: birth mints the creation row AND the materialize banks the stub it replaced', async () => {
     const r1 = await runSaveFacts([claim(FACT_1)], { engine, sourceId: SRC });
     expect('inserted' in r1 && r1.inserted).toBe(1);
 
@@ -81,12 +82,22 @@ describe('save_facts materialize snapshots the pre-update page state', () => {
     expect(page).not.toBeNull();
     expect(page!.compiled_truth).toContain(FACT_1); // live page: materialized fact body
 
-    // THE seam: the rewrite of the just-created stub must snapshot the stub,
-    // exactly as the put_page op snapshots an existing page before updating it.
-    const vs = await versions(SRC);
-    expect(vs.length).toBe(1);
-    expect(vs[0].compiled_truth).toContain(STUB_MARKER); // pre-update state = the stub
-    expect(vs[0].compiled_truth).not.toContain(FACT_1);  // never the post-state
+    // Two seams, two rows, one save. ensureStub banks the just-created stub
+    // as a creation-origin row (the chain's recorded floor); the materialize
+    // then banks its pre-update state — the same stub — as an ordinary
+    // update row, exactly as the put_page op snapshots an existing page.
+    // Both record REAL events (birth; replacement) that coincide in tx time.
+    const vs = await versions(SRC); // snapshot_at DESC, id DESC
+    expect(vs.length).toBe(2);
+    expect(vs.map((v) => v.origin)).toEqual(['update', 'creation']);
+    for (const v of vs) {
+      expect(v.compiled_truth).toContain(STUB_MARKER); // both hold the stub
+      expect(v.compiled_truth).not.toContain(FACT_1);  // never the post-state
+    }
+
+    // The worker's completeness signal: the OLDEST row is the creation row,
+    // so the creation→first-materialize era is bounded — no refusable gap.
+    expect(vs[vs.length - 1].origin).toBe('creation');
   });
 
   test('second save: the prior fact body is banked — as-of ordering is deterministic', async () => {
@@ -97,16 +108,18 @@ describe('save_facts materialize snapshots the pre-update page state', () => {
     expect(page!.compiled_truth).toContain(FACT_1);
     expect(page!.compiled_truth).toContain(FACT_2);
 
-    const vs = await versions(SRC); // getVersions: snapshot_at DESC
-    expect(vs.length).toBe(2);
+    const vs = await versions(SRC); // getVersions: snapshot_at DESC, id DESC
+    expect(vs.length).toBe(3);
 
     // Newest snapshot = the body as it stood UNTIL the second save: fact 1
     // only. Reconstruction for any D between the saves resolves to exactly
     // this row (earliest snapshot at-or-after D) — deterministic, no poison.
+    expect(vs[0].origin).toBe('update');
     expect(vs[0].compiled_truth).toContain(FACT_1);
     expect(vs[0].compiled_truth).not.toContain(FACT_2);
-    // Oldest snapshot stays the stub — the chain is append-only.
-    expect(vs[1].compiled_truth).toContain(STUB_MARKER);
+    // Oldest snapshot stays the birth-banked stub — the chain is append-only.
+    expect(vs[2].origin).toBe('creation');
+    expect(vs[2].compiled_truth).toContain(STUB_MARKER);
 
     // Worker usability contract (normalizeVersions): every row carries a
     // parseable snapshot_at and a string compiled_truth, newest-first.
@@ -128,10 +141,12 @@ describe('no version spam: only a real rewrite mints a snapshot', () => {
     const r1 = await runSaveFacts([claim(FACT)], { engine, sourceId: SRC });
     expect('inserted' in r1 && r1.inserted).toBe(1);
     const after1 = (await versions(SRC)).length;
-    expect(after1).toBe(1); // the stub snapshot from the first materialize
+    // Birth chain: the creation row + the first materialize's stub bank.
+    expect(after1).toBe(2);
 
     // Same claim again: dedup makes it a duplicate — no insert, no touched
-    // entity, no rewrite. The version chain must not grow.
+    // entity, no rewrite. The version chain must not grow (no second
+    // creation row, no no-op materialize bank).
     const r2 = await runSaveFacts([claim(FACT)], { engine, sourceId: SRC });
     expect('duplicate' in r2 && r2.duplicate).toBe(1);
     const after2 = (await versions(SRC)).length;
@@ -173,9 +188,18 @@ describe('legacy versionless rewrites (back-compat)', () => {
     await runSaveFacts([claim(FACT_B)], { engine, sourceId: SRC });
     const after = await versions(SRC);
     expect(after.length).toBe(before.length + 1);
+    expect(after[0].origin).toBe('update');
     expect(after[0].compiled_truth).toBe(POISONED_BODY);
 
     const page = await engine.getPage(SLUG, { sourceId: SRC });
     expect(page!.compiled_truth).toContain(FACT_B);
+
+    // Scope of the creation signal, pinned: this page was born post-fix, so
+    // its OLDEST row is still the creation row — yet a versionless direct
+    // putPage rewrite slipped between banks above. The creation row claims a
+    // RECORDED FLOOR (the chain is bounded from birth), not write-path
+    // totality; lost interior rewrites remain the r2 fidelity residual the
+    // worker already discloses (updated_at moved past the covering snapshot).
+    expect(after[after.length - 1].origin).toBe('creation');
   });
 });

@@ -41,6 +41,7 @@ import type {
   TimelineEntry, TimelineInput, TimelineOpts,
   RawData,
   PageVersion,
+  PageVersionOrigin,
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
@@ -4900,12 +4901,16 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Versions
-  async createVersion(slug: string, opts?: { sourceId?: string }): Promise<PageVersion> {
+  async createVersion(slug: string, opts?: { sourceId?: string; origin?: PageVersionOrigin }): Promise<PageVersion> {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
+    // 'creation' only from callers that PROVED the page did not exist before
+    // this engine call (import paths' `existing` check, construct's getPage
+    // gate) — see the BrainEngine.createVersion contract.
+    const origin: PageVersionOrigin = opts?.origin === 'creation' ? 'creation' : 'update';
     const rows = await sql`
-      INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
-      SELECT id, compiled_truth, frontmatter
+      INSERT INTO page_versions (page_id, compiled_truth, frontmatter, origin)
+      SELECT id, compiled_truth, frontmatter, ${origin}
       FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}
       RETURNING *
     `;
@@ -4915,13 +4920,15 @@ export class PostgresEngine implements BrainEngine {
 
   async getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]> {
     const sql = this.sql;
-    // v0.31.8 (D16): two-branch.
+    // v0.31.8 (D16): two-branch. `id DESC` tie-break keeps same-instant rows
+    // (tx-frozen now(), e.g. creation row + first materialize bank) in
+    // deterministic reverse event order on the wire.
     if (opts?.sourceId) {
       const rows = await sql`
         SELECT pv.* FROM page_versions pv
         JOIN pages p ON p.id = pv.page_id
         WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
-        ORDER BY pv.snapshot_at DESC
+        ORDER BY pv.snapshot_at DESC, pv.id DESC
       `;
       return rows as unknown as PageVersion[];
     }
@@ -4929,7 +4936,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT pv.* FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
       WHERE p.slug = ${slug}
-      ORDER BY pv.snapshot_at DESC
+      ORDER BY pv.snapshot_at DESC, pv.id DESC
     `;
     return rows as unknown as PageVersion[];
   }

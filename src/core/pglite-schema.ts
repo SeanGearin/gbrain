@@ -387,7 +387,14 @@ CREATE TABLE IF NOT EXISTS page_versions (
   page_id        INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   compiled_truth TEXT    NOT NULL,
   frontmatter    JSONB   NOT NULL DEFAULT '{}',
-  snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- 'creation' = banked the just-created page state in the creating call
+  -- (chain bounded from birth); 'update' = ordinary pre-update snapshot.
+  -- DEFAULT 'update' is the honest backfill for every legacy row — legacy
+  -- pages never claim a complete chain. Keep in sync with src/schema.sql.
+  -- NOTE: no commas in this comment block — the bootstrap-coverage parser
+  -- comma-splits the CREATE TABLE body before stripping comments.
+  origin         TEXT    NOT NULL DEFAULT 'update'
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_page ON page_versions(page_id);

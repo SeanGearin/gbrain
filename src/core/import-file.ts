@@ -775,6 +775,15 @@ export async function importFromContent(
       // provenance write fires; never client-controlled.
     }, txOpts);
 
+    // Bank the just-created state as a creation-origin version row (same tx,
+    // so snapshot_at == created_at). The mirror of the versions-on-existing
+    // contract above: with it, the page's version chain is bounded from
+    // birth and as-of reconstruction (worker pro-time-travel) can serve the
+    // creation→first-edit era as an ordinary bounded window instead of
+    // refusing it. Runs AFTER putPage because createVersion snapshots the
+    // pages row — which must exist first on the creation path.
+    if (!existing) await tx.createVersion(slug, { ...(txOpts ?? {}), origin: 'creation' });
+
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
     // UPDATE that runs after putPage's INSERT/UPDATE so the row exists.
@@ -1168,6 +1177,11 @@ export async function importCodeFile(
       content_hash: hash,
     }, txOpts);
 
+    // Creation-origin bank of the just-created state (same contract as the
+    // markdown path): the chain is bounded from birth for as-of
+    // reconstruction. AFTER putPage — the pages row must exist to snapshot.
+    if (!existing) await tx.createVersion(slug, { ...(txOpts ?? {}), origin: 'creation' });
+
     await tx.addTag(slug, 'code', txOpts);
     await tx.addTag(slug, lang, txOpts);
 
@@ -1301,6 +1315,10 @@ export async function withImportTransaction(
   await engine.transaction(async (tx) => {
     if (spec.hadExisting) await tx.createVersion(spec.slug);
     await tx.putPage(spec.slug, spec.page);
+    // Creation-origin bank of the just-created state (same contract as the
+    // markdown/code paths): the chain is bounded from birth for as-of
+    // reconstruction. AFTER putPage — the pages row must exist to snapshot.
+    if (!spec.hadExisting) await tx.createVersion(spec.slug, { origin: 'creation' });
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
       const stored = await tx.getPage(spec.slug);

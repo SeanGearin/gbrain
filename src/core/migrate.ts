@@ -5193,6 +5193,42 @@ export const MIGRATIONS: Migration[] = [
       $$;
     `,
   },
+  {
+    version: 116,
+    name: 'page_versions_origin_creation_marker',
+    // Time-travel first-window honesty (worker pro-time-travel `open_note_as_of`).
+    //
+    // Pre-fix the engine banked versions ONLY on update-of-existing
+    // (`if (existing) createVersion` at every import site), so a page's
+    // creation state was never banked and version rows carried no origin
+    // marker. The worker therefore cannot distinguish an earliest snapshot
+    // that genuinely holds the creation state (new page) from one that
+    // silently absorbed unbanked pre-versioning rewrites (legacy page) — and
+    // must refuse every as-of before the earliest snapshot on BOTH.
+    //
+    // This column is the trustworthy signal that re-opens the honest window:
+    // page-creation paths now bank a version row of the just-created state in
+    // the same engine call, stamped origin='creation'. A page whose OLDEST
+    // version row is a creation row has a chain bounded from birth; the
+    // worker may serve the creation→first-snapshot era as an ordinary bounded
+    // window. DEFAULT 'update' is the factually-correct backfill for every
+    // pre-existing row (all were banked by update-of-existing, revert, or
+    // migrate-engine), so no legacy page can ever falsely claim completeness
+    // — the signal is strictly opt-in per page, and its absence reproduces
+    // today's honest refusal.
+    //
+    // ADD COLUMN with a constant default is metadata-only on Postgres 11+ and
+    // PGLite — instant on a table of any size, no index, no FK. No CHECK:
+    // createVersion is the sole writer and validates the enum before insert
+    // (same rationale as facts.provenance, migration v114). Covered for fresh
+    // installs by the schema blob (src/schema.sql / pglite-schema.ts carry the
+    // column inline), so no bootstrap probe is needed — the
+    // schema-bootstrap-coverage test resolves it via the CREATE TABLE body.
+    idempotent: true,
+    sql: `
+      ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'update';
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

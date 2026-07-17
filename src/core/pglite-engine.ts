@@ -33,6 +33,7 @@ import type {
   TimelineEntry, TimelineInput, TimelineOpts,
   RawData,
   PageVersion,
+  PageVersionOrigin,
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
@@ -4706,14 +4707,18 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Versions
-  async createVersion(slug: string, opts?: { sourceId?: string }): Promise<PageVersion> {
+  async createVersion(slug: string, opts?: { sourceId?: string; origin?: PageVersionOrigin }): Promise<PageVersion> {
     const sourceId = opts?.sourceId ?? 'default';
+    // 'creation' only from callers that PROVED the page did not exist before
+    // this engine call (import paths' `existing` check, construct's getPage
+    // gate) — see the BrainEngine.createVersion contract.
+    const origin: PageVersionOrigin = opts?.origin === 'creation' ? 'creation' : 'update';
     const { rows } = await this.db.query(
-      `INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
-       SELECT id, compiled_truth, frontmatter
+      `INSERT INTO page_versions (page_id, compiled_truth, frontmatter, origin)
+       SELECT id, compiled_truth, frontmatter, $3
        FROM pages WHERE slug = $1 AND source_id = $2
        RETURNING *`,
-      [slug, sourceId]
+      [slug, sourceId, origin]
     );
     if (rows.length === 0) throw new Error(`createVersion failed: page "${slug}" (source=${sourceId}) not found`);
     return rows[0] as unknown as PageVersion;
@@ -4722,12 +4727,15 @@ export class PGLiteEngine implements BrainEngine {
   async getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]> {
     // v0.31.8 (D16): two-branch. Without opts.sourceId, joins return versions
     // for every same-slug page (preserves pre-v0.31.8 cross-source view).
+    // `id DESC` tie-break keeps same-instant rows (tx-frozen now(), e.g.
+    // creation row + first materialize bank) in deterministic reverse event
+    // order on the wire.
     if (opts?.sourceId) {
       const { rows } = await this.db.query(
         `SELECT pv.* FROM page_versions pv
          JOIN pages p ON p.id = pv.page_id
          WHERE p.slug = $1 AND p.source_id = $2
-         ORDER BY pv.snapshot_at DESC`,
+         ORDER BY pv.snapshot_at DESC, pv.id DESC`,
         [slug, opts.sourceId]
       );
       return rows as unknown as PageVersion[];
@@ -4736,7 +4744,7 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT pv.* FROM page_versions pv
        JOIN pages p ON p.id = pv.page_id
        WHERE p.slug = $1
-       ORDER BY pv.snapshot_at DESC`,
+       ORDER BY pv.snapshot_at DESC, pv.id DESC`,
       [slug]
     );
     return rows as unknown as PageVersion[];

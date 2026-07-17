@@ -6,6 +6,7 @@ import type {
   TimelineEntry, TimelineInput, TimelineOpts,
   RawData,
   PageVersion,
+  PageVersionOrigin,
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
@@ -1856,12 +1857,25 @@ export interface BrainEngine {
    * Snapshot a page row into page_versions. Source-scoped via `opts.sourceId`;
    * without it the bare-slug lookup snapshots whichever row Postgres returns
    * first when the slug exists across multiple sources.
+   *
+   * `opts.origin` stamps the row's provenance (default 'update'). Creation
+   * paths pass 'creation' AFTER their putPage INSERT, inside the same engine
+   * call, so the banked row holds the just-created state and the page's chain
+   * is bounded from birth. Only pass 'creation' where the caller has PROVEN
+   * the page did not exist (the import paths' `existing` check / construct's
+   * getPage gate) — a false creation stamp would let as-of reconstruction
+   * claim a complete history over a real gap.
    */
-  createVersion(slug: string, opts?: { sourceId?: string }): Promise<PageVersion>;
+  createVersion(slug: string, opts?: { sourceId?: string; origin?: PageVersionOrigin }): Promise<PageVersion>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the page-id lookup.
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
+   *
+   * Ordered snapshot_at DESC with an `id DESC` tie-break: rows banked in the
+   * same transaction share a tx-frozen now() (e.g. a page's creation row and
+   * the first materialize's pre-update bank), and the id tie-break keeps the
+   * wire order deterministic — descending ids = reverse event order.
    */
   getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]>;
   /**

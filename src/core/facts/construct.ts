@@ -346,6 +346,18 @@ async function ensureStub(
     },
     { sourceId },
   );
+  // Bank the just-created stub as a creation-origin version row — the same
+  // contract as the import paths' creation bank: the entity's version chain
+  // is bounded from birth, so as-of reconstruction (worker pro-time-travel)
+  // can serve the creation→first-materialize era instead of refusing it.
+  // Creation is PROVEN by the getPage gate above (this function returned
+  // early if any page stood at the slug). Same INSERT..SELECT grant shape as
+  // the materialize bank below: gbrain_tenant holds page_versions DML
+  // (b7-role.sql) and the source-scoped feeding SELECT satisfies the b7
+  // WITH CHECK. On Postgres the withSourceScope tx freezes now() so
+  // snapshot_at == created_at; on PGLite (pass-through scope) it may trail
+  // by call latency — consumers key on `origin`, never timestamp equality.
+  await engine.createVersion(slug, { sourceId, origin: 'creation' });
   const chunksCreated = await writeStubChunks(engine, sourceId, slug, compiledTruth);
   return { pageCreated: true, chunksCreated };
 }

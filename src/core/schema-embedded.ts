@@ -544,7 +544,18 @@ CREATE TABLE IF NOT EXISTS page_versions (
   page_id        INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   compiled_truth TEXT    NOT NULL,
   frontmatter    JSONB   NOT NULL DEFAULT '{}',
-  snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Origin marker for as-of reconstruction (worker pro-time-travel):
+  -- 'creation' = this row banked the just-created page state in the same
+  -- engine call that created the page — the version chain is bounded from
+  -- birth; 'update' = the ordinary pre-update snapshot. DEFAULT 'update' is
+  -- the factually-correct backfill for every legacy row (all were banked by
+  -- update-of-existing or revert or migrate-engine) — a legacy page can
+  -- never falsely claim a complete chain. No CHECK: createVersion is the
+  -- sole writer and validates the enum (same rationale as facts.provenance
+  -- in migration v114). No commas in this comment block — the
+  -- bootstrap-coverage parser comma-splits the body before stripping.
+  origin         TEXT    NOT NULL DEFAULT 'update'
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_page ON page_versions(page_id);

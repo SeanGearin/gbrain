@@ -1235,12 +1235,24 @@ export interface RawData {
 }
 
 // Versions
+/**
+ * Provenance of a version row. 'creation' rows bank the just-created page
+ * state inside the creating engine call — a page whose OLDEST version row is
+ * a creation row has a version chain bounded from birth (the worker's as-of
+ * reconstruction may serve the creation→first-snapshot era as an ordinary
+ * bounded window). 'update' rows are the ordinary pre-update snapshots, and
+ * the column DEFAULT backfills every legacy row as 'update' so legacy pages
+ * never claim a complete chain.
+ */
+export type PageVersionOrigin = 'creation' | 'update';
+
 export interface PageVersion {
   id: number;
   page_id: number;
   compiled_truth: string;
   frontmatter: Record<string, unknown>;
   snapshot_at: Date;
+  origin: PageVersionOrigin;
 }
 
 // Stats + Health
