@@ -588,8 +588,19 @@ async function applyAliasResolvedBoost(
 // Lexical-anchor term probe — fallback anchoring when the whole-phrase
 // keyword arm is empty (FTS AND semantics). Filler words would never anchor
 // a page; everything else gets one cheap per-term keyword probe.
+//
+// C1 (engine verify 2026-07-16): the cap must never be exhausted by query
+// ORDER. The old first-6-in-order selection was a live still-empty shape —
+// a compound question front-loading >=6 significant out-of-corpus terms
+// before the entity name ("give me your best comprehensive holistic
+// strategic overall assessment regarding Sightline", decomposer absent)
+// spent the whole cap on junk, the entity term was never probed, and the
+// gate annihilated every fused hit. Realistic asks carry <=12 significant
+// terms, so at 12 they are ALL probed; past the cap, selection prefers
+// entity-cased terms and then fills from both ends inward, so a leading or
+// trailing entity term can never be starved by mid-query verbiage.
 const ANCHOR_PROBE_LIMIT = 10;
-const ANCHOR_PROBE_MAX_TERMS = 6;
+const ANCHOR_PROBE_MAX_TERMS = 12;
 const ANCHOR_PROBE_FILLER = new Set([
   'the', 'a', 'an', 'of', 'and', 'or', 'to', 'in', 'on', 'for', 'with',
   'at', 'by', 'from', 'as', 'is', 'it', 'this', 'that', 'my', 'your',
@@ -598,14 +609,52 @@ const ANCHOR_PROBE_FILLER = new Set([
   'know', 'tell', 'about', 'its', 's', 'going', 'happening', 'anything',
 ]);
 
+// Entity-cased terms read off the RAW query (tokenizeTitle lowercases, so
+// case must be captured before tokenization): TitleCase anywhere past the
+// query's first word, ALLCAPS acronyms ("SEC"), and letter+digit codes
+// ("b8", "v51") — the tokens most likely to be names with lexical evidence.
+// Values are normalized exactly like tokenizeTitle output so they compare.
+function entityCasedTerms(query: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of query.matchAll(/[\p{L}\p{N}]+/gu)) {
+    const w = m[0];
+    const titleCased = m.index! > 0 && /^\p{Lu}/u.test(w);
+    const acronym = w.length >= 2 && w === w.toUpperCase() && /\p{Lu}/u.test(w);
+    const alnumCode = /\p{L}/u.test(w) && /\p{N}/u.test(w);
+    if (titleCased || acronym || alnumCode) {
+      out.add(w.toLowerCase().normalize('NFKC'));
+    }
+  }
+  return out;
+}
+
 function anchorProbeTerms(query: string): string[] {
   const seen = new Set<string>();
   for (const t of tokenizeTitle(query)) {
     if (t.length < 2 || ANCHOR_PROBE_FILLER.has(t)) continue;
     seen.add(t);
-    if (seen.size >= ANCHOR_PROBE_MAX_TERMS) break;
   }
-  return [...seen];
+  const terms = [...seen];
+  if (terms.length <= ANCHOR_PROBE_MAX_TERMS) return terms;
+
+  // Over the cap: query order must not decide who gets probed (C1).
+  // Entity-cased terms take slots first, in query order.
+  const cased = entityCasedTerms(query);
+  const picked = new Set<string>();
+  for (const t of terms) {
+    if (picked.size >= ANCHOR_PROBE_MAX_TERMS) break;
+    if (cased.has(t)) picked.add(t);
+  }
+  // Remaining slots fill from both ends inward, end first (conversational
+  // asks trail their entity), so only deep-middle terms can ever be dropped.
+  let lo = 0;
+  let hi = terms.length - 1;
+  let fromEnd = true;
+  while (picked.size < ANCHOR_PROBE_MAX_TERMS && lo <= hi) {
+    picked.add(fromEnd ? terms[hi--] : terms[lo++]);
+    fromEnd = !fromEnd;
+  }
+  return [...picked];
 }
 
 // T3 — free-text alias hop tuning.

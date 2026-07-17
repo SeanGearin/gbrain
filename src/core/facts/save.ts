@@ -510,7 +510,7 @@ export async function runSaveFacts(
       // or unknown is a silent no-op (expireFact returns false → not counted).
       // Self-supersession (target === the canonical dup) is skipped.
       if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
-        const applied = await ctx.engine.expireFact(supersedeTargetId, { // gbrain-allow-direct-insert: B2 supersedes on the dedup path — the engine's native RLS-confined, idempotent expire of the corrected fact; no fence/markdown source to reconcile through (same sanction as this file's insertFact site)
+        const applied = await ctx.engine.expireFact(supersedeTargetId, { // gbrain-allow-direct-insert: B2 supersedes on the dedup path — the engine's native RLS-confined, idempotent expire of the corrected fact. Plane-honest scope: on the tenant plane (sources without local_path) there is no fence/markdown source to reconcile through; on a fence-backed brain a supersede CAN target a fence-derived row, and this DB-only expire does not survive `gbrain rebuild` (the fence still lists the row active) — known gap, cure = mirror forgetFactInFence's canFence gate (forget.ts) on this path.
           supersededBy: matchedId,
         });
         if (applied) superseded += 1;
@@ -562,7 +562,7 @@ export async function runSaveFacts(
     const insertCtx = supersedeTargetId !== null
       ? { source_id: ctx.sourceId, supersedeId: supersedeTargetId }
       : { source_id: ctx.sourceId };
-    const result = await ctx.engine.insertFact(newFact, insertCtx); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, there is no fence/markdown source to reconcile through
+    const result = await ctx.engine.insertFact(newFact, insertCtx); // gbrain-allow-direct-insert: save_facts is the deterministic structured-intake write surface — claims are pre-extracted by the client, so the INSERTED claim has no fence/markdown source to reconcile through; the atomic supersede arm shares the dedup path's fence gap above when its target is fence-derived (see that sanction's honest scope).
     fact_ids.push(result.id);
     // 'superseded' means the engine wrote a NEW row (and atomically expired the
     // target) — count it as an insert exactly like 'inserted', and additionally

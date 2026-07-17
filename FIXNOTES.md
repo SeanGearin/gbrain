@@ -86,3 +86,25 @@ Back-compat: pre-fix rewrites destroyed their pre-states — nothing can invent 
 Tests: `test/facts-materialize-versioning.test.ts` — red-first 0/4 pre-fix → 4/4 post-fix (stub banked on first materialize; prior body banked on the next — the as-of seam; no version spam on duplicate/no-op; poisoned legacy state banked on first post-fix touch).
 
 Deploy: engine-side only, no schema migration (page_versions + grants already live). Box deploy is Sean-gated, as always.
+
+## fix/engine-c1-a1 — 2026-07-17 (probe-cap position independence + supersede sanction honesty)
+
+Branch base: `fix/engine-recall-quality @ 5190c7f`. Closes the two engine-side findings from the 2026-07-16 adversarial verify (C1 MED, A1 LOW-MED); E1 from that verify routes to the worker, not this line.
+
+### 1. C1 — the first-6 anchor-probe cap was a live still-empty shape
+
+The F1-addendum probe above capped at the FIRST 6 significant terms in query order, so a compound question front-loading >=6 significant out-of-corpus terms before the entity name ("give me your best comprehensive holistic strategic overall assessment regarding Sightline", decomposer absent — the raw-fallback leg) spent the cap on junk, never probed the entity, and the gate annihilated every fused hit while "Sightline" alone returned pages. The addendum's "conversational phrasing about real entities stops being annihilated" only became a class statement with this fix.
+
+Fix (`src/core/search/hybrid.ts` `anchorProbeTerms`): cap raised 6 → 12 (realistic asks carry <=12 significant terms, so all get probed — the airtight path); past the cap, selection is position-independent — entity-cased terms (TitleCase past the first word, ALLCAPS acronyms, letter+digit codes, read off the raw query before tokenization lowercases) take slots first, and the remainder fills from both ends inward, end first. Query order can no longer starve a leading or trailing entity term; only deep-middle terms of pathological >12-term queries can be dropped. The off-world guard is untouched: junk terms have no corpus hits, so they add no anchors, and a query with NO in-corpus term still gates to empty.
+
+Tests: `test/anchor-probe-frontload.serial.test.ts` — red-first 2 pass / 3 fail at `5190c7f` (probe receipts show exactly [give, best, comprehensive, holistic, strategic, overall], never sightline, results []) → 5/5 post-fix. Pins: the receipted C1 shape, its all-lowercase variant (no case signal — the raise carries it), an over-cap 13-junk-term run before a trailing lowercase entity (the both-ends fill carries it), and the off-world guard asserted NON-vacuously (vector arm forced to surface the dense cluster; gate still empties it).
+
+Not taken: widening the empty-fused path with probe hits (the "and/or" in the dispatch). When every retrieval arm is empty the gate isn't what emptied the result — injecting probe hits there turns a filter into a fallback retrieval arm with its own precision story (weak in-corpus junk terms would surface pages for off-target asks). Separate design call, not smuggled into a hardening fix.
+
+### 2. A1 — the B2 supersede sanction now states its plane-honest scope
+
+`save.ts`'s dedup-path `expireFact` sanction read "no fence/markdown source to reconcile through" — true on the b8 tenant plane (tenant sources have no `local_path`, so no fence lifecycle exists), false as the class statement it reads as: on a fence-backed brain a B2 supersede CAN target a fence-derived fact (the fence carries active/forgotten/supersededBy state), and a DB-only expire diverges from it — the supersession evaporates at the next rebuild while B2 already receipted `superseded: 1`.
+
+Route taken: honesty narrowing (comment-only, zero behavior change) at both supersede-relevant sanction sites — the dedup-path `expireFact` and the atomic insert+expire arm at `insertFact`, which shares the gap for fence-derived targets. Each now states: tenant-plane sanctioned; fence-backed supersedes of fence-derived rows do NOT survive rebuild; cure = mirror `forgetFactInFence`'s canFence gate (forget.ts, the house standard in this file family). The gate route was NOT taken here because it is not the cheap option it looks like: fence supersedes need a `superseded by #N` reference that stays stable across rebuild, and fence rewrites take page locks + filesystem writes inside save_facts' tenant tx (forget runs as a standalone op) — and on the b8 plane this branch feeds, `canFence` is always false, so the gate would be dead code on the deploy target. That gate is the sanctioned operator-plane follow-up.
+
+Deploy: engine-side only, no schema migration. Box deploy is Sean-gated, as always.
