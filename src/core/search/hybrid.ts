@@ -1870,6 +1870,12 @@ export async function hybridSearchCached(
         ...(hit.meta?.embedding_column ? { embedding_column: hit.meta.embedding_column } : {}),
         ...(hit.meta?.adaptive_return ? { adaptive_return: hit.meta.adaptive_return } : {}),
         ...(hit.meta?.autocut ? { autocut: hit.meta.autocut } : {}),
+        // SR-6/V-1: a degraded result set stored by the writeback (the
+        // cross-modal fell-open shape keeps vector_enabled true, so it IS
+        // cached) must re-serve AS degraded — dropping these re-laundered
+        // the stored row as healthy for up to TTL on every warm hit.
+        ...(hit.meta?.degraded ? { degraded: true } : {}),
+        ...(hit.meta?.degraded_reason ? { degraded_reason: hit.meta.degraded_reason } : {}),
         // SR-1: carry the stored window record so observability (and any
         // re-serve decision upstream) sees what the row can prove.
         ...(win ? { cache_window: win } : {}),

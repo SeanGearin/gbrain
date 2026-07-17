@@ -30,6 +30,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { operationsByName } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
+import { awaitPendingSearchCacheWrites } from '../src/core/search/hybrid.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   configureGateway,
@@ -152,6 +153,51 @@ describe('SR-6 — the degradation flag reaches the response', () => {
           embeddings: args.values.map(() => Array.from({ length: DIM }, (_, i) => Math.sin(i * 0.01))),
         };
       }) as never);
+    }
+  }, 60_000);
+
+  test('V-1: a degraded result served from CACHE still reports degraded — the hit must not launder search_health', async () => {
+    // The cacheABLE degraded shape (search-verify V-1): cross-modal fell
+    // open. The TEXT vector arm stays healthy (vector_enabled true → the
+    // row IS stored by the writeback gate) while the unified arm fails —
+    // this text-only recipe rejects multimodal embedding — so the fresh
+    // response is degraded:true, reason cross_modal_arm_fell_open. The
+    // embed-outage shape from the tests above is NOT cacheable
+    // (vector_enabled false blocks writeback) and cannot exercise this.
+    embedShouldFail = false; // text embeds succeed → vector arm healthy
+    await engine.setConfig('search.unified_multimodal', 'true');
+    try {
+      const search = operationsByName['search'];
+      // Every term lives in the seeded chunk — a stray term empties the
+      // lexically-gated result set and an EMPTY set is never written back,
+      // which would make this test pass vacuously as a double miss.
+      const q = 'walrus colony observed northern shore';
+      const miss = (await search.handler(ctx(), { query: q, limit: 5 })) as SearchEnvelope;
+      expect(miss.results.length).toBeGreaterThan(0);        // non-empty → cacheable
+      expect(miss.search_health.degraded).toBe(true);        // fresh path honest
+      expect(miss.search_health.vector_enabled).toBe(true);  // → the row was cached
+      expect(miss.search_health.reason).toBe('cross_modal_arm_fell_open');
+
+      // The writeback is fire-and-forget; settle it so call 2 deterministically
+      // sees the stored row.
+      await awaitPendingSearchCacheWrites();
+
+      const hit = (await search.handler(ctx(), { query: q, limit: 5 })) as SearchEnvelope;
+      // Non-vacuity: prove call 2 actually served from cache (hit_count bumped).
+      const cacheRows = await engine.executeRaw<{ hit_count: number | string }>(
+        `SELECT hit_count FROM query_cache WHERE query_text = $1`,
+        [q],
+      );
+      expect(cacheRows.length).toBe(1);
+      expect(Number(cacheRows[0].hit_count)).toBe(1);
+      // RED pre-V-1-fix: cachedMeta dropped degraded/degraded_reason, so the
+      // warm hit re-served the degraded set as search_health.degraded:false
+      // for up to TTL. The hit must carry the stored row's own health.
+      expect(hit.search_health.degraded).toBe(true);
+      expect(hit.search_health.reason).toBe('cross_modal_arm_fell_open');
+    } finally {
+      await engine.setConfig('search.unified_multimodal', 'false');
+      embedShouldFail = true;
     }
   }, 60_000);
 });
