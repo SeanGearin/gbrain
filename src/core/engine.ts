@@ -1769,8 +1769,15 @@ export interface BrainEngine {
    *   4. else classifier (caller's job; this engine method handles the
    *      DB-side INSERT/UPDATE only). On insert.status === 'duplicate' or
    *      'superseded' the engine returns the existing/superseding row id.
-   * Per-entity advisory lock on Postgres serializes the dedup window.
-   * PGLite no-op for the lock (single-process).
+   * Dedup window (A2 2026-07-18, FS-8 class): on Postgres the PLAIN insert
+   * path takes an advisory xact lock for EVERY insert — keyed on the entity
+   * when present, else on the folded claim text — and re-runs the exact-arm
+   * duplicate check INSIDE the lock, so two concurrent verbatim same-text
+   * saves serialize and the loser returns 'duplicate' (the pre-A2 shape
+   * locked only entity claims and checked before locking, which closed
+   * nothing). PGLite shares the re-check without the lock (single-process).
+   * Residual: near-dup (trgm/cosine) races and same-text-different-entity
+   * races can still double-insert; the realistic retry threat is verbatim.
    *
    * `status` reflects what the engine wrote:
    *   'inserted'   → row inserted

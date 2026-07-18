@@ -3761,6 +3761,25 @@ export class PGLiteEngine implements BrainEngine {
       return { id: result.id, status: result.applied ? 'superseded' : 'inserted' };
     }
 
+    // Plain insert path — race-safe dedup window (A2 2026-07-18, FS-8
+    // class), twin of the postgres engine. The lock half is postgres-only
+    // (single-connection PGLite cannot contend, so no lock is taken here);
+    // the exact-arm re-check is the shared semantic, keeping engine-level
+    // behavior identical across twins (a same-text insert against an
+    // existing ACTIVE row returns 'duplicate' on both).
+    const dup = await this.db.query<{ id: number }>(
+      `SELECT id FROM facts
+       WHERE source_id = $1
+         AND expired_at IS NULL
+         AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+           = lower(regexp_replace(btrim($2), '\\s+', ' ', 'g'))
+       ORDER BY id DESC
+       LIMIT 1`,
+      [ctx.source_id, input.fact],
+    );
+    if (dup.rows.length > 0) {
+      return { id: Number(dup.rows[0].id), status: 'duplicate' };
+    }
     const ins = await this.db.query<{ id: number }>(
       embedStr === null
         ? `INSERT INTO facts (

@@ -4023,11 +4023,34 @@ export class PostgresEngine implements BrainEngine {
       return { id: outcome.id, status: outcome.applied ? 'superseded' : 'inserted' };
     }
 
-    // Plain insert path with optional advisory lock for the dedup window.
-    const id = await this.sqlTxRaw(async (tx) => {
-      if (entitySlug) {
-        await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
-      }
+    // Plain insert path — race-safe dedup window (A2 2026-07-18, FS-8
+    // class): the advisory lock is now taken for EVERY insert (keyed on the
+    // entity when present, else on the folded claim text) and the exact-arm
+    // dedup check re-runs INSIDE the lock. The old shape locked only
+    // entity-keyed claims and — decisively — callers ran their dedup check
+    // BEFORE the lock, so two concurrent same-text saves both missed and
+    // both inserted (proven on real PG in all three plane shapes). The
+    // in-lock re-check closes the verbatim window: the loser of the lock
+    // race sees the winner's committed row and returns status 'duplicate'
+    // (the receipt path save.ts/backstop.ts always had for this). Scoped
+    // ACTIVE-only, so the N1 tombstone lane still owns corrected-away
+    // refusals and forget stays reversible. Residuals (documented): near-
+    // dup/cosine races and same-text-different-entity races can still
+    // double-insert — the realistic retry threat is byte-verbatim.
+    const outcome = await this.sqlTxRaw(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(
+        ${ctx.source_id} || ':' ||
+        COALESCE(${entitySlug}, lower(regexp_replace(btrim(${input.fact}), '\\s+', ' ', 'g'))), 0))`;
+      const dup = await tx<Array<{ id: number }>>`
+        SELECT id FROM facts
+        WHERE source_id = ${ctx.source_id}
+          AND expired_at IS NULL
+          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+            = lower(regexp_replace(btrim(${input.fact}), '\\s+', ' ', 'g'))
+        ORDER BY id DESC
+        LIMIT 1
+      `;
+      if (dup.length > 0) return { id: Number(dup[0].id), dup: true };
       const ins = await tx<Array<{ id: number }>>`
         INSERT INTO facts (
           source_id, entity_slug, fact, kind, visibility, notability, context,
@@ -4043,9 +4066,9 @@ export class PostgresEngine implements BrainEngine {
           ${provenance}, ${clientAuthored}
         ) RETURNING id
       `;
-      return Number(ins[0].id);
+      return { id: Number(ins[0].id), dup: false };
     });
-    return { id, status: 'inserted' };
+    return { id: outcome.id, status: outcome.dup ? 'duplicate' : 'inserted' };
   }
 
   async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean> {
