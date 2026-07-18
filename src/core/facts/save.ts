@@ -582,19 +582,22 @@ export async function runSaveFacts(
 
     // --- N1 tombstone check (third dedup layer, active-miss only) ----------
     // Exact-text lookup against rows expired BY CORRECTION (superseded_by IS
-    // NOT NULL), firing only when Layers 1+2 missed AND the claim does not
-    // carry `supersedes`. A supersedes-carrying re-assertion is the escape
-    // hatch: it skips this check and falls through to the atomic
-    // insert+expire below, re-minting with the chain intact (correction-of-
-    // the-correction needs no new field — B2 already expresses the intent).
+    // NOT NULL), firing whenever Layers 1+2 missed. The escape hatch is
+    // HEAD-CHECKED (V-N1-2): a re-assertion passes through ONLY when its
+    // `supersedes` names the chain's LIVE HEAD — the shape the tool doc has
+    // always prescribed — and re-mints via the atomic insert+expire with the
+    // chain intact. Any other `supersedes` (a stale correction batch
+    // replayed after a FURTHER correction names a mid-chain id) gets the
+    // same honest refusal as a plain replay: without the head check, that
+    // replay re-minted the middle claim as live truth beside the real head.
     // Forget/decay tombstones (superseded_by NULL) never match, so deliberate
     // deletion stays reversible by a plain save. Refuse ONLY when the chain
     // walk lands on an ACTIVE head — the receipt then points at live truth;
     // a dead chain (the correction was itself forgotten) mints, or the
     // forget would become sticky against the original text.
-    if (supersedeTargetId === null) {
+    {
       const tomb = await ctx.engine.findSupersededTombstone(ctx.sourceId, cleaned);
-      if (tomb !== null && tomb.head_active) {
+      if (tomb !== null && tomb.head_active && supersedeTargetId !== tomb.head_id) {
         duplicate += 1;
         fact_ids.push(tomb.head_id);
         results[index] = {
