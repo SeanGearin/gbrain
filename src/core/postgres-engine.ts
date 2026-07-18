@@ -4474,13 +4474,18 @@ export class PostgresEngine implements BrainEngine {
     return rows.map(rowToFactPg);
   }
 
-  // N1 — third dedup check: exact-text correction-tombstone lookup + bounded
+  // N1 — third dedup check: exact-text correction-tombstone lookup +
   // superseded_by walk to the chain head, in one recursive CTE. The walk's
   // join re-checks source_id (belt-and-suspenders alongside RLS) so a
-  // cross-source pointer can never leak a row; the depth guard bounds cycles
-  // and pathological chains. The deepest chain row is where the walk stopped:
-  // the ACTIVE head (superseded_by NULL ends the recursion), or an expired /
-  // dangling stop the caller treats as "no live head" (head_active false).
+  // cross-source pointer can never leak a row. V-N1-3 (A2 2026-07-18): the
+  // walk carries a visited-id path guard instead of the old depth<32 bound —
+  // a LEGAL chain of any depth reaches its head (the bound made deep chains
+  // fall OPEN: the walk stopped on an expired row and the replay minted),
+  // while a corrupted CYCLIC chain terminates at the first revisit and falls
+  // to the dead-chain policy. The deepest chain row is where the walk
+  // stopped: the ACTIVE head (superseded_by NULL ends the recursion), or an
+  // expired / dangling / cycle stop the caller treats as "no live head"
+  // (head_active false).
   async findSupersededTombstone(
     source_id: string,
     factText: string,
@@ -4497,13 +4502,14 @@ export class PostgresEngine implements BrainEngine {
         LIMIT 1
       ),
       chain AS (
-        SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth
+        SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth, ARRAY[f.id] AS path
         FROM facts f JOIN tomb t ON f.id = t.id
         UNION ALL
-        SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1
+        SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1, c.path || nxt.id
         FROM chain c
         JOIN facts nxt ON nxt.id = c.superseded_by AND nxt.source_id = ${source_id}
-        WHERE c.superseded_by IS NOT NULL AND c.depth < 32
+        WHERE c.superseded_by IS NOT NULL
+          AND NOT (c.superseded_by = ANY(c.path))
       )
       SELECT t.id AS tombstone_id,
              c.id AS head_id,

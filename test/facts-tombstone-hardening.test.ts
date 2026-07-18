@@ -182,3 +182,80 @@ describe('tombstone hardening — V-N1-2 stale-correction replay', () => {
     expect(novel.results[0].status).toBe('inserted');
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// V-N1-3 — deep chains and cycles in the walk
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Plant a correction chain of `hops` supersessions directly (raw SQL —
+ * fixture speed; the REPLAY goes through the real save path). Row i is
+ * expired with superseded_by → row i+1; the last row is the ACTIVE head.
+ * Returns ids[0..hops] (ids[0] = the original tombstone).
+ */
+async function plantChain(src: string, hops: number, text: (i: number) => string): Promise<number[]> {
+  const ids: number[] = [];
+  for (let i = 0; i <= hops; i++) {
+    const rows = await engine.executeRaw<{ id: number | string }>(
+      `INSERT INTO facts (source_id, fact, kind, visibility, notability, source, client_authored)
+       VALUES ($1, $2, 'fact', 'private', 'medium', 'mcp:save_facts', true) RETURNING id`,
+      [src, text(i)],
+    );
+    ids.push(Number(rows[0].id));
+  }
+  for (let i = 0; i < hops; i++) {
+    await engine.executeRaw(
+      `UPDATE facts SET expired_at = now(), superseded_by = $1 WHERE id = $2`,
+      [ids[i + 1], ids[i]],
+    );
+  }
+  return ids;
+}
+
+describe('tombstone hardening — V-N1-3 walk depth + cycle guard', () => {
+  test('RED: a 40-hop chain with an ACTIVE head must refuse the replay (depth-32 fall-open resurrected it)', async () => {
+    const SRC = 'tenant-h-deep';
+    const hopText = (i: number) => `deep chain hop ${i} — filler ${i * 7919} orthogonal payload ${String.fromCharCode(65 + (i % 26))}`;
+    const ids = await plantChain(SRC, 40, hopText);
+    const rowsBefore = await totalCount(SRC);
+
+    const replay = await save(SRC, [
+      { claim: hopText(0), provenance: 'user_stated' },
+    ]);
+
+    expect(replay.inserted).toBe(0);
+    expect(replay.duplicate).toBe(1);
+    expect(replay.results[0]).toMatchObject({
+      status: 'duplicate_superseded',
+      fact_id: ids[40],
+      superseded_from: ids[0],
+    });
+    expect(await totalCount(SRC)).toBe(rowsBefore);
+    expect(await activeCount(SRC, hopText(0))).toBe(0);
+  });
+
+  test('CONTROL: a corrupted CYCLIC chain terminates and falls to the dead-chain policy (mint)', async () => {
+    const SRC = 'tenant-h-cycle';
+    const TX = 'cycle row alpha — the renovation estimate was forty thousand';
+    const TY = 'cycle row beta — vendor onboarding wraps before the offsite';
+    const x = (await engine.executeRaw<{ id: number | string }>(
+      `INSERT INTO facts (source_id, fact, kind, visibility, notability, source, client_authored)
+       VALUES ($1, $2, 'fact', 'private', 'medium', 'mcp:save_facts', true) RETURNING id`,
+      [SRC, TX],
+    ))[0];
+    const y = (await engine.executeRaw<{ id: number | string }>(
+      `INSERT INTO facts (source_id, fact, kind, visibility, notability, source, client_authored)
+       VALUES ($1, $2, 'fact', 'private', 'medium', 'mcp:save_facts', true) RETURNING id`,
+      [SRC, TY],
+    ))[0];
+    await engine.executeRaw(`UPDATE facts SET expired_at = now(), superseded_by = $1 WHERE id = $2`, [Number(y.id), Number(x.id)]);
+    await engine.executeRaw(`UPDATE facts SET expired_at = now(), superseded_by = $1 WHERE id = $2`, [Number(x.id), Number(y.id)]);
+
+    // No live head exists anywhere in the loop → the dead-chain policy
+    // mints. The point pinned here: the walk TERMINATES (path guard) and
+    // the save completes rather than recursing forever.
+    const replay = await save(SRC, [{ claim: TX, provenance: 'user_stated' }]);
+    expect(replay.inserted).toBe(1);
+    expect(await activeCount(SRC, TX)).toBe(1);
+  });
+});

@@ -1973,12 +1973,15 @@ export interface BrainEngine {
    * Forget/decay tombstones (`superseded_by` NULL) never match, so
    * deliberate deletion stays reversible by a plain re-save.
    *
-   * On a hit, walks the `superseded_by` chain (bounded at 32 hops,
-   * source-confined) and returns the matched tombstone plus where the walk
-   * stopped: the chain head and whether that head is ACTIVE. Callers refuse
-   * the re-mint ONLY when `head_active` — a dead chain (the correction was
-   * itself forgotten, or a dangling pointer) must fall through and mint,
-   * or the forget would become sticky against the original text.
+   * On a hit, walks the `superseded_by` chain (source-confined, with a
+   * visited-id path guard — V-N1-3: legal chains of ANY depth reach their
+   * head; the old depth<32 bound made deep chains fall open and re-mint,
+   * while a corrupted cyclic chain now terminates at the first revisit)
+   * and returns the matched tombstone plus where the walk stopped: the
+   * chain head and whether that head is ACTIVE. Callers refuse the
+   * re-mint ONLY when `head_active` — a dead chain (the correction was
+   * itself forgotten, a dangling pointer, or a cycle) must fall through
+   * and mint, or the forget would become sticky against the original text.
    *
    * Runs on the active-dedup MISS path only (save.ts), so the cost is one
    * extra query per genuinely-new claim. Deliberately NO trgm/cosine arm:
