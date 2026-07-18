@@ -4009,9 +4009,12 @@ export class PostgresEngine implements BrainEngine {
         const id = Number(ins[0].id);
         // FS-4: source-confined — a foreign target no-ops even on
         // BYPASSRLS planes where RLS never filters.
+        // FS-5: `id <> ${id}` — a supersedeId that lands on the id this
+        // INSERT just minted (future-id guess hitting the serial) must not
+        // expire the new row into a born-dead self-superseded loop.
         const upd = await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
                  WHERE id = ${supersedeId} AND expired_at IS NULL
-                   AND source_id = ${ctx.source_id}`;
+                   AND source_id = ${ctx.source_id} AND id <> ${id}`;
         return { id, applied: (upd.count ?? 0) > 0 };
       });
       // FS-3: the status reports what HAPPENED, not what was dispatched.

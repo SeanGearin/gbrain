@@ -642,9 +642,11 @@ export async function runSaveFacts(
     };
     // B2: when the claim supersedes a prior fact AND its text is not a dup, use
     // the engine's ATOMIC insert+expire path (its own tx) so no observer ever
-    // sees the old and new rows both active — returns status 'superseded'. A new
-    // row (fresh id) can never equal supersedeTargetId, so no self-guard needed
-    // here. Plain insert otherwise.
+    // sees the old and new rows both active — returns status 'superseded' iff
+    // the expire actually applied (FS-3). A supersedeTargetId CAN equal the id
+    // the INSERT is about to mint (future-id guess hitting the serial); the
+    // engine's expire excludes the new row's own id (FS-5), so that shape lands
+    // as a plain honest insert. Plain insert otherwise.
     const insertCtx = supersedeTargetId !== null
       ? { source_id: ctx.sourceId, supersedeId: supersedeTargetId }
       : { source_id: ctx.sourceId };

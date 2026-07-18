@@ -3745,9 +3745,12 @@ export class PGLiteEngine implements BrainEngine {
         const newId = ins.rows[0].id;
         // FS-4: source-confined — a foreign target no-ops even on
         // BYPASSRLS planes where RLS never filters.
+        // FS-5: `id <> $1` — a supersedeId that lands on the id this
+        // INSERT just minted (future-id guess hitting the serial) must not
+        // expire the new row into a born-dead self-superseded loop.
         const upd = await tx.query(
           `UPDATE facts SET expired_at = now(), superseded_by = $1
-           WHERE id = $2 AND expired_at IS NULL AND source_id = $3`,
+           WHERE id = $2 AND expired_at IS NULL AND source_id = $3 AND id <> $1`,
           [newId, ctx.supersedeId, ctx.source_id],
         );
         return { id: newId, applied: (upd.affectedRows ?? 0) > 0 };

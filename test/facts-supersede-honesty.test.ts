@@ -287,6 +287,34 @@ describe('save_facts — FS-4 cross-source supersede confinement (BYPASSRLS plan
     expect(target.superseded_by).toBe(corr.fact_ids[0]);
   });
 
+  test('FS-5 RED: a supersedes id equal to the row the INSERT itself mints must not birth a self-superseded dead row', async () => {
+    const SRC = 'tenant-a2-self';
+    // Learn the serial's position exactly: the next insert takes probeId + 1
+    // (single-connection engine, serial allocation is strictly sequential).
+    const probe = await engine.insertFact(
+      { fact: 'serial probe row for FS-5', source: 'mcp:save_facts', client_authored: true },
+      { source_id: SRC },
+    );
+    const predictedNextId = probe.id + 1;
+
+    const res = await save(SRC, [
+      { claim: 'The design review cadence doubled during launch month', provenance: 'user_stated', supersedes: predictedNextId },
+    ]);
+
+    // The claim landed under the predicted id — the trap was armed.
+    expect(res.fact_ids[0]).toBe(predictedNextId);
+
+    // Pre-fix: the atomic UPDATE matched the row the INSERT just minted →
+    // born expired, superseded_by = itself, receipted inserted+superseded.
+    // Post-fix: the UPDATE excludes the new row's own id → plain honest insert.
+    const mine = await factState(predictedNextId);
+    expect(mine.active).toBe(true);
+    expect(mine.superseded_by).toBeNull();
+    expect(res.inserted).toBe(1);
+    expect(res.superseded).toBe(0);
+    expect(res.results[0].status).toBe('inserted');
+  });
+
   test('CONTROL: same-source supersede still applies on both B2 paths (incl. the fence strike)', async () => {
     // Insert path, plain rows.
     const first = await save('tenant-a2-ctl', [
