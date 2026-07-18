@@ -3987,7 +3987,7 @@ export class PostgresEngine implements BrainEngine {
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
       const supersedeId = ctx.supersedeId;
-      const newId = await this.sqlTxRaw(async (tx) => {
+      const outcome = await this.sqlTxRaw(async (tx) => {
         if (entitySlug) {
           await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
         }
@@ -4009,12 +4009,15 @@ export class PostgresEngine implements BrainEngine {
         const id = Number(ins[0].id);
         // FS-4: source-confined — a foreign target no-ops even on
         // BYPASSRLS planes where RLS never filters.
-        await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
+        const upd = await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
                  WHERE id = ${supersedeId} AND expired_at IS NULL
                    AND source_id = ${ctx.source_id}`;
-        return id;
+        return { id, applied: (upd.count ?? 0) > 0 };
       });
-      return { id: newId, status: 'superseded' };
+      // FS-3: the status reports what HAPPENED, not what was dispatched.
+      // 0 rows updated (nonexistent / already-expired / foreign target) →
+      // the new fact is a plain insert; no supersession is claimed.
+      return { id: outcome.id, status: outcome.applied ? 'superseded' : 'inserted' };
     }
 
     // Plain insert path with optional advisory lock for the dedup window.

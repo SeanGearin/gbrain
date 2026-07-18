@@ -1776,6 +1776,13 @@ export interface BrainEngine {
    *   'inserted'   → row inserted
    *   'duplicate'  → no new row (returns the matching candidate id)
    *   'superseded' → new row inserted; old row got expired_at + superseded_by
+   *
+   * FS-3 (A2 2026-07-18): 'superseded' is ROW-COUNT-HONEST. When a
+   * supersedeId was dispatched but the UPDATE matched zero rows
+   * (nonexistent / already-expired / foreign-source target), the status is
+   * 'inserted' — the new fact is real, the supersession did not happen,
+   * and callers must not count or fence-follow-up a supersession that
+   * never applied.
    */
   insertFact(
     input: NewFact,

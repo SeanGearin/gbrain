@@ -216,6 +216,77 @@ describe('save_facts — FS-4 cross-source supersede confinement (BYPASSRLS plan
     expect(vy.inserted).toBe(1);
   });
 
+  test('FS-3 RED: nonexistent supersede target must not count — superseded: 0, status inserted', async () => {
+    const res = await save('tenant-a2-ghost', [
+      { claim: 'The retro moved to the first Friday of the month', provenance: 'user_stated', supersedes: 99999999 },
+    ]);
+    expect(res.inserted).toBe(1);
+    expect(res.superseded).toBe(0);
+    expect(res.results[0].status).toBe('inserted');
+    const mine = await factState(res.fact_ids[0]);
+    expect(mine.active).toBe(true);
+  });
+
+  test('FS-3 RED: already-expired target — a second correction batch must not double-count', async () => {
+    const SRC = 'tenant-a2-expired';
+    const first = await save(SRC, [
+      { claim: 'Dario is the launch DRI', provenance: 'user_stated', people: ['Dario'] },
+    ]);
+    const targetId = first.fact_ids[0];
+
+    // Correction 1 genuinely applies.
+    const corr1 = await save(SRC, [
+      { claim: 'Noor took over as launch DRI in June', provenance: 'user_stated', people: ['Noor'], supersedes: targetId },
+    ]);
+    expect(corr1.superseded).toBe(1);
+
+    // Correction 2 targets the SAME (now expired) row with novel text:
+    // zero rows change, so zero supersessions are counted.
+    const corr2 = await save(SRC, [
+      { claim: 'The launch DRI rotation is documented in the runbook', provenance: 'user_stated', supersedes: targetId },
+    ]);
+    expect(corr2.inserted).toBe(1);
+    expect(corr2.superseded).toBe(0);
+    expect(corr2.results[0].status).toBe('inserted');
+
+    // The chain still points at correction 1 — correction 2 didn't clobber it.
+    const target = await factState(targetId);
+    expect(target.superseded_by).toBe(corr1.fact_ids[0]);
+  });
+
+  test('FS-3 RED: cross-source insert-path receipt is honest post-confinement — superseded: 0, status inserted', async () => {
+    const vx = await save('tenant-a2-x', [
+      { claim: 'Ravi holds the second on-call slot', provenance: 'user_stated', people: ['Ravi'] },
+    ]);
+    const foreignId = vx.fact_ids[0];
+
+    const vy = await save('tenant-a2-y', [
+      { claim: 'On-call handoff happens at 09:00 UTC', provenance: 'user_stated', supersedes: foreignId },
+    ]);
+    // FS-4 confined the write; FS-3 makes the receipt match: no row changed,
+    // so nothing is counted and the status says plain insert.
+    expect(vy.superseded).toBe(0);
+    expect(vy.results[0].status).toBe('inserted');
+    expect((await factState(foreignId)).active).toBe(true);
+  });
+
+  test('FS-3 CONTROL: a supersede that applies still counts exactly once, and the fence follow-up still fires', async () => {
+    const fenceId = await seedDefaultFenceFact('people/imogen', 'Imogen owns the data-room checklist');
+    const corr = await save('default', [
+      { claim: 'The data-room checklist moved to Priya after the reorg', provenance: 'user_stated', supersedes: fenceId },
+    ]);
+    expect(corr.inserted).toBe(1);
+    expect(corr.superseded).toBe(1);
+    expect(corr.results[0].status).toBe('inserted');
+    // Follow-up ran: fence struck durably (no disclosure fields present).
+    expect(corr.results[0]).not.toHaveProperty('supersede_durable');
+    const fenceBody = readFileSync(join(brainDir, 'people/imogen.md'), 'utf-8');
+    expect(fenceBody).toContain('~~Imogen owns the data-room checklist~~');
+    const target = await factState(fenceId);
+    expect(target.active).toBe(false);
+    expect(target.superseded_by).toBe(corr.fact_ids[0]);
+  });
+
   test('CONTROL: same-source supersede still applies on both B2 paths (incl. the fence strike)', async () => {
     // Insert path, plain rows.
     const first = await save('tenant-a2-ctl', [

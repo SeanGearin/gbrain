@@ -3745,14 +3745,17 @@ export class PGLiteEngine implements BrainEngine {
         const newId = ins.rows[0].id;
         // FS-4: source-confined — a foreign target no-ops even on
         // BYPASSRLS planes where RLS never filters.
-        await tx.query(
+        const upd = await tx.query(
           `UPDATE facts SET expired_at = now(), superseded_by = $1
            WHERE id = $2 AND expired_at IS NULL AND source_id = $3`,
           [newId, ctx.supersedeId, ctx.source_id],
         );
-        return newId;
+        return { id: newId, applied: (upd.affectedRows ?? 0) > 0 };
       });
-      return { id: result, status: 'superseded' };
+      // FS-3: the status reports what HAPPENED, not what was dispatched.
+      // 0 rows updated (nonexistent / already-expired / foreign target) →
+      // the new fact is a plain insert; no supersession is claimed.
+      return { id: result.id, status: result.applied ? 'superseded' : 'inserted' };
     }
 
     const ins = await this.db.query<{ id: number }>(
