@@ -3766,16 +3766,21 @@ export class PGLiteEngine implements BrainEngine {
     // (single-connection PGLite cannot contend, so no lock is taken here);
     // the exact-arm re-check is the shared semantic, keeping engine-level
     // behavior identical across twins (a same-text insert against an
-    // existing ACTIVE row returns 'duplicate' on both).
+    // existing ACTIVE row returns 'duplicate' on both). ENTITY-SCOPED
+    // (A2 amend 2026-07-18, R2-confirmed drop): IS NOT DISTINCT FROM the
+    // incoming entity_slug, matching the extract pipeline's
+    // entity-prefiltered gate — same text under a different entity is a
+    // legitimate distinct fact, never a duplicate.
     const dup = await this.db.query<{ id: number }>(
       `SELECT id FROM facts
        WHERE source_id = $1
+         AND entity_slug IS NOT DISTINCT FROM $3
          AND expired_at IS NULL
          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
            = lower(regexp_replace(btrim($2), '\\s+', ' ', 'g'))
        ORDER BY id DESC
        LIMIT 1`,
-      [ctx.source_id, input.fact],
+      [ctx.source_id, input.fact, entitySlug],
     );
     if (dup.rows.length > 0) {
       return { id: Number(dup.rows[0].id), status: 'duplicate' };

@@ -4034,9 +4034,15 @@ export class PostgresEngine implements BrainEngine {
     // race sees the winner's committed row and returns status 'duplicate'
     // (the receipt path save.ts/backstop.ts always had for this). Scoped
     // ACTIVE-only, so the N1 tombstone lane still owns corrected-away
-    // refusals and forget stays reversible. Residuals (documented): near-
-    // dup/cosine races and same-text-different-entity races can still
-    // double-insert — the realistic retry threat is byte-verbatim.
+    // refusals and forget stays reversible. ENTITY-SCOPED (A2 amend
+    // 2026-07-18, R2-confirmed drop): the re-check matches the extract
+    // pipeline's entity-prefiltered dedup gate via IS NOT DISTINCT FROM —
+    // same text under a DIFFERENT entity is a legitimate distinct fact,
+    // never a duplicate (pre-amend it was refused sequentially, pointing
+    // at the other entity's row). Residuals (documented): near-dup/cosine
+    // races and same-text-different-entity RACES can still double-insert
+    // (different lock keys by design) — the realistic retry threat is
+    // byte-verbatim same-entity, which stays closed.
     const outcome = await this.sqlTxRaw(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(
         ${ctx.source_id} || ':' ||
@@ -4044,6 +4050,7 @@ export class PostgresEngine implements BrainEngine {
       const dup = await tx<Array<{ id: number }>>`
         SELECT id FROM facts
         WHERE source_id = ${ctx.source_id}
+          AND entity_slug IS NOT DISTINCT FROM ${entitySlug}
           AND expired_at IS NULL
           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
             = lower(regexp_replace(btrim(${input.fact}), '\\s+', ' ', 'g'))
