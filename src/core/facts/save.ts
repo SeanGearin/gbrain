@@ -688,18 +688,34 @@ export async function runSaveFacts(
       // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
       // this claim's people[]/entities[] into entity stub pages + bidirectional
       // co-occurrence edges so traverse_graph / find_experts have a graph to
-      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts in this SAME
-      // withSourceScope tx (same-tx visibility lets the edge batch see the
-      // stubs written microseconds earlier). Runs only on a genuine insert: a
-      // duplicate's canonical fact already built the identical graph. The fact
-      // is the primary value, the graph is derived. See facts/construct.ts for
-      // the tenant-plane discipline (low-level writes, config-free, source-scoped).
-      await constructGraphFromClaim(ctx.engine, ctx.sourceId, {
-        people: c.people,
-        entities: c.entities,
-        personSurfaceHints,
-        claimText: cleaned,
-      });
+      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts. Runs only
+      // on a genuine insert: a duplicate's canonical fact already built the
+      // identical graph. The fact is the primary value, the graph is derived.
+      // See facts/construct.ts for the tenant-plane discipline (low-level
+      // writes, config-free, source-scoped).
+      //
+      // FS-7 (A2 2026-07-18): DERIVED-layer containment, same shape as the
+      // FS-2 materialize guard below. Unwrapped, a graph SQL error aborted
+      // the tenant dispatch tx (25P02 → the whole batch's PRIMARY writes
+      // rolled back over a derived-graph hiccup), and on the operator
+      // auto-commit plane it threw past claims 1..k-1's durably-committed
+      // facts, losing the receipt for work already done. The savepoint/tx
+      // wrap (engine.transaction — savepoint inside the dispatch tx, real tx
+      // at top level) keeps same-tx stub→edge visibility while containing a
+      // failure to the graph writes; the facts commit, the receipt stays
+      // true, and the next save re-runs the idempotent upserts.
+      try {
+        await ctx.engine.transaction((txEngine) =>
+          constructGraphFromClaim(txEngine, ctx.sourceId, {
+            people: c.people,
+            entities: c.entities,
+            personSurfaceHints,
+            claimText: cleaned,
+          }),
+        );
+      } catch (err) {
+        console.error(`[save_facts] graph construct skipped for claim ${index}, fact saved (graph writes rolled back to their own savepoint/tx): ${err instanceof Error ? err.message : String(err)}`);
+      }
       // Anchor for the post-loop materialize: this fact's primary-subject page
       // must be rebuilt from its facts so search_brain's chunk arm sees the
       // substance (not the stub). entity_slug == page slug by construction.
