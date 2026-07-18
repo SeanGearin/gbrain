@@ -3743,10 +3743,12 @@ export class PGLiteEngine implements BrainEngine {
             : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored],
         );
         const newId = ins.rows[0].id;
+        // FS-4: source-confined — a foreign target no-ops even on
+        // BYPASSRLS planes where RLS never filters.
         await tx.query(
           `UPDATE facts SET expired_at = now(), superseded_by = $1
-           WHERE id = $2 AND expired_at IS NULL`,
-          [newId, ctx.supersedeId],
+           WHERE id = $2 AND expired_at IS NULL AND source_id = $3`,
+          [newId, ctx.supersedeId, ctx.source_id],
         );
         return newId;
       });
@@ -3786,12 +3788,15 @@ export class PGLiteEngine implements BrainEngine {
     return { id: ins.rows[0].id, status: 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean> {
     const at = opts?.at ?? new Date();
+    // FS-4: when the caller names a source, the expire is confined to it
+    // (belt alongside RLS — BYPASSRLS planes get no row filter otherwise).
     const result = await this.db.query(
       `UPDATE facts SET expired_at = $1, superseded_by = COALESCE($2, superseded_by)
-       WHERE id = $3 AND expired_at IS NULL`,
-      [at, opts?.supersededBy ?? null, id],
+       WHERE id = $3 AND expired_at IS NULL
+         AND ($4::text IS NULL OR source_id = $4)`,
+      [at, opts?.supersededBy ?? null, id, opts?.sourceId ?? null],
     );
     return (result.affectedRows ?? 0) > 0;
   }

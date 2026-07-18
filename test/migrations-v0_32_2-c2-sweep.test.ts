@@ -134,7 +134,7 @@ describe('C2 keystone — db_only supersession survives phase B + reconcile', ()
       entity_slug: 'people/reggie', fact: 'Reggie is CFO', client_authored: true,
     });
 
-    const sup = await supersedeFactDurably(engine, old, { supersededByFactId: correction });
+    const sup = await supersedeFactDurably(engine, old, { supersededByFactId: correction, sourceId: 'default' });
     expect(sup.applied).toBe(true);
     expect(sup.path).toBe('db_only');
     expect(sup.durable).toBe(true);

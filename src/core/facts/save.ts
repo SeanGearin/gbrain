@@ -561,6 +561,7 @@ export async function runSaveFacts(
       if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
         const res = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
           supersededByFactId: matchedId,
+          sourceId: ctx.sourceId,
         });
         if (res.applied) superseded += 1;
         if (res.applied && !res.durable) {
@@ -667,6 +668,7 @@ export async function runSaveFacts(
         const followUp = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
           supersededByFactId: result.id,
           followUp: true,
+          sourceId: ctx.sourceId,
         });
         if (followUp.applied && !followUp.durable) {
           supersedeDisclosure = {

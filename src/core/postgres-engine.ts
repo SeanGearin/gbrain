@@ -4007,8 +4007,11 @@ export class PostgresEngine implements BrainEngine {
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
+        // FS-4: source-confined — a foreign target no-ops even on
+        // BYPASSRLS planes where RLS never filters.
         await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
-                 WHERE id = ${supersedeId} AND expired_at IS NULL`;
+                 WHERE id = ${supersedeId} AND expired_at IS NULL
+                   AND source_id = ${ctx.source_id}`;
         return id;
       });
       return { id: newId, status: 'superseded' };
@@ -4039,13 +4042,17 @@ export class PostgresEngine implements BrainEngine {
     return { id, status: 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean> {
     const sql = this.sql;
     const at = opts?.at ?? new Date();
     const supersededBy = opts?.supersededBy ?? null;
+    // FS-4: when the caller names a source, the expire is confined to it
+    // (belt alongside RLS — BYPASSRLS planes get no row filter otherwise).
+    const sourceId = opts?.sourceId ?? null;
     const result = await sql`
       UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by)
       WHERE id = ${id} AND expired_at IS NULL
+        AND (${sourceId}::text IS NULL OR source_id = ${sourceId})
     `;
     return (result.count ?? 0) > 0;
   }

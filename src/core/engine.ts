@@ -1851,8 +1851,11 @@ export interface BrainEngine {
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
    * Idempotent-as-false (already expired returns false without changing state).
+   * `sourceId` (FS-4) confines the update to that source — a target in any
+   * other source is left untouched and reported false, so the id cannot be
+   * used as a cross-source write primitive on BYPASSRLS planes.
    */
-  expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean>;
+  expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean>;
 
   /** List active facts about an entity within a source, newest first. */
   listFactsByEntity(
