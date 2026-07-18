@@ -32,7 +32,7 @@ describe.skipIf(skip)('save_facts concurrent dedup window against real Postgres'
   const engines: PostgresEngine[] = [];
   const WRITERS = 4;
 
-  const SOURCES = ['a2conc-entity', 'a2conc-noentity', 'a2conc-tenant'];
+  const SOURCES = ['a2conc-entity', 'a2conc-noentity', 'a2conc-tenant', 'a2conc-xentity'];
 
   beforeAll(async () => {
     for (let i = 0; i < WRITERS; i++) {
@@ -102,6 +102,41 @@ describe.skipIf(skip)('save_facts concurrent dedup window against real Postgres'
     const t = tallies(results);
     expect(t.inserted).toBe(1);
     expect(t.duplicate).toBe(WRITERS - 1);
+  });
+
+  test('cross-entity SEQUENTIAL saves are never deduped (A2 amend, R2-confirmed drop): the in-lock re-check is entity-scoped', async () => {
+    // The extract pipeline's dedup gate (findCandidateDuplicates) is
+    // entity-prefiltered; the engine's in-lock re-check must agree or it
+    // silently drops a legitimate fact the pipeline already approved —
+    // pre-amend it returned 'duplicate' pointing at the OTHER entity's row.
+    // Sequential on purpose: no race is needed to hit the drop. Call shape
+    // mirrors the backstop (engine.insertFact with { source_id }).
+    const SRC = 'a2conc-xentity';
+    const TEXT = 'Sequential pin: the pilot program renews in March';
+    const base = {
+      fact: TEXT, kind: 'fact' as const, visibility: 'private' as const,
+      source: 'test:a2-xentity', confidence: 0.9, embedding: null,
+    };
+    const a = await engines[0].insertFact({ ...base, entity_slug: 'people/alice-vane' }, { source_id: SRC });
+    expect(a.status).toBe('inserted');
+    const b = await engines[0].insertFact({ ...base, entity_slug: 'companies/marsh-co' }, { source_id: SRC });
+    expect(b.status).toBe('inserted');
+    expect(b.id).not.toBe(a.id);
+    const c = await engines[0].insertFact({ ...base, entity_slug: null }, { source_id: SRC });
+    expect(c.status).toBe('inserted');
+    // Same-entity retry still dedups (FS-8 semantic retained)…
+    const a2 = await engines[0].insertFact({ ...base, entity_slug: 'people/alice-vane' }, { source_id: SRC });
+    expect(a2.status).toBe('duplicate');
+    expect(a2.id).toBe(a.id);
+    // …and so does the no-entity retry (NULL IS NOT DISTINCT FROM NULL).
+    const c2 = await engines[0].insertFact({ ...base, entity_slug: null }, { source_id: SRC });
+    expect(c2.status).toBe('duplicate');
+    expect(c2.id).toBe(c.id);
+    const rows = await engines[0].executeRaw<{ n: number | string }>(
+      `SELECT COUNT(*)::int AS n FROM facts WHERE source_id = $1 AND expired_at IS NULL`,
+      [SRC],
+    );
+    expect(Number(rows[0].n)).toBe(3);
   });
 
   test('tenant-plane shape: concurrent withSourceScope dispatches serialize on the dedup window', async () => {
