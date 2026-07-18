@@ -4156,13 +4156,16 @@ export class PGLiteEngine implements BrainEngine {
     source_id: string,
     factText: string,
   ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
-    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    // V-N1-4: the probe folds in SQL (symmetric with the stored side) —
+    // see the postgres-engine twin for the divergence classes the old
+    // JS-side fold missed.
     const result = await this.db.query<{ tombstone_id: number | string; head_id: number | string; head_active: boolean }>(
       `WITH RECURSIVE tomb AS (
          SELECT id, superseded_by FROM facts
          WHERE source_id = $1
            AND superseded_by IS NOT NULL
-           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $2
+           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+             = lower(regexp_replace(btrim($2), '\\s+', ' ', 'g'))
          ORDER BY id DESC
          LIMIT 1
        ),
@@ -4182,7 +4185,7 @@ export class PGLiteEngine implements BrainEngine {
        FROM tomb t, chain c
        ORDER BY c.depth DESC
        LIMIT 1`,
-      [source_id, normalized],
+      [source_id, factText],
     );
     if (result.rows.length === 0) return null;
     const r = result.rows[0];

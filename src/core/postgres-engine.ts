@@ -4491,13 +4491,20 @@ export class PostgresEngine implements BrainEngine {
     factText: string,
   ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
     const sql = this.sql;
-    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    // V-N1-4: the probe folds in SQL, so BOTH sides of the equality use the
+    // SAME fold tables. The old JS toLowerCase param diverged from SQL
+    // lower() on the stored side (Greek word-final Σ → js 'ς' vs sql 'σ';
+    // 'İ' → js 'i'+combining-dot vs sql 'i'), so a verbatim replay of a
+    // corrected-away claim containing such characters missed its tombstone
+    // and minted. Whichever locale/build the engine runs, symmetric folding
+    // makes verbatim replay match by construction.
     const rows = await sql<Array<{ tombstone_id: number; head_id: number; head_active: boolean }>>`
       WITH RECURSIVE tomb AS (
         SELECT id, superseded_by FROM facts
         WHERE source_id = ${source_id}
           AND superseded_by IS NOT NULL
-          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+            = lower(regexp_replace(btrim(${factText}), '\\s+', ' ', 'g'))
         ORDER BY id DESC
         LIMIT 1
       ),

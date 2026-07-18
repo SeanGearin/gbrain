@@ -259,3 +259,48 @@ describe('tombstone hardening — V-N1-3 walk depth + cycle guard', () => {
     expect(await activeCount(SRC, TX)).toBe(1);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// V-N1-4 — fold the probe text in SQL, not JS
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('tombstone hardening — V-N1-4 JS-vs-SQL case-fold asymmetry', () => {
+  // JS toLowerCase folds Greek word-final Σ context-sensitively to 'ς';
+  // SQL lower() always yields 'σ' — so the JS-folded probe could never
+  // equal the SQL-folded stored text and a VERBATIM replay minted.
+  test('RED: byte-replay of a corrected-away Greek claim (word-final Σ) must hit its tombstone', async () => {
+    const SRC = 'tenant-h-fold';
+    const TGREEK = 'ΤΟ ΚΌΣΤΟΣ ΑΝΆΠΤΥΞΗΣ ΞΕΠΈΡΑΣΕ ΤΙΣ ΣΑΡΆΝΤΑ ΧΙΛΙΆΔΕΣ';
+    const first = await save(SRC, [{ claim: TGREEK, provenance: 'user_stated' }]);
+    const corr = await save(SRC, [
+      { claim: 'The development budget was revised well below forty thousand', provenance: 'user_stated', supersedes: first.fact_ids[0] },
+    ]);
+    expect(corr.superseded).toBe(1);
+
+    const replay = await save(SRC, [{ claim: TGREEK, provenance: 'user_stated' }]);
+    expect(replay.inserted).toBe(0);
+    expect(replay.results[0]).toMatchObject({
+      status: 'duplicate_superseded',
+      fact_id: corr.fact_ids[0],
+      superseded_from: first.fact_ids[0],
+    });
+    expect(await activeCount(SRC, TGREEK)).toBe(0);
+  });
+
+  // JS folds 'İ' (U+0130) to 'i' + combining dot; this build's SQL lower()
+  // yields plain 'i' — second independent divergence class.
+  test('RED: byte-replay of a corrected-away claim containing İ must hit its tombstone', async () => {
+    const SRC = 'tenant-h-fold2';
+    const TURK = 'İstanbul offsite anchors the fall planning cycle';
+    const first = await save(SRC, [{ claim: TURK, provenance: 'user_stated' }]);
+    const corr = await save(SRC, [
+      { claim: 'Remote-only replaces every travel gathering this year', provenance: 'user_stated', supersedes: first.fact_ids[0] },
+    ]);
+    expect(corr.superseded).toBe(1);
+
+    const replay = await save(SRC, [{ claim: TURK, provenance: 'user_stated' }]);
+    expect(replay.inserted).toBe(0);
+    expect(replay.results[0]).toMatchObject({ status: 'duplicate_superseded' });
+    expect(await activeCount(SRC, TURK)).toBe(0);
+  });
+});
