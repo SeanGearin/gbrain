@@ -4011,6 +4011,11 @@ export class PostgresEngine implements BrainEngine {
                  WHERE id = ${supersedeId} AND expired_at IS NULL`;
         return id;
       });
+      // Post-commit, not in-tx: the invalidation must never abort a landed
+      // write, and staying out of the tx body keeps the A2 dedup-rework
+      // fold clean. Crash between commit and clear leaves one stale window
+      // that the next fact mutation clears.
+      await this.invalidateQueryCacheForFacts(ctx.source_id);
       return { id: newId, status: 'superseded' };
     }
 
@@ -4036,6 +4041,7 @@ export class PostgresEngine implements BrainEngine {
       `;
       return Number(ins[0].id);
     });
+    await this.invalidateQueryCacheForFacts(ctx.source_id);
     return { id, status: 'inserted' };
   }
 
@@ -4043,11 +4049,33 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const at = opts?.at ?? new Date();
     const supersededBy = opts?.supersededBy ?? null;
-    const result = await sql`
+    // RETURNING source_id: expireFact is keyed by fact id alone, and the
+    // cache invalidation below needs the owning source.
+    const result = await sql<Array<{ source_id: string }>>`
       UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by)
       WHERE id = ${id} AND expired_at IS NULL
+      RETURNING source_id
     `;
-    return (result.count ?? 0) > 0;
+    const changed = (result.count ?? 0) > 0;
+    if (changed && result[0]?.source_id) {
+      await this.invalidateQueryCacheForFacts(result[0].source_id);
+    }
+    return changed;
+  }
+
+  /**
+   * P1 cross-app recall lag (2026-07-19): see the BrainEngine interface doc.
+   * Table-missing (pre-v51 brain) degrades to a silent no-op — without the
+   * cache the staleness cannot exist. RLS: the b7_tenant_isolation FOR ALL
+   * policy on query_cache plus the role's DELETE grant scope this to the
+   * caller's own rows on the tenant plane.
+   */
+  async invalidateQueryCacheForFacts(sourceId: string): Promise<void> {
+    try {
+      await this.sql`DELETE FROM query_cache WHERE source_id = ${sourceId}`;
+    } catch {
+      /* pre-v51 brain (no query_cache table) — nothing to invalidate */
+    }
   }
 
   /**
@@ -4180,6 +4208,7 @@ export class PostgresEngine implements BrainEngine {
       }
       return out;
     });
+    if (ids.length > 0) await this.invalidateQueryCacheForFacts(ctx.source_id);
     return { inserted: ids.length, ids };
   }
 
@@ -4188,7 +4217,9 @@ export class PostgresEngine implements BrainEngine {
     const result = await sql`
       DELETE FROM facts WHERE source_id = ${source_id} AND source_markdown_slug = ${slug}
     `;
-    return { deleted: result.count ?? 0 };
+    const deleted = result.count ?? 0;
+    if (deleted > 0) await this.invalidateQueryCacheForFacts(source_id);
+    return { deleted };
   }
 
   async listFactsByEntity(

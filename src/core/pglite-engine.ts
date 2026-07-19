@@ -3750,6 +3750,11 @@ export class PGLiteEngine implements BrainEngine {
         );
         return newId;
       });
+      // Post-commit, not in-tx: the invalidation must never abort a landed
+      // write, and staying out of the tx body keeps the A2 dedup-rework
+      // fold clean. Crash between commit and clear leaves one stale window
+      // that the next fact mutation clears.
+      await this.invalidateQueryCacheForFacts(ctx.source_id);
       return { id: result, status: 'superseded' };
     }
 
@@ -3783,17 +3788,38 @@ export class PGLiteEngine implements BrainEngine {
         ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored]
         : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored],
     );
+    await this.invalidateQueryCacheForFacts(ctx.source_id);
     return { id: ins.rows[0].id, status: 'inserted' };
   }
 
   async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
     const at = opts?.at ?? new Date();
-    const result = await this.db.query(
+    // RETURNING source_id: expireFact is keyed by fact id alone, and the
+    // cache invalidation below needs the owning source.
+    const result = await this.db.query<{ source_id: string }>(
       `UPDATE facts SET expired_at = $1, superseded_by = COALESCE($2, superseded_by)
-       WHERE id = $3 AND expired_at IS NULL`,
+       WHERE id = $3 AND expired_at IS NULL
+       RETURNING source_id`,
       [at, opts?.supersededBy ?? null, id],
     );
-    return (result.affectedRows ?? 0) > 0;
+    const changed = result.rows.length > 0;
+    if (changed && result.rows[0]?.source_id) {
+      await this.invalidateQueryCacheForFacts(result.rows[0].source_id);
+    }
+    return changed;
+  }
+
+  /**
+   * P1 cross-app recall lag (2026-07-19): see the BrainEngine interface doc.
+   * Table-missing (pre-v51 brain) degrades to a silent no-op — without the
+   * cache the staleness cannot exist.
+   */
+  async invalidateQueryCacheForFacts(sourceId: string): Promise<void> {
+    try {
+      await this.db.query(`DELETE FROM query_cache WHERE source_id = $1`, [sourceId]);
+    } catch {
+      /* pre-v51 brain (no query_cache table) — nothing to invalidate */
+    }
   }
 
   async insertFacts(
@@ -3890,6 +3916,7 @@ export class PGLiteEngine implements BrainEngine {
       }
       return out;
     });
+    if (ids.length > 0) await this.invalidateQueryCacheForFacts(ctx.source_id);
     return { inserted: ids.length, ids };
   }
 
@@ -3898,7 +3925,9 @@ export class PGLiteEngine implements BrainEngine {
       `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2`,
       [source_id, slug],
     );
-    return { deleted: result.affectedRows ?? 0 };
+    const deleted = result.affectedRows ?? 0;
+    if (deleted > 0) await this.invalidateQueryCacheForFacts(source_id);
+    return { deleted };
   }
 
   async listFactsByEntity(
