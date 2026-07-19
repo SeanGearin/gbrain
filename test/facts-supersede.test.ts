@@ -115,6 +115,7 @@ describe('supersedeFactDurably — fence route (the P0 #1 scenario)', () => {
     // The dedup-path shape: expire the target, point at the correction.
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: correctionId,
+      sourceId: 'default',
     });
     expect(res.applied).toBe(true);
     expect(res.path).toBe('fence');
@@ -171,6 +172,7 @@ describe('supersedeFactDurably — fence route (the P0 #1 scenario)', () => {
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: ins.id,
       followUp: true,
+      sourceId: 'default',
     });
     expect(res.applied).toBe(true);
     expect(res.path).toBe('fence');
@@ -195,6 +197,7 @@ describe('supersedeFactDurably — honest fallback matrix', () => {
 
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: correctionId,
+      sourceId: 'default',
     });
     expect(res.applied).toBe(true);
     expect(res.path).toBe('db_only');
@@ -213,6 +216,7 @@ describe('supersedeFactDurably — honest fallback matrix', () => {
 
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: correctionId,
+      sourceId: 'default',
     });
     // The correction intent still applies NOW…
     expect(res.applied).toBe(true);
@@ -232,6 +236,7 @@ describe('supersedeFactDurably — honest fallback matrix', () => {
 
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: correctionId,
+      sourceId: 'default',
     });
     expect(res.applied).toBe(true);
     expect(res.path).toBe('db_fallback');
@@ -239,7 +244,7 @@ describe('supersedeFactDurably — honest fallback matrix', () => {
   });
 
   test('unknown target: silent no-op (not_found, applied: false)', async () => {
-    const res = await supersedeFactDurably(engine, 999999, { supersededByFactId: 1 });
+    const res = await supersedeFactDurably(engine, 999999, { supersededByFactId: 1, sourceId: 'default' });
     expect(res.applied).toBe(false);
     expect(res.path).toBe('not_found');
   });
@@ -251,11 +256,13 @@ describe('supersedeFactDurably — honest fallback matrix', () => {
 
     const first = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: firstCorrection,
+      sourceId: 'default',
     });
     expect(first.applied).toBe(true);
 
     const second = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: secondCorrection,
+      sourceId: 'default',
     });
     expect(second.applied).toBe(false);
     expect(second.path).toBe('already_expired');
@@ -286,6 +293,7 @@ ${JUNK}`,
 
     const res = await supersedeFactDurably(engine, targetId, {
       supersededByFactId: correctionId,
+      sourceId: 'default',
     });
     expect(res.path).toBe('fence');
 

@@ -1769,13 +1769,27 @@ export interface BrainEngine {
    *   4. else classifier (caller's job; this engine method handles the
    *      DB-side INSERT/UPDATE only). On insert.status === 'duplicate' or
    *      'superseded' the engine returns the existing/superseding row id.
-   * Per-entity advisory lock on Postgres serializes the dedup window.
-   * PGLite no-op for the lock (single-process).
+   * Dedup window (A2 2026-07-18, FS-8 class): on Postgres the PLAIN insert
+   * path takes an advisory xact lock for EVERY insert — keyed on the entity
+   * when present, else on the folded claim text — and re-runs the exact-arm
+   * duplicate check INSIDE the lock, so two concurrent verbatim same-text
+   * saves serialize and the loser returns 'duplicate' (the pre-A2 shape
+   * locked only entity claims and checked before locking, which closed
+   * nothing). PGLite shares the re-check without the lock (single-process).
+   * Residual: near-dup (trgm/cosine) races and same-text-different-entity
+   * races can still double-insert; the realistic retry threat is verbatim.
    *
    * `status` reflects what the engine wrote:
    *   'inserted'   → row inserted
    *   'duplicate'  → no new row (returns the matching candidate id)
    *   'superseded' → new row inserted; old row got expired_at + superseded_by
+   *
+   * FS-3 (A2 2026-07-18): 'superseded' is ROW-COUNT-HONEST. When a
+   * supersedeId was dispatched but the UPDATE matched zero rows
+   * (nonexistent / already-expired / foreign-source target), the status is
+   * 'inserted' — the new fact is real, the supersession did not happen,
+   * and callers must not count or fence-follow-up a supersession that
+   * never applied.
    */
   insertFact(
     input: NewFact,
@@ -1851,8 +1865,11 @@ export interface BrainEngine {
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
    * Idempotent-as-false (already expired returns false without changing state).
+   * `sourceId` (FS-4) confines the update to that source — a target in any
+   * other source is left untouched and reported false, so the id cannot be
+   * used as a cross-source write primitive on BYPASSRLS planes.
    */
-  expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean>;
+  expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean>;
 
   /** List active facts about an entity within a source, newest first. */
   listFactsByEntity(
@@ -1963,12 +1980,15 @@ export interface BrainEngine {
    * Forget/decay tombstones (`superseded_by` NULL) never match, so
    * deliberate deletion stays reversible by a plain re-save.
    *
-   * On a hit, walks the `superseded_by` chain (bounded at 32 hops,
-   * source-confined) and returns the matched tombstone plus where the walk
-   * stopped: the chain head and whether that head is ACTIVE. Callers refuse
-   * the re-mint ONLY when `head_active` — a dead chain (the correction was
-   * itself forgotten, or a dangling pointer) must fall through and mint,
-   * or the forget would become sticky against the original text.
+   * On a hit, walks the `superseded_by` chain (source-confined, with a
+   * visited-id path guard — V-N1-3: legal chains of ANY depth reach their
+   * head; the old depth<32 bound made deep chains fall open and re-mint,
+   * while a corrupted cyclic chain now terminates at the first revisit)
+   * and returns the matched tombstone plus where the walk stopped: the
+   * chain head and whether that head is ACTIVE. Callers refuse the
+   * re-mint ONLY when `head_active` — a dead chain (the correction was
+   * itself forgotten, a dangling pointer, or a cycle) must fall through
+   * and mint, or the forget would become sticky against the original text.
    *
    * Runs on the active-dedup MISS path only (save.ts), so the cost is one
    * extra query per genuinely-new claim. Deliberately NO trgm/cosine arm:

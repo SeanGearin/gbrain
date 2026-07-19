@@ -114,14 +114,20 @@ function todayUtc(): string {
 export async function supersedeFactDurably(
   engine: BrainEngine,
   targetId: number,
-  opts: { supersededByFactId: number; followUp?: boolean },
+  opts: { supersededByFactId: number; followUp?: boolean; sourceId: string },
 ): Promise<SupersedeFactResult> {
   const supersededByFactId = opts.supersededByFactId;
 
+  // FS-4 (A2 2026-07-18): the target lookup is confined to the CALLER's
+  // source. `supersedes` is a raw client-supplied id; on planes where RLS
+  // does not filter (operator/incumbent BYPASSRLS, PGLite) an unscoped
+  // SELECT would fetch a foreign source's row — and, for fence-backed
+  // targets, strike the FOREIGN source's fence file on disk. A foreign id
+  // now behaves exactly like a nonexistent one: silent not_found no-op.
   const rows = await engine.executeRaw<FactDbRow>(
     `SELECT id, source_id, entity_slug, row_num, source_markdown_slug, expired_at, superseded_by
-       FROM facts WHERE id = $1`,
-    [targetId],
+       FROM facts WHERE id = $1 AND source_id = $2`,
+    [targetId, opts.sourceId],
   );
   if (rows.length === 0) {
     // Unknown or RLS-invisible — silent no-op (matches the B2 contract:
@@ -145,7 +151,7 @@ export async function supersedeFactDurably(
 
   const stampDb = async (): Promise<boolean> => {
     if (alreadyStamped) return true;
-    return engine.expireFact(targetId, { supersededBy: supersededByFactId }); // gbrain-allow-direct-insert: DB half of the durable supersede — the fence strike (or the honest durable:false disclosure) is handled by this module, unlike the pre-v0.42.24 bare expireFact
+    return engine.expireFact(targetId, { supersededBy: supersededByFactId, sourceId: opts.sourceId }); // gbrain-allow-direct-insert: DB half of the durable supersede — the fence strike (or the honest durable:false disclosure) is handled by this module, unlike the pre-v0.42.24 bare expireFact
   };
 
   const canFence =

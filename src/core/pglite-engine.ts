@@ -3743,16 +3743,48 @@ export class PGLiteEngine implements BrainEngine {
             : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, provenance, clientAuthored],
         );
         const newId = ins.rows[0].id;
-        await tx.query(
+        // FS-4: source-confined — a foreign target no-ops even on
+        // BYPASSRLS planes where RLS never filters.
+        // FS-5: `id <> $1` — a supersedeId that lands on the id this
+        // INSERT just minted (future-id guess hitting the serial) must not
+        // expire the new row into a born-dead self-superseded loop.
+        const upd = await tx.query(
           `UPDATE facts SET expired_at = now(), superseded_by = $1
-           WHERE id = $2 AND expired_at IS NULL`,
-          [newId, ctx.supersedeId],
+           WHERE id = $2 AND expired_at IS NULL AND source_id = $3 AND id <> $1`,
+          [newId, ctx.supersedeId, ctx.source_id],
         );
-        return newId;
+        return { id: newId, applied: (upd.affectedRows ?? 0) > 0 };
       });
-      return { id: result, status: 'superseded' };
+      // FS-3: the status reports what HAPPENED, not what was dispatched.
+      // 0 rows updated (nonexistent / already-expired / foreign target) →
+      // the new fact is a plain insert; no supersession is claimed.
+      return { id: result.id, status: result.applied ? 'superseded' : 'inserted' };
     }
 
+    // Plain insert path — race-safe dedup window (A2 2026-07-18, FS-8
+    // class), twin of the postgres engine. The lock half is postgres-only
+    // (single-connection PGLite cannot contend, so no lock is taken here);
+    // the exact-arm re-check is the shared semantic, keeping engine-level
+    // behavior identical across twins (a same-text insert against an
+    // existing ACTIVE row returns 'duplicate' on both). ENTITY-SCOPED
+    // (A2 amend 2026-07-18, R2-confirmed drop): IS NOT DISTINCT FROM the
+    // incoming entity_slug, matching the extract pipeline's
+    // entity-prefiltered gate — same text under a different entity is a
+    // legitimate distinct fact, never a duplicate.
+    const dup = await this.db.query<{ id: number }>(
+      `SELECT id FROM facts
+       WHERE source_id = $1
+         AND entity_slug IS NOT DISTINCT FROM $3
+         AND expired_at IS NULL
+         AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+           = lower(regexp_replace(btrim($2), '\\s+', ' ', 'g'))
+       ORDER BY id DESC
+       LIMIT 1`,
+      [ctx.source_id, input.fact, entitySlug],
+    );
+    if (dup.rows.length > 0) {
+      return { id: Number(dup.rows[0].id), status: 'duplicate' };
+    }
     const ins = await this.db.query<{ id: number }>(
       embedStr === null
         ? `INSERT INTO facts (
@@ -3786,12 +3818,15 @@ export class PGLiteEngine implements BrainEngine {
     return { id: ins.rows[0].id, status: 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean> {
     const at = opts?.at ?? new Date();
+    // FS-4: when the caller names a source, the expire is confined to it
+    // (belt alongside RLS — BYPASSRLS planes get no row filter otherwise).
     const result = await this.db.query(
       `UPDATE facts SET expired_at = $1, superseded_by = COALESCE($2, superseded_by)
-       WHERE id = $3 AND expired_at IS NULL`,
-      [at, opts?.supersededBy ?? null, id],
+       WHERE id = $3 AND expired_at IS NULL
+         AND ($4::text IS NULL OR source_id = $4)`,
+      [at, opts?.supersededBy ?? null, id, opts?.sourceId ?? null],
     );
     return (result.affectedRows ?? 0) > 0;
   }
@@ -4131,34 +4166,42 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows.map(rowToFact);
   }
 
-  // N1 — third dedup check: exact-text correction-tombstone lookup + bounded
+  // N1 — third dedup check: exact-text correction-tombstone lookup +
   // superseded_by walk to the chain head, in one recursive CTE. Twin of the
   // postgres-engine impl (identical SQL semantics; PGLite is real Postgres,
-  // so the recursive CTE + depth guard behave the same). The deepest chain
-  // row is where the walk stopped: the ACTIVE head, or an expired/dangling
-  // stop the caller treats as "no live head" (head_active false).
+  // so the recursive CTE behaves the same). V-N1-3 (A2 2026-07-18): the
+  // walk carries a visited-id path guard instead of the old depth<32 bound —
+  // legal chains of any depth reach their head; a corrupted cyclic chain
+  // terminates at the first revisit and falls to the dead-chain policy. The
+  // deepest chain row is where the walk stopped: the ACTIVE head, or an
+  // expired/dangling/cycle stop the caller treats as "no live head"
+  // (head_active false).
   async findSupersededTombstone(
     source_id: string,
     factText: string,
   ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
-    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    // V-N1-4: the probe folds in SQL (symmetric with the stored side) —
+    // see the postgres-engine twin for the divergence classes the old
+    // JS-side fold missed.
     const result = await this.db.query<{ tombstone_id: number | string; head_id: number | string; head_active: boolean }>(
       `WITH RECURSIVE tomb AS (
          SELECT id, superseded_by FROM facts
          WHERE source_id = $1
            AND superseded_by IS NOT NULL
-           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = $2
+           AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+             = lower(regexp_replace(btrim($2), '\\s+', ' ', 'g'))
          ORDER BY id DESC
          LIMIT 1
        ),
        chain AS (
-         SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth
+         SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth, ARRAY[f.id] AS path
          FROM facts f JOIN tomb t ON f.id = t.id
          UNION ALL
-         SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1
+         SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1, c.path || nxt.id
          FROM chain c
          JOIN facts nxt ON nxt.id = c.superseded_by AND nxt.source_id = $1
-         WHERE c.superseded_by IS NOT NULL AND c.depth < 32
+         WHERE c.superseded_by IS NOT NULL
+           AND NOT (c.superseded_by = ANY(c.path))
        )
        SELECT t.id AS tombstone_id,
               c.id AS head_id,
@@ -4166,7 +4209,7 @@ export class PGLiteEngine implements BrainEngine {
        FROM tomb t, chain c
        ORDER BY c.depth DESC
        LIMIT 1`,
-      [source_id, normalized],
+      [source_id, factText],
     );
     if (result.rows.length === 0) return null;
     const r = result.rows[0];

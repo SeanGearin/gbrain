@@ -3987,7 +3987,7 @@ export class PostgresEngine implements BrainEngine {
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
       const supersedeId = ctx.supersedeId;
-      const newId = await this.sqlTxRaw(async (tx) => {
+      const outcome = await this.sqlTxRaw(async (tx) => {
         if (entitySlug) {
           await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
         }
@@ -4007,18 +4007,57 @@ export class PostgresEngine implements BrainEngine {
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
-        await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
-                 WHERE id = ${supersedeId} AND expired_at IS NULL`;
-        return id;
+        // FS-4: source-confined — a foreign target no-ops even on
+        // BYPASSRLS planes where RLS never filters.
+        // FS-5: `id <> ${id}` — a supersedeId that lands on the id this
+        // INSERT just minted (future-id guess hitting the serial) must not
+        // expire the new row into a born-dead self-superseded loop.
+        const upd = await tx`UPDATE facts SET expired_at = now(), superseded_by = ${id}
+                 WHERE id = ${supersedeId} AND expired_at IS NULL
+                   AND source_id = ${ctx.source_id} AND id <> ${id}`;
+        return { id, applied: (upd.count ?? 0) > 0 };
       });
-      return { id: newId, status: 'superseded' };
+      // FS-3: the status reports what HAPPENED, not what was dispatched.
+      // 0 rows updated (nonexistent / already-expired / foreign target) →
+      // the new fact is a plain insert; no supersession is claimed.
+      return { id: outcome.id, status: outcome.applied ? 'superseded' : 'inserted' };
     }
 
-    // Plain insert path with optional advisory lock for the dedup window.
-    const id = await this.sqlTxRaw(async (tx) => {
-      if (entitySlug) {
-        await tx`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.source_id} || ':' || ${entitySlug}, 0))`;
-      }
+    // Plain insert path — race-safe dedup window (A2 2026-07-18, FS-8
+    // class): the advisory lock is now taken for EVERY insert (keyed on the
+    // entity when present, else on the folded claim text) and the exact-arm
+    // dedup check re-runs INSIDE the lock. The old shape locked only
+    // entity-keyed claims and — decisively — callers ran their dedup check
+    // BEFORE the lock, so two concurrent same-text saves both missed and
+    // both inserted (proven on real PG in all three plane shapes). The
+    // in-lock re-check closes the verbatim window: the loser of the lock
+    // race sees the winner's committed row and returns status 'duplicate'
+    // (the receipt path save.ts/backstop.ts always had for this). Scoped
+    // ACTIVE-only, so the N1 tombstone lane still owns corrected-away
+    // refusals and forget stays reversible. ENTITY-SCOPED (A2 amend
+    // 2026-07-18, R2-confirmed drop): the re-check matches the extract
+    // pipeline's entity-prefiltered dedup gate via IS NOT DISTINCT FROM —
+    // same text under a DIFFERENT entity is a legitimate distinct fact,
+    // never a duplicate (pre-amend it was refused sequentially, pointing
+    // at the other entity's row). Residuals (documented): near-dup/cosine
+    // races and same-text-different-entity RACES can still double-insert
+    // (different lock keys by design) — the realistic retry threat is
+    // byte-verbatim same-entity, which stays closed.
+    const outcome = await this.sqlTxRaw(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(
+        ${ctx.source_id} || ':' ||
+        COALESCE(${entitySlug}, lower(regexp_replace(btrim(${input.fact}), '\\s+', ' ', 'g'))), 0))`;
+      const dup = await tx<Array<{ id: number }>>`
+        SELECT id FROM facts
+        WHERE source_id = ${ctx.source_id}
+          AND entity_slug IS NOT DISTINCT FROM ${entitySlug}
+          AND expired_at IS NULL
+          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+            = lower(regexp_replace(btrim(${input.fact}), '\\s+', ' ', 'g'))
+        ORDER BY id DESC
+        LIMIT 1
+      `;
+      if (dup.length > 0) return { id: Number(dup[0].id), dup: true };
       const ins = await tx<Array<{ id: number }>>`
         INSERT INTO facts (
           source_id, entity_slug, fact, kind, visibility, notability, context,
@@ -4034,18 +4073,22 @@ export class PostgresEngine implements BrainEngine {
           ${provenance}, ${clientAuthored}
         ) RETURNING id
       `;
-      return Number(ins[0].id);
+      return { id: Number(ins[0].id), dup: false };
     });
-    return { id, status: 'inserted' };
+    return { id: outcome.id, status: outcome.dup ? 'duplicate' : 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean> {
     const sql = this.sql;
     const at = opts?.at ?? new Date();
     const supersededBy = opts?.supersededBy ?? null;
+    // FS-4: when the caller names a source, the expire is confined to it
+    // (belt alongside RLS — BYPASSRLS planes get no row filter otherwise).
+    const sourceId = opts?.sourceId ?? null;
     const result = await sql`
       UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by)
       WHERE id = ${id} AND expired_at IS NULL
+        AND (${sourceId}::text IS NULL OR source_id = ${sourceId})
     `;
     return (result.count ?? 0) > 0;
   }
@@ -4461,36 +4504,49 @@ export class PostgresEngine implements BrainEngine {
     return rows.map(rowToFactPg);
   }
 
-  // N1 — third dedup check: exact-text correction-tombstone lookup + bounded
+  // N1 — third dedup check: exact-text correction-tombstone lookup +
   // superseded_by walk to the chain head, in one recursive CTE. The walk's
   // join re-checks source_id (belt-and-suspenders alongside RLS) so a
-  // cross-source pointer can never leak a row; the depth guard bounds cycles
-  // and pathological chains. The deepest chain row is where the walk stopped:
-  // the ACTIVE head (superseded_by NULL ends the recursion), or an expired /
-  // dangling stop the caller treats as "no live head" (head_active false).
+  // cross-source pointer can never leak a row. V-N1-3 (A2 2026-07-18): the
+  // walk carries a visited-id path guard instead of the old depth<32 bound —
+  // a LEGAL chain of any depth reaches its head (the bound made deep chains
+  // fall OPEN: the walk stopped on an expired row and the replay minted),
+  // while a corrupted CYCLIC chain terminates at the first revisit and falls
+  // to the dead-chain policy. The deepest chain row is where the walk
+  // stopped: the ACTIVE head (superseded_by NULL ends the recursion), or an
+  // expired / dangling / cycle stop the caller treats as "no live head"
+  // (head_active false).
   async findSupersededTombstone(
     source_id: string,
     factText: string,
   ): Promise<{ tombstone_id: number; head_id: number; head_active: boolean } | null> {
     const sql = this.sql;
-    const normalized = factText.toLowerCase().replace(/\s+/g, ' ').trim();
+    // V-N1-4: the probe folds in SQL, so BOTH sides of the equality use the
+    // SAME fold tables. The old JS toLowerCase param diverged from SQL
+    // lower() on the stored side (Greek word-final Σ → js 'ς' vs sql 'σ';
+    // 'İ' → js 'i'+combining-dot vs sql 'i'), so a verbatim replay of a
+    // corrected-away claim containing such characters missed its tombstone
+    // and minted. Whichever locale/build the engine runs, symmetric folding
+    // makes verbatim replay match by construction.
     const rows = await sql<Array<{ tombstone_id: number; head_id: number; head_active: boolean }>>`
       WITH RECURSIVE tomb AS (
         SELECT id, superseded_by FROM facts
         WHERE source_id = ${source_id}
           AND superseded_by IS NOT NULL
-          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g')) = ${normalized}
+          AND lower(regexp_replace(btrim(fact), '\\s+', ' ', 'g'))
+            = lower(regexp_replace(btrim(${factText}), '\\s+', ' ', 'g'))
         ORDER BY id DESC
         LIMIT 1
       ),
       chain AS (
-        SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth
+        SELECT f.id, f.superseded_by, f.expired_at, 0 AS depth, ARRAY[f.id] AS path
         FROM facts f JOIN tomb t ON f.id = t.id
         UNION ALL
-        SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1
+        SELECT nxt.id, nxt.superseded_by, nxt.expired_at, c.depth + 1, c.path || nxt.id
         FROM chain c
         JOIN facts nxt ON nxt.id = c.superseded_by AND nxt.source_id = ${source_id}
-        WHERE c.superseded_by IS NOT NULL AND c.depth < 32
+        WHERE c.superseded_by IS NOT NULL
+          AND NOT (c.superseded_by = ANY(c.path))
       )
       SELECT t.id AS tombstone_id,
              c.id AS head_id,

@@ -561,6 +561,7 @@ export async function runSaveFacts(
       if (supersedeTargetId !== null && supersedeTargetId !== matchedId) {
         const res = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
           supersededByFactId: matchedId,
+          sourceId: ctx.sourceId,
         });
         if (res.applied) superseded += 1;
         if (res.applied && !res.durable) {
@@ -581,19 +582,22 @@ export async function runSaveFacts(
 
     // --- N1 tombstone check (third dedup layer, active-miss only) ----------
     // Exact-text lookup against rows expired BY CORRECTION (superseded_by IS
-    // NOT NULL), firing only when Layers 1+2 missed AND the claim does not
-    // carry `supersedes`. A supersedes-carrying re-assertion is the escape
-    // hatch: it skips this check and falls through to the atomic
-    // insert+expire below, re-minting with the chain intact (correction-of-
-    // the-correction needs no new field — B2 already expresses the intent).
+    // NOT NULL), firing whenever Layers 1+2 missed. The escape hatch is
+    // HEAD-CHECKED (V-N1-2): a re-assertion passes through ONLY when its
+    // `supersedes` names the chain's LIVE HEAD — the shape the tool doc has
+    // always prescribed — and re-mints via the atomic insert+expire with the
+    // chain intact. Any other `supersedes` (a stale correction batch
+    // replayed after a FURTHER correction names a mid-chain id) gets the
+    // same honest refusal as a plain replay: without the head check, that
+    // replay re-minted the middle claim as live truth beside the real head.
     // Forget/decay tombstones (superseded_by NULL) never match, so deliberate
     // deletion stays reversible by a plain save. Refuse ONLY when the chain
     // walk lands on an ACTIVE head — the receipt then points at live truth;
     // a dead chain (the correction was itself forgotten) mints, or the
     // forget would become sticky against the original text.
-    if (supersedeTargetId === null) {
+    {
       const tomb = await ctx.engine.findSupersededTombstone(ctx.sourceId, cleaned);
-      if (tomb !== null && tomb.head_active) {
+      if (tomb !== null && tomb.head_active && supersedeTargetId !== tomb.head_id) {
         duplicate += 1;
         fact_ids.push(tomb.head_id);
         results[index] = {
@@ -641,9 +645,11 @@ export async function runSaveFacts(
     };
     // B2: when the claim supersedes a prior fact AND its text is not a dup, use
     // the engine's ATOMIC insert+expire path (its own tx) so no observer ever
-    // sees the old and new rows both active — returns status 'superseded'. A new
-    // row (fresh id) can never equal supersedeTargetId, so no self-guard needed
-    // here. Plain insert otherwise.
+    // sees the old and new rows both active — returns status 'superseded' iff
+    // the expire actually applied (FS-3). A supersedeTargetId CAN equal the id
+    // the INSERT is about to mint (future-id guess hitting the serial); the
+    // engine's expire excludes the new row's own id (FS-5), so that shape lands
+    // as a plain honest insert. Plain insert otherwise.
     const insertCtx = supersedeTargetId !== null
       ? { source_id: ctx.sourceId, supersedeId: supersedeTargetId }
       : { source_id: ctx.sourceId };
@@ -667,6 +673,7 @@ export async function runSaveFacts(
         const followUp = await supersedeFactDurably(ctx.engine, supersedeTargetId, {
           supersededByFactId: result.id,
           followUp: true,
+          sourceId: ctx.sourceId,
         });
         if (followUp.applied && !followUp.durable) {
           supersedeDisclosure = {
@@ -681,18 +688,34 @@ export async function runSaveFacts(
       // Deterministic graph construct (CC packet 2026-06-15, verdict B): turn
       // this claim's people[]/entities[] into entity stub pages + bidirectional
       // co-occurrence edges so traverse_graph / find_experts have a graph to
-      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts in this SAME
-      // withSourceScope tx (same-tx visibility lets the edge batch see the
-      // stubs written microseconds earlier). Runs only on a genuine insert: a
-      // duplicate's canonical fact already built the identical graph. The fact
-      // is the primary value, the graph is derived. See facts/construct.ts for
-      // the tenant-plane discipline (low-level writes, config-free, source-scoped).
-      await constructGraphFromClaim(ctx.engine, ctx.sourceId, {
-        people: c.people,
-        entities: c.entities,
-        personSurfaceHints,
-        claimText: cleaned,
-      });
+      // walk. Zero LLM, zero embedding — pure SQL upserts/inserts. Runs only
+      // on a genuine insert: a duplicate's canonical fact already built the
+      // identical graph. The fact is the primary value, the graph is derived.
+      // See facts/construct.ts for the tenant-plane discipline (low-level
+      // writes, config-free, source-scoped).
+      //
+      // FS-7 (A2 2026-07-18): DERIVED-layer containment, same shape as the
+      // FS-2 materialize guard below. Unwrapped, a graph SQL error aborted
+      // the tenant dispatch tx (25P02 → the whole batch's PRIMARY writes
+      // rolled back over a derived-graph hiccup), and on the operator
+      // auto-commit plane it threw past claims 1..k-1's durably-committed
+      // facts, losing the receipt for work already done. The savepoint/tx
+      // wrap (engine.transaction — savepoint inside the dispatch tx, real tx
+      // at top level) keeps same-tx stub→edge visibility while containing a
+      // failure to the graph writes; the facts commit, the receipt stays
+      // true, and the next save re-runs the idempotent upserts.
+      try {
+        await ctx.engine.transaction((txEngine) =>
+          constructGraphFromClaim(txEngine, ctx.sourceId, {
+            people: c.people,
+            entities: c.entities,
+            personSurfaceHints,
+            claimText: cleaned,
+          }),
+        );
+      } catch (err) {
+        console.error(`[save_facts] graph construct skipped for claim ${index}, fact saved (graph writes rolled back to their own savepoint/tx): ${err instanceof Error ? err.message : String(err)}`);
+      }
       // Anchor for the post-loop materialize: this fact's primary-subject page
       // must be rebuilt from its facts so search_brain's chunk arm sees the
       // substance (not the stub). entity_slug == page slug by construction.
