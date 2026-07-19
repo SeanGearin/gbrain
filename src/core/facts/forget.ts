@@ -220,11 +220,18 @@ export async function forgetFactInFence(
     // This keeps DB query patterns (active facts WHERE expired_at IS NULL)
     // accurate the moment the forget commits, without waiting for the
     // next extract_facts cycle phase to reconcile.
-    await engine.executeRaw(
+    // RETURNING source_id feeds the P1 query-cache invalidation: a
+    // forgotten fact must also stop appearing in cached search results
+    // (the legacy_db paths get this via engine.expireFact; this direct
+    // stamp is the one forget executor that bypasses it).
+    const stamped = await engine.executeRaw<{ source_id: string }>(
       `UPDATE facts SET valid_until = $1, expired_at = now()
-       WHERE id = $2 AND expired_at IS NULL`,
+       WHERE id = $2 AND expired_at IS NULL
+       RETURNING source_id`,
       [today, factId],
     );
+    const stampedSource = stamped?.[0]?.source_id;
+    if (stampedSource) await engine.invalidateQueryCacheForFacts?.(stampedSource);
 
     return { ok: true, path: 'fence' as const, reason, durable: true };
   }, { timeoutMs: 5_000 });

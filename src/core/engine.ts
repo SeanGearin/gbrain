@@ -1871,6 +1871,20 @@ export interface BrainEngine {
    */
   expireFact(id: number, opts?: { supersededBy?: number; at?: Date; sourceId?: string }): Promise<boolean>;
 
+  /**
+   * P1 cross-app recall lag (2026-07-19): drop the source's semantic
+   * query-cache rows after a fact mutation. The cache freshness gate
+   * (query-cache-gate.ts) watches only pages.generation — fact writes never
+   * advance it — so a query cached before a save keeps serving the pre-save
+   * result set for up to its TTL while recall sees the new row instantly:
+   * the live cross-app "said it in one app, invisible from another" defect.
+   * Fact mutations are orders of magnitude rarer than searches, so dropping
+   * the source's cache rows is the cheapest correct invalidation. Optional
+   * so structural test doubles stay valid; both real engines implement it,
+   * and callers outside the engines invoke it via `engine.method?.(...)`.
+   */
+  invalidateQueryCacheForFacts?(sourceId: string): Promise<void>;
+
   /** List active facts about an entity within a source, newest first. */
   listFactsByEntity(
     source_id: string,
