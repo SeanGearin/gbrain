@@ -54,6 +54,20 @@ describe('scanInstructionShaped — KEEPS genuine memories (precision / capture 
     'System prompt engineering is the main thing I do at work.',
     // First person addressing the assistant directly ("you"), no header, no token.
     'You should always call me Rob, not Robert.',
+    // --- adversarial-review regressions (2026-07-21): genuine PM/engineer/AI
+    //     memories the FIRST detector wrongly DROPPED. Header words + actor words
+    //     co-occur, but the header is MID-SENTENCE (subject matter, not a leading
+    //     directive), so capture must be preserved. ---
+    "Our onboarding flow's default behavior is to skip the tutorial, but the user testing showed confusion.",
+    'The customer complained that our default behavior for refunds is too slow.',
+    'Default behavior in v2 is dark mode; the user can toggle it in settings.',
+    "I'm debugging why the assistant ignores the system prompt once the context window fills up.",
+    'Custom instructions I gave the new hire: always CC the user on release notes.',
+    // generic code identifiers that collide with tool-token vocabulary (get_page /
+    // put_page were removed from the detector) — engineer memories, must KEEP.
+    'The get_page bug in our crawler only happens on redirects; Marcus wants it fixed by Friday.',
+    'Our Django paginator.get_page() call breaks when page=0.',
+    'put_page in the Notion sync helper double-writes on retries.',
   ])('keeps: %p', (text) => {
     const r = scanInstructionShaped(text);
     expect(r.instructionShaped).toBe(false);

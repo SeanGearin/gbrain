@@ -56,21 +56,44 @@ export interface InstructionShapedScan {
 }
 
 // --- (a) product tool identifiers -------------------------------------------
-// The product's own MCP tool names as distinctive snake_case (underscore-joined)
+// The product's own MCP tool names as DISTINCTIVE snake_case (underscore-joined)
 // literals. A genuine memory uses the natural verb ("save"), never the tool id
 // ("save_facts"); the underscore is the precision guard (no bare English word or
 // hyphenated slug matches). Word-boundaried so "save_facts/save_note" (the 8944
-// specimen, slash-separated) and parenthesised forms both hit.
+// specimen, slash-separated) and parenthesised forms both hit; an optional
+// `gbrain_` prefix catches the real namespaced ids (gbrain_save_facts) too.
+//
+// Adversarial-review hardening (2026-07-21): DROPPED the generic `get_page` /
+// `put_page` — they collide with everyday code vocabulary (Django's
+// Paginator.get_page(), scraper/Notion helpers), so an engineer's genuine work
+// memory ("the get_page bug in our crawler…") was being silently DROPPED. Every
+// remaining token is product-distinctive and essentially never appears in real
+// biography. Engineers are a core audience — precision here IS capture strength.
 const TOOL_TOKEN_RE =
-  /\b(save_facts|save_note|recall_facts|find_in_record|forget_fact|correct_fact|set_facts_valid_from|put_page|get_page|share_brain_map|morning_brief|compose_brief|meeting_brief|gather_evidence|extract_facts)\b/i;
+  /\b(?:gbrain_)?(save_facts|save_note|recall_facts|find_in_record|forget_fact|correct_fact|set_facts_valid_from|share_brain_map|morning_brief|compose_brief|meeting_brief|gather_evidence|extract_facts)\b/i;
 
 // --- (b) steering-document shape --------------------------------------------
-// Header: the distinctive openers of a steering / setup document. "behaviour"
-// spelling tolerated; "custom instruction(s)" both forms.
-const STEERING_HEADER_RE = /\b(default behaviou?r|system prompt|custom instructions?)\b/i;
-// Third-person actor framing — how a steering doc refers to the parties. A
-// first-person preference ("I", "you") never narrates these.
-const STEERING_ACTOR_RE = /\bthe (user|customer|assistant|model|agent|ai)\b/i;
+// The header must appear as a LEADING LABEL — the distinctive shape of a steering
+// / setup DIRECTIVE ("Default behavior:", "System prompt:", "Custom
+// instructions:") at the very START of the claim (optionally behind a markdown
+// heading marker), immediately followed by ':' or '-'.
+//
+// Adversarial-review hardening (2026-07-21): the prior version matched these
+// header words ANYWHERE and only co-required a third-person actor phrase — which
+// silently DROPPED genuine first-person memories from the product's core PM /
+// engineer / AI-builder audience ("our onboarding flow's default behavior is…,
+// but the user testing showed confusion"; "debugging why the assistant ignores
+// the system prompt"). Those use the same words MID-SENTENCE as subject matter,
+// not as a leading directive. Anchoring the header to the start (with a trailing
+// colon/dash) is what separates an actual steering doc from that everyday usage.
+// Anchored + possessive-free → linear-time on adversarial input.
+const STEERING_HEADER_LABEL_RE =
+  /^\s*(?:#{1,6}\s*)?(?:default behaviou?r|system prompt|custom instructions?)\b[ \t]*[:\-]/i;
+// Third-person actor framing — a steering doc narrates the parties in the third
+// person ("the user" / "the assistant"); a first-person preference ("I", "you")
+// does not. REQUIRED IN ADDITION to the leading header, so neither signal alone
+// can drop a genuine memory.
+const STEERING_ACTOR_RE = /\bthe (users?|customers?|assistant|model|agent|ai)\b/i;
 
 const NO_MATCH: InstructionShapedScan = { instructionShaped: false, reason: null };
 
@@ -84,7 +107,7 @@ const NO_MATCH: InstructionShapedScan = { instructionShaped: false, reason: null
 export function scanInstructionShaped(text: string): InstructionShapedScan {
   if (!text) return NO_MATCH;
   if (TOOL_TOKEN_RE.test(text)) return { instructionShaped: true, reason: 'tool_token' };
-  if (STEERING_HEADER_RE.test(text) && STEERING_ACTOR_RE.test(text)) {
+  if (STEERING_HEADER_LABEL_RE.test(text) && STEERING_ACTOR_RE.test(text)) {
     return { instructionShaped: true, reason: 'steering_shape' };
   }
   return NO_MATCH;
