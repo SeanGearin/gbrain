@@ -251,7 +251,8 @@ function resolveConfidence(c: ValidClaim): number {
  *     dating is the dangerous direction (it skews decay + trajectory ordering),
  *     so it is refused rather than trusted.
  *   - absurd past (before 1990) → undefined → now().
- * Lenient shape parse (accept 'YYYY-MM-DD' or full ISO). The value is only ever
+ * STRICT canonical shape (v2): only 'YYYY-MM-DD', optionally followed by a
+ * time (T or space) with an optional zone, is accepted. The value is only ever
  * a parameterized timestamp — no injection surface.
  *
  * Adversarial-review hardening (2026-07-21): TIMEZONE DETERMINISM. Per the ES
@@ -260,15 +261,50 @@ function resolveConfidence(c: ValidClaim): number {
  * engine host it could land the fact on the adjacent UTC day (valid_from is
  * TIMESTAMPTZ). We force UTC for a zone-less date-time by appending 'Z', so the
  * stored day is the client's intended day regardless of the box's timezone.
+ *
+ * v2 hardening (review F2-1 + F2-2, 2026-07-21):
+ *   - STRICT canonical acceptance: anything that is not the canonical shape
+ *     (slash dates, prose dates, non-zero-padded) → undefined → now(). Those
+ *     forms went through new Date() as HOST-LOCAL time — the exact TZ
+ *     nondeterminism this hardening exists to prevent, previously half-closed.
+ *     This also pins behavior against engine-specific Date parsing (the
+ *     offline harness is Bun/JSC, the deploy runtime may be V8 — review F2-3):
+ *     only spec-stable canonical forms ever reach new Date().
+ *   - ROUND-TRIP DAY CHECK: before new Date(normalized), the leading
+ *     YYYY-MM-DD is re-derived via Date.UTC + getUTCFullYear/Month/Date; a
+ *     mismatch (calendar-invalid DAY overflow — '2026-02-30' silently rolled
+ *     to 2026-03-02 pre-fix) → undefined → now(), so DAY overflow behaves
+ *     like the already-caught MONTH overflow instead of mis-dating the memory
+ *     1-3 days off. Checked on the DAY COMPONENT standalone, so a legitimate
+ *     offset timestamp whose UTC day differs from its stated local day
+ *     ('2026-03-15T23:30:00-05:00' → UTC Mar 16) still passes.
  */
 const VALID_FROM_FLOOR_MS = Date.UTC(1990, 0, 1);
 const CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+// v2 (F2-2): the ONLY accepted shape — canonical date, optional (T|space)time,
+// optional Z / ±HH[:]MM zone. Everything else → undefined → now().
+const CANONICAL_VALID_FROM_RE = /^\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 // A date-time (has 'T') with NO zone designator (no trailing 'Z' and no ±HH:MM
 // offset). Date-only forms have no 'T' and already parse as UTC.
 const ZONELESS_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[T ][\d:.]+$/;
 function resolveValidFrom(s: string | undefined): Date | undefined {
   if (!s) return undefined;
   const trimmed = s.trim();
+  if (!CANONICAL_VALID_FROM_RE.test(trimmed)) return undefined; // non-canonical → now()
+  // Round-trip the stated calendar day (F2-1): Date.UTC rolls overflow the
+  // same way new Date() does, so a mismatch means the stated day never
+  // existed on the calendar.
+  const y = Number(trimmed.slice(0, 4));
+  const mo = Number(trimmed.slice(5, 7));
+  const da = Number(trimmed.slice(8, 10));
+  const probe = new Date(Date.UTC(y, mo - 1, da));
+  if (
+    probe.getUTCFullYear() !== y ||
+    probe.getUTCMonth() !== mo - 1 ||
+    probe.getUTCDate() !== da
+  ) {
+    return undefined; // calendar-invalid day (e.g. 2026-02-30) → now()
+  }
   const normalized = ZONELESS_DATETIME_RE.test(trimmed)
     ? `${trimmed.replace(' ', 'T')}Z` // interpret a zone-less date-time as UTC
     : trimmed;
