@@ -108,12 +108,25 @@ export async function getBrainHotMemoryMeta(
   return payload;
 }
 
-/** Invalidate the cache for a (source_id, session_id) pair after extraction. */
-export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): void {
-  // Walk the cache and prune any entry matching this source+session prefix
-  // (regardless of allow-list hash). Visitors with different visibility
-  // tiers all get fresh data on next read.
-  const prefix = `${sourceId}::${sessionId ?? '_'}::`;
+/**
+ * Invalidate the cache after a fact mutation.
+ *
+ * - `bumpHotMemoryCache(sourceId, sessionId)` — prune the (source, session)
+ *   pair's entries (all allow-list hashes). `null` targets the no-session
+ *   entries specifically.
+ * - `bumpHotMemoryCache(sourceId)` — v2 (review F1-2, 2026-07-21): prune EVERY
+ *   session's entries for the source. The expire sites (forget / supersede)
+ *   don't know which session cached the payload, and a just-forgotten fact
+ *   must not ride the 30s TTL in ANY session — so session-unknown means
+ *   source-wide.
+ */
+export function bumpHotMemoryCache(sourceId: string, sessionId?: string | null): void {
+  // Walk the cache and prune any entry matching the prefix (regardless of
+  // allow-list hash). Visitors with different visibility tiers all get fresh
+  // data on next read.
+  const prefix = sessionId === undefined
+    ? `${sourceId}::`
+    : `${sourceId}::${sessionId ?? '_'}::`;
   for (const k of _cache.keys()) {
     if (k.startsWith(prefix)) _cache.delete(k);
   }

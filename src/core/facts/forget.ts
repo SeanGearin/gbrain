@@ -56,7 +56,11 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
 import { parseFactsFence, updateFactRowInFence, introducesNewWarnings } from '../facts-fence.ts';
-import { rematerializeEntityAfterExpire } from './construct.ts';
+import {
+  rematerializeEntityAfterExpire,
+  cleanupCoOccurrenceEdgesForExpiredClaim,
+} from './construct.ts';
+import { bumpHotMemoryCache } from './meta-hook.ts';
 
 export interface ForgetFactResult {
   /** True iff the row was found AND a forget was applied (fence or DB). */
@@ -123,16 +127,28 @@ export async function forgetFactInFence(
   // and are correctly skipped (no state changed). Best-effort + contained
   // (rematerializeEntityAfterExpire) so it can never undo the forget. The cheap
   // extra SELECT mirrors the row the raw path re-reads anyway.
-  const targetRows = await engine.executeRaw<{ source_id: string; entity_slug: string | null }>(
-    `SELECT source_id, entity_slug FROM facts WHERE id = $1`,
+  const targetRows = await engine.executeRaw<{ source_id: string; entity_slug: string | null; fact: string }>(
+    `SELECT source_id, entity_slug, fact FROM facts WHERE id = $1`,
     [factId],
   );
   const target = targetRows[0];
 
   const result = await forgetFactInFenceRaw(engine, factId, opts);
 
-  if (result.ok && target?.entity_slug) {
-    await rematerializeEntityAfterExpire(engine, target.source_id, target.entity_slug);
+  if (result.ok && target) {
+    if (target.entity_slug) {
+      await rematerializeEntityAfterExpire(engine, target.source_id, target.entity_slug);
+    }
+    // F1-1 (v2, review 2026-07-21): the claim's co-occurrence edges carry the
+    // forgotten text verbatim in their context — clean them so get_links /
+    // traverse_graph stop surfacing it. Best-effort + contained (own
+    // savepoint/tx inside the helper), can never undo the forget. Runs even
+    // when entity_slug is NULL: edges key on the claim TEXT, not the slug.
+    await cleanupCoOccurrenceEdgesForExpiredClaim(engine, target.source_id, target.fact);
+    // F1-2 (v2): a just-forgotten fact must not ride the 30s _meta
+    // hot-memory cache. The forget site doesn't know the session, so bump
+    // EVERY session's entries for this source (sessionId omitted).
+    bumpHotMemoryCache(target.source_id);
   }
   return result;
 }

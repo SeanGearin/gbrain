@@ -47,8 +47,13 @@ import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 import { cosineSimilarity } from './classify.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
-import { constructGraphFromClaim, materializeEntityPages } from './construct.ts';
+import {
+  constructGraphFromClaim,
+  materializeEntityPages,
+  cleanupCoOccurrenceEdgesForExpiredClaim,
+} from './construct.ts';
 import { supersedeFactDurably } from './supersede.ts';
+import { bumpHotMemoryCache } from './meta-hook.ts';
 
 /** Layer-1 (pg_trgm / normalized-exact) duplicate threshold. */
 const TRGM_DEDUP_THRESHOLD = 0.85;
@@ -459,16 +464,38 @@ async function resolvePrimaryEntitySlug(
  * (source-scoped); expiring a row does not clear its entity_slug, so reading it
  * after the supersede is correct.
  */
-async function resolveSupersededEntitySlug(
+async function resolveSupersededFactRow(
   engine: BrainEngine,
   factId: number,
   sourceId: string,
-): Promise<string | null> {
-  const rows = await engine.executeRaw<{ entity_slug: string | null }>(
-    `SELECT entity_slug FROM facts WHERE id = $1 AND source_id = $2`,
+): Promise<{ entity_slug: string | null; fact: string } | null> {
+  const rows = await engine.executeRaw<{ entity_slug: string | null; fact: string }>(
+    `SELECT entity_slug, fact FROM facts WHERE id = $1 AND source_id = $2`,
     [factId, sourceId],
   );
-  return rows[0]?.entity_slug ?? null;
+  return rows[0] ?? null;
+}
+
+/**
+ * F1-1 + F1-2 (v2, review 2026-07-21): after a supersede APPLIED, scrub the
+ * corrected-away claim's derived residue — its co-occurrence edges (which carry
+ * the old claim text verbatim on the get_links/traverse_graph read path) and
+ * the 30s _meta hot-memory cache (source-wide: the expire site doesn't know
+ * which session cached it). Also queues the target's own entity page for the
+ * post-loop re-materialize via the returned slug. Both cleanups are
+ * best-effort/contained and can never undo the applied supersede.
+ */
+async function scrubExpiredTargetResidue(
+  engine: BrainEngine,
+  factId: number,
+  sourceId: string,
+  touchedEntitySlugs: Set<string>,
+): Promise<void> {
+  const target = await resolveSupersededFactRow(engine, factId, sourceId);
+  if (!target) return;
+  if (target.entity_slug) touchedEntitySlugs.add(target.entity_slug);
+  await cleanupCoOccurrenceEdgesForExpiredClaim(engine, sourceId, target.fact);
+  bumpHotMemoryCache(sourceId);
 }
 
 /**
@@ -689,9 +716,10 @@ export async function runSaveFacts(
           // arm. On the dedup path no new row inserts, so touchedEntitySlugs
           // would otherwise be empty for this claim; the target's slug may also
           // differ from this claim's (cross-subject correction). Post-loop
-          // materialize then rebuilds it (or blanks it when it has no facts left).
-          const oldSlug = await resolveSupersededEntitySlug(ctx.engine, supersedeTargetId, ctx.sourceId);
-          if (oldSlug) touchedEntitySlugs.add(oldSlug);
+          // materialize then rebuilds it (or blanks it when it has no facts
+          // left). v2 (F1-1/F1-2): additionally scrub the target's
+          // co-occurrence edge residue + the hot-memory cache.
+          await scrubExpiredTargetResidue(ctx.engine, supersedeTargetId, ctx.sourceId, touchedEntitySlugs);
         }
         if (res.applied && !res.durable) {
           // Honest receipt: the correction applies NOW, but the target's
@@ -821,9 +849,9 @@ export async function runSaveFacts(
         // Add the OLD target's slug too, so its page is rebuilt (or blanked when it
         // has no active facts left) and the corrected-away value stops surfacing
         // via the chunk arm. Same-subject corrections resolve to the same slug and
-        // the Set dedups.
-        const oldSlug = await resolveSupersededEntitySlug(ctx.engine, supersedeTargetId, ctx.sourceId);
-        if (oldSlug) touchedEntitySlugs.add(oldSlug);
+        // the Set dedups. v2 (F1-1/F1-2): additionally scrub the target's
+        // co-occurrence edge residue + the hot-memory cache.
+        await scrubExpiredTargetResidue(ctx.engine, supersedeTargetId, ctx.sourceId, touchedEntitySlugs);
       }
       // B3: a superseding insert is still a NEW row → 'inserted' (the batch
       // `superseded` counter reports the chain; see SaveFactsClaimResult).

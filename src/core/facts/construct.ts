@@ -596,6 +596,51 @@ export async function rematerializeEntityAfterExpire(
   }
 }
 
+/**
+ * F1-1 (v2 remediation, adversarial review 2026-07-21): delete the
+ * construct-owned co_occurrence edges minted from an expired claim, so the
+ * forgotten/corrected-away value stops surfacing verbatim on the GRAPH read
+ * path (get_links / traverse_graph). constructGraphFromClaim stamps
+ * `context = claimText.slice(0, 500)` into every edge it mints, so the expired
+ * claim's edges are exactly the co_occurrence/'manual' edges whose context
+ * equals that slice — deleting by (source, type, link_source, context) removes
+ * BOTH directions of every pair from that claim and touches nothing else: an
+ * edge minted from a DIFFERENT still-active claim carries that claim's own
+ * context and survives (identical text would have deduped to the same fact).
+ *
+ * CONTAINED exactly like rematerializeEntityAfterExpire: runs in its own
+ * engine.transaction (a SAVEPOINT when nested inside the tenant tx, a real tx
+ * at top level) with the error swallowed, so a derived-layer cleanup failure
+ * can NEVER undo or block the primary expire/forget. Pure SQL — no config, no
+ * LLM, no embedding; RLS-confined via the pages join under the tenant role.
+ */
+export async function cleanupCoOccurrenceEdgesForExpiredClaim(
+  engine: BrainEngine,
+  sourceId: string,
+  claimText: string,
+): Promise<void> {
+  const context = claimText.slice(0, 500);
+  if (!context) return;
+  try {
+    await engine.transaction(async (txEngine) => {
+      await txEngine.executeRaw(
+        `DELETE FROM links l
+          USING pages f
+          WHERE l.from_page_id = f.id
+            AND f.source_id = $1
+            AND l.link_type = '${LINK_TYPE}'
+            AND l.link_source = '${LINK_SOURCE}'
+            AND l.context = $2`,
+        [sourceId, context],
+      );
+    });
+  } catch (err) {
+    console.error(
+      `[facts:edge-cleanup] skipped, expire already applied (edge deletes rolled back to their own savepoint/tx): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 /** One directed co-occurrence edge, source-qualified on both endpoints. */
 function edge(from: string, to: string, context: string, sourceId: string): LinkBatchInput {
   return {
