@@ -385,6 +385,26 @@ async function resolvePrimaryEntitySlug(
 }
 
 /**
+ * FIX 1 (RED-B, PACKET ENGINE-PREP 2026-07-20): resolve a superseded target
+ * fact's OWN entity_slug so the post-loop materialize rebuilds its page. On a
+ * cross-subject correction (Google→Meta) the old fact's slug differs from the
+ * new claim's, so the old page would otherwise keep its stale chunk. RLS-safe
+ * (source-scoped); expiring a row does not clear its entity_slug, so reading it
+ * after the supersede is correct.
+ */
+async function resolveSupersededEntitySlug(
+  engine: BrainEngine,
+  factId: number,
+  sourceId: string,
+): Promise<string | null> {
+  const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+    `SELECT entity_slug FROM facts WHERE id = $1 AND source_id = $2`,
+    [factId, sourceId],
+  );
+  return rows[0]?.entity_slug ?? null;
+}
+
+/**
  * Deterministic intake. Returns a validation error (no writes) or the insert
  * tally. Throws nothing in the normal path — the embedding lane is the only
  * external call and it is guarded + caught.
@@ -564,6 +584,16 @@ export async function runSaveFacts(
           sourceId: ctx.sourceId,
         });
         if (res.applied) superseded += 1;
+        if (res.applied) {
+          // FIX 1 (RED-B): the superseded target's OWN entity page must be
+          // rebuilt so the corrected-away value stops surfacing via the chunk
+          // arm. On the dedup path no new row inserts, so touchedEntitySlugs
+          // would otherwise be empty for this claim; the target's slug may also
+          // differ from this claim's (cross-subject correction). Post-loop
+          // materialize then rebuilds it (or blanks it when it has no facts left).
+          const oldSlug = await resolveSupersededEntitySlug(ctx.engine, supersedeTargetId, ctx.sourceId);
+          if (oldSlug) touchedEntitySlugs.add(oldSlug);
+        }
         if (res.applied && !res.durable) {
           // Honest receipt: the correction applies NOW, but the target's
           // fence still lists the claim active — the next reconcile of that
@@ -681,6 +711,15 @@ export async function runSaveFacts(
             supersede_reason: followUp.reason ?? 'fence not rewritten',
           };
         }
+        // FIX 1 (RED-B): on a CROSS-SUBJECT correction (old fact → companies/google,
+        // new fact → companies/meta) the atomic insert+expire above added only the
+        // NEW fact's slug to touchedEntitySlugs (below, at the entitySlug add).
+        // Add the OLD target's slug too, so its page is rebuilt (or blanked when it
+        // has no active facts left) and the corrected-away value stops surfacing
+        // via the chunk arm. Same-subject corrections resolve to the same slug and
+        // the Set dedups.
+        const oldSlug = await resolveSupersededEntitySlug(ctx.engine, supersedeTargetId, ctx.sourceId);
+        if (oldSlug) touchedEntitySlugs.add(oldSlug);
       }
       // B3: a superseding insert is still a NEW row → 'inserted' (the batch
       // `superseded` counter reports the chain; see SaveFactsClaimResult).

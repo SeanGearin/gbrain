@@ -89,6 +89,8 @@ import type { ChunkInput, Page } from '../types.ts';
 import { chunkText, MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { slugifyEntity } from '../enrichment-service.ts';
+import { isAvailable } from '../ai/gateway.ts';
+import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 
 /**
  * `link_source = 'manual'` — NOT 'markdown'. The links.link_source CHECK
@@ -475,16 +477,29 @@ export async function materializeEntityPages(
     if (!isConstructOwnedPage(page)) continue;  // authored/enriched body — never clobber
 
     const facts = await engine.listFactsByEntity(sourceId, slug, { activeOnly: true, limit: 100 });
-    if (facts.length === 0) continue;           // nothing to materialize — leave the stub as-is
 
+    // FS-8 (RED-B, PACKET ENGINE-PREP 2026-07-20): do NOT short-circuit the
+    // zero-active-facts case. A page whose last active fact was just expired
+    // (forget / cross-subject supersede) must not keep its stale materialized
+    // body — the chunk arm of find_in_record (searchKeyword/searchVector over
+    // content_chunks) has no expired_at filter and no join to facts, so the
+    // forgotten value would keep surfacing via meaning search. compileEntityBody
+    // returns a STUB body for an empty set; the idempotency check below skips a
+    // page that is already a stub, and the empty `chunks` array makes
+    // upsertChunks DELETE the page's content chunks — reverting it to a
+    // never-materialized stub. The isConstructOwnedPage gate above already
+    // protects authored / enriched pages from being blanked. A non-empty fact
+    // set re-chunks the compiled body exactly as before.
     const body = compileEntityBody(page.title, page.type, facts);
     if (body === page.compiled_truth) continue; // idempotent: identical body, skip rewrite + re-chunk
 
-    const chunks: ChunkInput[] = chunkText(body).map((c, i) => ({
-      chunk_index: i,
-      chunk_text: c.text,
-      chunk_source: 'compiled_truth',
-    }));
+    const chunks: ChunkInput[] = facts.length === 0
+      ? [] // zero active facts → blank to stub + drop chunks so the value stops surfacing (RED-B)
+      : chunkText(body).map((c, i) => ({
+          chunk_index: i,
+          chunk_text: c.text,
+          chunk_source: 'compiled_truth',
+        }));
     pending.push({ slug, page: { ...page, compiled_truth: body }, chunks });
   }
   if (pending.length === 0) return { pagesMaterialized: 0, chunksWritten: 0 };
@@ -543,6 +558,42 @@ export async function materializeEntityPages(
     chunksWritten += chunks.length;
   }
   return { pagesMaterialized: pending.length, chunksWritten };
+}
+
+/**
+ * FS-8 (RED-B, PACKET ENGINE-PREP 2026-07-20): re-materialize ONE entity page
+ * after its fact set changed on the EXPIRE path (forget / supersede), so a
+ * corrected-away or forgotten value stops surfacing via the chunk arm of
+ * find_in_record. Rebuilds the page from its remaining active facts, or blanks
+ * it to a stub + drops its chunks when none remain (materializeEntityPages
+ * handles both). Standalone twin of the post-loop materialize save_facts runs:
+ * it sets up the SAME best-effort embedding lane (isAvailable('embedding') is an
+ * in-memory gateway read — no DB config, FLAG-C-safe on the tenant plane) and
+ * runs inside engine.transaction (a SAVEPOINT when nested in the tenant tx, a
+ * real tx at top level). CONTAINED: a derived-layer rebuild failure is swallowed
+ * so it can NEVER undo the primary expire/forget. Idempotent + LLM-free.
+ */
+export async function rematerializeEntityAfterExpire(
+  engine: BrainEngine,
+  sourceId: string,
+  entitySlug: string,
+): Promise<void> {
+  if (!entitySlug) return;
+  const embeddingsOn = isAvailable('embedding');
+  const embedChunks = embeddingsOn ? (texts: string[]) => embedBatch(texts) : undefined;
+  const embeddingSignature = embeddingsOn ? currentEmbeddingSignature() : null;
+  try {
+    await engine.transaction((txEngine) =>
+      materializeEntityPages(txEngine, sourceId, new Set([entitySlug]), {
+        embedChunks,
+        embeddingSignature,
+      }),
+    );
+  } catch (err) {
+    console.error(
+      `[facts:rematerialize] skipped for ${entitySlug}, expire already applied (rematerialize writes rolled back to their own savepoint/tx): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /** One directed co-occurrence edge, source-qualified on both endpoints. */

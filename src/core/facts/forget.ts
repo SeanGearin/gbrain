@@ -56,6 +56,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
 import { parseFactsFence, updateFactRowInFence, introducesNewWarnings } from '../facts-fence.ts';
+import { rematerializeEntityAfterExpire } from './construct.ts';
 
 export interface ForgetFactResult {
   /** True iff the row was found AND a forget was applied (fence or DB). */
@@ -109,6 +110,34 @@ function todayUtc(): string {
  * when the user provides it.
  */
 export async function forgetFactInFence(
+  engine: BrainEngine,
+  factId: number,
+  opts: { reason?: string } = {},
+): Promise<ForgetFactResult> {
+  // FIX 1 (RED-B, PACKET ENGINE-PREP 2026-07-20): capture the target's entity
+  // page up front, run the existing forget, then — after a REAL expire (ok) —
+  // re-materialize that page so the forgotten value stops surfacing via the
+  // chunk arm of find_in_record (its content_chunks otherwise keep the value
+  // verbatim; the chunk arm has no expired_at filter). Covers BOTH callers
+  // (forget_fact op + recall CLI). not_found / already_expired return ok:false
+  // and are correctly skipped (no state changed). Best-effort + contained
+  // (rematerializeEntityAfterExpire) so it can never undo the forget. The cheap
+  // extra SELECT mirrors the row the raw path re-reads anyway.
+  const targetRows = await engine.executeRaw<{ source_id: string; entity_slug: string | null }>(
+    `SELECT source_id, entity_slug FROM facts WHERE id = $1`,
+    [factId],
+  );
+  const target = targetRows[0];
+
+  const result = await forgetFactInFenceRaw(engine, factId, opts);
+
+  if (result.ok && target?.entity_slug) {
+    await rematerializeEntityAfterExpire(engine, target.source_id, target.entity_slug);
+  }
+  return result;
+}
+
+async function forgetFactInFenceRaw(
   engine: BrainEngine,
   factId: number,
   opts: { reason?: string } = {},
