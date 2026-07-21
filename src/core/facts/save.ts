@@ -41,6 +41,7 @@ import {
   logRestrictedSurfaceStrip,
   type RestrictedCategory,
 } from './restricted-data.ts';
+import { scanInstructionShaped, logInstructionShapedDrop } from './instruction-shaped.ts';
 import { isAvailable, embedOne } from '../ai/gateway.ts';
 import { embedBatch, currentEmbeddingSignature } from '../embedding.ts';
 import { cosineSimilarity } from './classify.ts';
@@ -112,11 +113,14 @@ export interface SaveFactsContext {
  *                 fact_id is the LIVE HEAD of the supersession chain
  *                 (bounded walk); superseded_from is the matched tombstone.
  *                 Counts under the batch `duplicate` tally.
- *   'dropped'   — restricted-data scrub (PCI card / SSN / credential); the
- *                 claim was never inserted. Carries the `category` ONLY —
- *                 the value itself is never returned or logged, but the
- *                 category is reported honestly so the caller can tell the
- *                 user WHY the memory was refused instead of losing it silently.
+ *   'dropped'   — restricted-data scrub (PCI card / SSN / credential) OR the
+ *                 instruction-shaped guard (assistant-steering / setup text a
+ *                 client mislabeled as a user fact — category
+ *                 'instruction_shaped'); the claim was never inserted. Carries
+ *                 the `category` ONLY — the value itself is never returned or
+ *                 logged, but the category is reported honestly so the caller can
+ *                 tell the user WHY the memory was refused instead of losing it
+ *                 silently.
  */
 export type SaveFactsClaimResult =
   | {
@@ -153,7 +157,7 @@ export type SaveFactsClaimResult =
       fact_id: number;
       superseded_from: number;
     }
-  | { index: number; status: 'dropped'; category: RestrictedCategory };
+  | { index: number; status: 'dropped'; category: RestrictedCategory | 'instruction_shaped' };
 
 export type SaveFactsResult =
   | {
@@ -506,6 +510,22 @@ export async function runSaveFacts(
       logRestrictedDrop(restricted.category, 'mcp:save_facts');
       // B3: honest drop receipt — the category class only, never the value.
       results[i] = { index: i, status: 'dropped', category: restricted.category };
+      dropped += 1;
+      continue;
+    }
+    // FIX 3 (provenance engine backstop, PACKET ENGINE-PREP 2026-07-20): drop
+    // assistant-steering / setup text a client mislabeled as a first-person user
+    // fact (the 8944 class), before it is banked as user_stated at confidence 1.
+    // Deterministic + zero-LLM, precision over recall: only distinctive shapes
+    // fire (the product's own tool identifiers as literal tokens, OR a
+    // steering-document header co-occurring with third-person "the user"/"the
+    // assistant"), so a first-person meta-preference still inserts. Same DROP
+    // disposition as the restricted-data scrub above: never inserted, the batch
+    // proceeds, the value is never silently rewritten. See instruction-shaped.ts.
+    const shaped = scanInstructionShaped(cleaned);
+    if (shaped.instructionShaped && shaped.reason) {
+      logInstructionShapedDrop(shaped.reason, 'mcp:save_facts');
+      results[i] = { index: i, status: 'dropped', category: 'instruction_shaped' };
       dropped += 1;
       continue;
     }
