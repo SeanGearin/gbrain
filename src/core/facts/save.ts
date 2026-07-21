@@ -64,6 +64,18 @@ const ClaimSchema = z
     people: z.array(z.string()).optional(),
     entities: z.array(z.string()).optional(),
     date_context: z.string().optional(),
+    /**
+     * FIX 2 (import dates, PACKET ENGINE-PREP 2026-07-20): the SOURCE date of
+     * this claim — the historical date it was true / stated, NOT the import
+     * timestamp. 'YYYY-MM-DD' or full ISO. Optional; when a client re-saves an
+     * imported conversation it stamps the original conversation date here so the
+     * fact reads / decays / time-travels as of THEN, not now. Distinct from
+     * `date_context` (free-text "when" that flows into the context column, never
+     * a queryable date). A garbage or future value is ignored and the row falls
+     * back to now() — a malformed date must never fail the batch. Threaded into
+     * NewFact.valid_from below; facts.valid_from already exists (no migration).
+     */
+    valid_from: z.string().optional(),
     provenance: z.enum(['user_stated', 'model_inferred']),
     confidence: z.number().min(0).max(1).optional(),
     /**
@@ -206,6 +218,31 @@ function resolveConfidence(c: ValidClaim): number {
     return Math.min(c.confidence ?? 0.7, 0.7);
   }
   return c.confidence ?? 1.0;
+}
+
+/**
+ * FIX 2 (import dates): parse a client-supplied `valid_from` into the fact's
+ * historical valid-from Date. Fail-OPEN and deterministic (zero inference):
+ *   - unparseable ('last Tuesday-ish') → undefined → engine defaults now(). A
+ *     malformed date must NEVER fail the batch or lose the memory.
+ *   - future-dated (beyond a small clock-skew tolerance) → undefined → now().
+ *     Backdating is the whole point of importing history and is allowed; FORWARD
+ *     dating is the dangerous direction (it skews decay + trajectory ordering),
+ *     so it is refused rather than trusted.
+ *   - absurd past (before 1990) → undefined → now().
+ * Lenient shape parse matches extract-from-fence.ts (accept 'YYYY-MM-DD' or full
+ * ISO). The value is only ever a parameterized timestamp — no injection surface.
+ */
+const VALID_FROM_FLOOR_MS = Date.UTC(1990, 0, 1);
+const CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+function resolveValidFrom(s: string | undefined): Date | undefined {
+  if (!s) return undefined;
+  const d = new Date(s);
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return undefined;
+  if (ms > Date.now() + CLOCK_SKEW_MS) return undefined; // forward-dating → now()
+  if (ms < VALID_FROM_FLOOR_MS) return undefined;        // absurd past → now()
+  return d;
 }
 
 /**
@@ -672,6 +709,11 @@ export async function runSaveFacts(
       embedding,
       provenance: c.provenance,
       client_authored: true,
+      // FIX 2 (import dates): stamp the claim's SOURCE date when supplied +
+      // parseable; undefined falls through to the engine default now() (both
+      // engines: `input.valid_from ?? new Date()`), so unchanged for every
+      // caller that omits it.
+      valid_from: resolveValidFrom(c.valid_from),
     };
     // B2: when the claim supersedes a prior fact AND its text is not a dup, use
     // the engine's ATOMIC insert+expire path (its own tx) so no observer ever
