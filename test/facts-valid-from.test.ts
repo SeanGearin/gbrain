@@ -109,6 +109,51 @@ describe('save_facts valid_from (import dates)', () => {
     expect(await validFromDate(res.fact_ids[0])).toBe('2026-03-16');
   });
 
+  // --- v2 hardening (adversarial review 2026-07-21, F2-1 + F2-2) ------------
+
+  test.each([
+    // Distinctive claim texts per row — near-identical texts would trgm-dedup
+    // against each other and mask the date assertion.
+    ['2026-02-30', '2026-03-02', 'Signed the Falcor lease on the imported note date'],   // Feb 30 → Mar 2 pre-fix
+    ['2026-04-31', '2026-05-01', 'Bought the espresso machine for the Kyoto office'],    // Apr 31 → May 1 pre-fix
+    ['2026-02-29', '2026-03-01', 'Priya cleared the vendor audit with zero findings'],   // 2026 not a leap year → Mar 1 pre-fix
+  ])('F2-1: day-overflow %p fails to today, never silently rolls to %p', async (input, rolled, claim) => {
+    // Pre-fix, new Date() silently rolled calendar-invalid DAY overflows to a
+    // nearby valid date (mis-dating the memory 1-3 days off); month overflow
+    // already NaN'd. The round-trip day check makes DAY overflow behave like
+    // the already-caught MONTH overflow: undefined -> now().
+    const res = await runSaveFacts(
+      [{ claim, provenance: 'user_stated', valid_from: input }],
+      { engine, sourceId: SRC },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    expect(res.inserted).toBe(1);
+    const stored = await validFromDate(res.fact_ids[0]);
+    expect(stored).not.toBe(rolled);
+    expect(stored).toBe(todayUtc());
+  });
+
+  test.each([
+    ['2026/03/15 10:00', 'Kicked off the Sable migration with the platform team'],  // slash form: HOST-LOCAL parse
+    ['March 15, 2026', 'Renewed the Halcyon support contract for two years'],       // prose form: host-local midnight
+    ['15 March 2026', 'Marcus demoed the graph explorer to the Tokyo prospects'],   // prose form: host-local midnight
+    ['2026-3-5', 'Shipped the queue drain fix behind the beta flag'],               // non-zero-padded: engine-dependent
+  ])('F2-2: non-canonical parseable date %p is refused to today (strict canonical acceptance)', async (input, claim) => {
+    // Pre-fix these fell through to new Date() as-is and parsed as host-LOCAL
+    // time - the exact TZ nondeterminism the hardening was written to prevent,
+    // only half-closed. Only the canonical YYYY-MM-DD[(T| )time[zone]] shape is
+    // accepted now; everything else -> undefined -> now().
+    const res = await runSaveFacts(
+      [{ claim, provenance: 'user_stated', valid_from: input }],
+      { engine, sourceId: SRC },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    expect(res.inserted).toBe(1);
+    expect(await validFromDate(res.fact_ids[0])).toBe(todayUtc());
+  });
+
   test('a future valid_from is clamped to today (anti-poison: forward-dating skews decay/trajectory)', async () => {
     const res = await runSaveFacts(
       [{ claim: 'Will renew Globex next cycle', provenance: 'user_stated', valid_from: '2031-01-01' }],
