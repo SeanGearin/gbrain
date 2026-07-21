@@ -157,7 +157,19 @@ export type SaveFactsClaimResult =
       fact_id: number;
       superseded_from: number;
     }
-  | { index: number; status: 'dropped'; category: RestrictedCategory | 'instruction_shaped' };
+  | {
+      index: number;
+      status: 'dropped';
+      category: RestrictedCategory | 'instruction_shaped';
+      /**
+       * v2 (review minor, 2026-07-21): present ONLY when the dropped claim
+       * carried `supersedes`. The drop happens BEFORE the supersede path, so
+       * the named correction was NOT applied — the target fact stays active.
+       * Disclosed so the caller can tell the user the correction needs to be
+       * re-issued as a clean claim instead of silently losing it.
+       */
+      supersede_not_applied?: true;
+    };
 
 export type SaveFactsResult =
   | {
@@ -523,23 +535,39 @@ export async function runSaveFacts(
     if (restricted.restricted && restricted.category) {
       logRestrictedDrop(restricted.category, 'mcp:save_facts');
       // B3: honest drop receipt — the category class only, never the value.
-      results[i] = { index: i, status: 'dropped', category: restricted.category };
+      // v2: a dropped claim carrying `supersedes` never reaches the supersede
+      // path, so the correction did NOT apply — say so (review minor).
+      results[i] = {
+        index: i,
+        status: 'dropped',
+        category: restricted.category,
+        ...(typeof parsed.data.supersedes === 'number' ? { supersede_not_applied: true as const } : {}),
+      };
       dropped += 1;
       continue;
     }
-    // FIX 3 (provenance engine backstop, PACKET ENGINE-PREP 2026-07-20): drop
-    // assistant-steering / setup text a client mislabeled as a first-person user
-    // fact (the 8944 class), before it is banked as user_stated at confidence 1.
-    // Deterministic + zero-LLM, precision over recall: only distinctive shapes
-    // fire (the product's own tool identifiers as literal tokens, OR a
-    // steering-document header co-occurring with third-person "the user"/"the
-    // assistant"), so a first-person meta-preference still inserts. Same DROP
-    // disposition as the restricted-data scrub above: never inserted, the batch
-    // proceeds, the value is never silently rewritten. See instruction-shaped.ts.
+    // FIX 3 (provenance engine backstop, PACKET ENGINE-PREP 2026-07-20; v2 per
+    // the adversarial review 2026-07-21): drop assistant-steering / setup text a
+    // client mislabeled as a first-person user fact (the 8944 class), before it
+    // is banked as user_stated at confidence 1. Deterministic + zero-LLM,
+    // precision over recall: v2 fires ONLY on the steering-document shape — a
+    // LEADING header label + third-person actor framing + a directive aimed at
+    // the actor, all three together. Merely naming a product tool id never
+    // drops (that shape silently lost the core audience's genuine memories —
+    // review F3-1 BLOCKER), descriptive PRD/spec lines keep (F3-2), and a
+    // first-person meta-preference still inserts even when it names a tool.
+    // Same DROP disposition as the restricted-data scrub above: never inserted,
+    // the batch proceeds, the value is never silently rewritten. A porous
+    // literal-specimen backstop by design — see instruction-shaped.ts.
     const shaped = scanInstructionShaped(cleaned);
     if (shaped.instructionShaped && shaped.reason) {
       logInstructionShapedDrop(shaped.reason, 'mcp:save_facts');
-      results[i] = { index: i, status: 'dropped', category: 'instruction_shaped' };
+      results[i] = {
+        index: i,
+        status: 'dropped',
+        category: 'instruction_shaped',
+        ...(typeof parsed.data.supersedes === 'number' ? { supersede_not_applied: true as const } : {}),
+      };
       dropped += 1;
       continue;
     }

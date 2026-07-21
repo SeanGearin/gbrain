@@ -2,7 +2,9 @@
  * Instruction-shaped claim guard — drops assistant-steering / setup text that a
  * client mislabels as a first-person user fact, before it is banked to the facts
  * table (PACKET ENGINE-PREP 2026-07-20, FIX 3 — the ENGINE backstop for fact
- * 8944; the worker guidance half is virgil-worker 79dc854).
+ * 8944; the worker guidance half is virgil-worker 79dc854. Remediated per the
+ * independent adversarial review, cc-findings_2026-07-21_engine-bundle-review
+ * F3-1/F3-2/F3-3).
  *
  * ## Why this exists
  *
@@ -26,88 +28,102 @@
  *
  * ## Posture: PRECISION over recall (capture stays strong — standing rule)
  *
- * A genuine biography — or a first-person dictated meta-preference ("when I ask
- * you to save something, round to whole dollars") — MUST still insert. So the
- * detector matches only two narrow, high-signal shapes:
- *   (a) tool_token — the claim names the product's OWN tool surface as a literal
- *       snake_case identifier (save_facts, recall_facts, …). Genuine customer
- *       biography essentially never contains the product's internal tool tokens;
- *       a real preference says "save", the natural verb, never "save_facts".
- *   (b) steering_shape — a steering-document HEADER (default behavior:, system
- *       prompt, custom instructions) CO-OCCURRING with third-person actor framing
- *       ("the user" / "the assistant"). A customer dictating a real preference
- *       speaks in the first person ("I", "you"), never narrates "the user" /
- *       "the assistant" — so the header alone, or the framing alone, does NOT
- *       fire; both must be present.
+ * v2 (2026-07-21): the v1 detector's standalone `tool_token` shape is REMOVED.
+ * Its premise — "genuine biography essentially never contains the product's
+ * internal tool tokens" — is FALSE for the product's core audience: the review's
+ * probe catalogs measured 24/35 genuine PM/founder memories and effectively 100%
+ * of API-referencing engineer/AI-builder memories dropped ("the save_facts dedup
+ * bug in our crawler cost us a day" is a memory, not steering). Naming a tool id
+ * is now NEVER, by itself, grounds to drop — and the docstring promise that a
+ * first-person meta-preference still inserts is finally true even when it names
+ * a token ("when I ask you to save something, use save_note" KEEPs).
+ *
+ * The one remaining shape, `steering_shape`, requires ALL THREE signals:
+ *   1. a LEADING steering-document HEADER LABEL ("Default behavior:",
+ *      "System prompt:", "Custom instructions:") at the very start of the claim
+ *      (optionally behind a markdown heading marker), followed by ':' or '-';
+ *   2. third-person ACTOR framing ("the user" / "the assistant" / "the model" …)
+ *      — a customer dictating a real preference speaks in the first person;
+ *   3. a normative DIRECTIVE aimed at the actor executing the doc: an
+ *      imperative command clause ("…, prioritize and use …", "…: always use …",
+ *      "…. Treat …") or a second-person/modal tool-usage directive ("must
+ *      always use/call/invoke/prioritize/prefer/route"). This is what separates
+ *      a steering doc that COMMANDS the assistant from ordinary PRD/spec
+ *      writing that DESCRIBES intended behavior in the third person ("System
+ *      prompt: the model should always refuse medical advice" — a genuine
+ *      design memo the review confirmed v1 wrongly dropped; those KEEP).
+ *
+ * ## This is a POROUS LITERAL-SPECIMEN BACKSTOP, not a wall (review F3-3)
+ *
+ * Naturally-phrased steering trivially evades all three signals ("When you save
+ * something, always prioritize the Virgil tools first" KEEPs), and the product
+ * rule resolves ambiguity toward capture. The guard exists to catch the 8944
+ * class — config-doc text forwarded verbatim — and must never be described as a
+ * paraphrase-resistant defense.
  *
  * Pure + zero-dep + zero-LLM + config-free (the save_facts tenant tx is
  * GRANT-excluded from config — CAT-6/FLAG-C — so this, like restricted-data.ts,
  * reads nothing). Inputs are already length-capped (<=500 chars) and sanitized
- * before this sees them; every pattern is possessive-quantifier-free, so
- * adversarial input stays linear-time.
+ * before this sees them; every pattern is possessive-quantifier-free and
+ * anchored or bounded, so adversarial input stays linear-time.
  */
 
-/** Why a claim was judged instruction-shaped (first hit wins). */
-export type InstructionShapedReason = 'tool_token' | 'steering_shape';
+/** Why a claim was judged instruction-shaped. v2: only the steering shape fires. */
+export type InstructionShapedReason = 'steering_shape';
 
 export interface InstructionShapedScan {
   instructionShaped: boolean;
   reason: InstructionShapedReason | null;
 }
 
-// --- (a) product tool identifiers -------------------------------------------
-// The product's own MCP tool names as DISTINCTIVE snake_case (underscore-joined)
-// literals. A genuine memory uses the natural verb ("save"), never the tool id
-// ("save_facts"); the underscore is the precision guard (no bare English word or
-// hyphenated slug matches). Word-boundaried so "save_facts/save_note" (the 8944
-// specimen, slash-separated) and parenthesised forms both hit; an optional
-// `gbrain_` prefix catches the real namespaced ids (gbrain_save_facts) too.
-//
-// Adversarial-review hardening (2026-07-21): DROPPED the generic `get_page` /
-// `put_page` — they collide with everyday code vocabulary (Django's
-// Paginator.get_page(), scraper/Notion helpers), so an engineer's genuine work
-// memory ("the get_page bug in our crawler…") was being silently DROPPED. Every
-// remaining token is product-distinctive and essentially never appears in real
-// biography. Engineers are a core audience — precision here IS capture strength.
-const TOOL_TOKEN_RE =
-  /\b(?:gbrain_)?(save_facts|save_note|recall_facts|find_in_record|forget_fact|correct_fact|set_facts_valid_from|share_brain_map|morning_brief|compose_brief|meeting_brief|gather_evidence|extract_facts)\b/i;
-
-// --- (b) steering-document shape --------------------------------------------
+// --- signal 1: leading steering-document header label ------------------------
 // The header must appear as a LEADING LABEL — the distinctive shape of a steering
 // / setup DIRECTIVE ("Default behavior:", "System prompt:", "Custom
 // instructions:") at the very START of the claim (optionally behind a markdown
-// heading marker), immediately followed by ':' or '-'.
-//
-// Adversarial-review hardening (2026-07-21): the prior version matched these
-// header words ANYWHERE and only co-required a third-person actor phrase — which
-// silently DROPPED genuine first-person memories from the product's core PM /
-// engineer / AI-builder audience ("our onboarding flow's default behavior is…,
-// but the user testing showed confusion"; "debugging why the assistant ignores
-// the system prompt"). Those use the same words MID-SENTENCE as subject matter,
-// not as a leading directive. Anchoring the header to the start (with a trailing
-// colon/dash) is what separates an actual steering doc from that everyday usage.
-// Anchored + possessive-free → linear-time on adversarial input.
+// heading marker), immediately followed by ':' or '-'. Mid-sentence use of the
+// same words is subject matter, not a directive, and never fires.
 const STEERING_HEADER_LABEL_RE =
   /^\s*(?:#{1,6}\s*)?(?:default behaviou?r|system prompt|custom instructions?)\b[ \t]*[:\-]/i;
-// Third-person actor framing — a steering doc narrates the parties in the third
-// person ("the user" / "the assistant"); a first-person preference ("I", "you")
-// does not. REQUIRED IN ADDITION to the leading header, so neither signal alone
-// can drop a genuine memory.
+
+// --- signal 2: third-person actor framing ------------------------------------
+// A steering doc narrates the parties in the third person ("the user" / "the
+// assistant"); a first-person preference ("I", "you") does not.
 const STEERING_ACTOR_RE = /\bthe (users?|customers?|assistant|model|agent|ai)\b/i;
+
+// --- signal 3: normative directive aimed at the actor ------------------------
+// Two arms (v2, review F3-2 — this is the arm that spares descriptive PRD lines):
+//   (a) an IMPERATIVE command clause: a bare directive verb opening a clause
+//       (right after ',' '.' ':' ';', optionally prefixed and/then/always/never/
+//       first) — "…, prioritize and use …", "…: always use …", "…. Treat …".
+//       A steering doc commands its executor; a spec line puts the actor as the
+//       subject instead ("…: the model should …" — no verb after the colon).
+//   (b) a modal/frequency TOOL-USAGE directive: must/should/shall/always/never
+//       immediately governing a tool-routing verb (use/call/invoke/prioritize/
+//       prefer/route). The verb list is deliberately narrow: "the model should
+//       always refuse medical advice" / "the assistant must cite sources" are
+//       product-spec statements about DOMAIN behavior and KEEP; steering the
+//       assistant's TOOL ROUTING is the 8944 threat class.
+const STEERING_DIRECTIVE_RE =
+  /[,.:;]\s+(?:(?:and|then|always|never|first)\s+)?(?:priorit(?:ize|ise)|use|prefer|treat|call|invoke|route|respond|answer|refuse|ignore|avoid|cite|reveal|save|store|remember)\b|\b(?:must|should|shall|always|never)\s+(?:(?:always|never|first)\s+)?(?:priorit(?:ize|ise)|use|prefer|call|invoke|route)\b/i;
 
 const NO_MATCH: InstructionShapedScan = { instructionShaped: false, reason: null };
 
 /**
- * Scan one claim's TEXT for instruction/steering shape. Returns the first shape
- * matched (tool_token → steering_shape); `instructionShaped: false` when clean.
+ * Scan one claim's TEXT for instruction/steering shape. `instructionShaped:
+ * false` when clean.
  *
- * Conservative: only the two high-signal shapes fire. Anything else is a genuine
- * memory and is saved.
+ * Conservative: all three signals (leading header label + third-person actor +
+ * directive aimed at the actor) must co-occur. Anything else — including a
+ * claim that merely names a product tool id, and descriptive PRD/spec lines —
+ * is a genuine memory and is saved.
  */
 export function scanInstructionShaped(text: string): InstructionShapedScan {
   if (!text) return NO_MATCH;
-  if (TOOL_TOKEN_RE.test(text)) return { instructionShaped: true, reason: 'tool_token' };
-  if (STEERING_HEADER_LABEL_RE.test(text) && STEERING_ACTOR_RE.test(text)) {
+  if (
+    STEERING_HEADER_LABEL_RE.test(text) &&
+    STEERING_ACTOR_RE.test(text) &&
+    STEERING_DIRECTIVE_RE.test(text)
+  ) {
     return { instructionShaped: true, reason: 'steering_shape' };
   }
   return NO_MATCH;
