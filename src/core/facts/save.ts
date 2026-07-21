@@ -234,14 +234,28 @@ function resolveConfidence(c: ValidClaim): number {
  *     dating is the dangerous direction (it skews decay + trajectory ordering),
  *     so it is refused rather than trusted.
  *   - absurd past (before 1990) → undefined → now().
- * Lenient shape parse matches extract-from-fence.ts (accept 'YYYY-MM-DD' or full
- * ISO). The value is only ever a parameterized timestamp — no injection surface.
+ * Lenient shape parse (accept 'YYYY-MM-DD' or full ISO). The value is only ever
+ * a parameterized timestamp — no injection surface.
+ *
+ * Adversarial-review hardening (2026-07-21): TIMEZONE DETERMINISM. Per the ES
+ * spec, a date-only 'YYYY-MM-DD' parses as UTC, but a bare ISO date-TIME with no
+ * zone designator ('2026-03-15T10:00:00') parses as LOCAL — so on a non-UTC
+ * engine host it could land the fact on the adjacent UTC day (valid_from is
+ * TIMESTAMPTZ). We force UTC for a zone-less date-time by appending 'Z', so the
+ * stored day is the client's intended day regardless of the box's timezone.
  */
 const VALID_FROM_FLOOR_MS = Date.UTC(1990, 0, 1);
 const CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+// A date-time (has 'T') with NO zone designator (no trailing 'Z' and no ±HH:MM
+// offset). Date-only forms have no 'T' and already parse as UTC.
+const ZONELESS_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[T ][\d:.]+$/;
 function resolveValidFrom(s: string | undefined): Date | undefined {
   if (!s) return undefined;
-  const d = new Date(s);
+  const trimmed = s.trim();
+  const normalized = ZONELESS_DATETIME_RE.test(trimmed)
+    ? `${trimmed.replace(' ', 'T')}Z` // interpret a zone-less date-time as UTC
+    : trimmed;
+  const d = new Date(normalized);
   const ms = d.getTime();
   if (!Number.isFinite(ms)) return undefined;
   if (ms > Date.now() + CLOCK_SKEW_MS) return undefined; // forward-dating → now()

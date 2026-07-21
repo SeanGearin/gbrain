@@ -86,6 +86,29 @@ describe('save_facts valid_from (import dates)', () => {
     expect(await validFromDate(res.fact_ids[0])).toBe(todayUtc());
   });
 
+  test('a zone-less ISO date-time is interpreted as UTC (no off-by-one-day on a non-UTC host)', async () => {
+    // '2026-03-15T02:00:00' with no Z would parse as LOCAL; on a positive-UTC box
+    // that crosses midnight backwards to 2026-03-14. Forcing UTC keeps the day.
+    const res = await runSaveFacts(
+      [{ claim: 'Kicked off the Aurora migration early morning', provenance: 'user_stated', valid_from: '2026-03-15T02:00:00' }],
+      { engine, sourceId: SRC },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    expect(await validFromDate(res.fact_ids[0])).toBe('2026-03-15');
+  });
+
+  test('an explicit-offset ISO timestamp is honored (not double-shifted)', async () => {
+    // 2026-03-15T23:30:00-05:00 == 2026-03-16T04:30:00Z → UTC day is the 16th.
+    const res = await runSaveFacts(
+      [{ claim: 'Closed the books late that night', provenance: 'user_stated', valid_from: '2026-03-15T23:30:00-05:00' }],
+      { engine, sourceId: SRC },
+    );
+    expect('error' in res).toBe(false);
+    if ('error' in res) return;
+    expect(await validFromDate(res.fact_ids[0])).toBe('2026-03-16');
+  });
+
   test('a future valid_from is clamped to today (anti-poison: forward-dating skews decay/trajectory)', async () => {
     const res = await runSaveFacts(
       [{ claim: 'Will renew Globex next cycle', provenance: 'user_stated', valid_from: '2031-01-01' }],
