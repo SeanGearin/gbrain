@@ -200,6 +200,67 @@ function formatJobDetail(job: MinionJob): string {
   return lines.join('\n');
 }
 
+/**
+ * v0.41 Bug 2 / Eng D8 — lease-pressure window read for `jobs stats`.
+ *
+ * Split out of the render in #3684/#3685 so the human dashboard and the
+ * --json payload report the same numbers from one query. Best-effort:
+ * returns null on a pre-v93 brain (no minion_lease_pressure_log table), which
+ * both callers treat as "omit the line". `subagent_completed` is only read
+ * when there were bounces, matching what the dashboard needed before.
+ */
+async function readLeasePressure(
+  engine: BrainEngine,
+): Promise<{ bounces: number; subagent_completed: number } | null> {
+  try {
+    const lpRows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_lease_pressure_log
+        WHERE bounced_at > now() - interval '1 hour'`,
+    );
+    const bounces = parseInt(lpRows[0]?.count ?? '0', 10);
+    if (bounces === 0) return { bounces: 0, subagent_completed: 0 };
+    // Bounces with rising completed counts = healthy backpressure; bounces
+    // with zero completes = real blocker (matches doctor's subagent_health).
+    const completedRows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_jobs
+        WHERE finished_at > now() - interval '1 hour'
+          AND status = 'completed' AND name = 'subagent'`,
+    ).catch(() => [{ count: '0' }]);
+    return { bounces, subagent_completed: parseInt(completedRows[0]?.count ?? '0', 10) };
+  } catch {
+    // Pre-v93 brain — no table. Silent skip.
+    return null;
+  }
+}
+
+/**
+ * v0.41 D3 — 24h dead/failed error clustering for `jobs stats --cluster-errors`.
+ *
+ * Split out of the render alongside readLeasePressure (#3684/#3685). An empty
+ * array means "no dead/failed jobs in the window"; null means the read itself
+ * failed and the caller should skip the section rather than block stats.
+ */
+async function readErrorClusters(
+  engine: BrainEngine,
+): Promise<Array<{ cluster: string; count: number; sample_ids: number[] }> | null> {
+  try {
+    const { clusterErrors } = await import('../core/minions/error-classify.ts');
+    const errRows = await engine.executeRaw<{ id: number; last_error: string | null }>(
+      `SELECT id, error_text AS last_error FROM minion_jobs
+        WHERE status IN ('dead', 'failed')
+          AND updated_at > now() - interval '24 hours'`,
+    );
+    if (errRows.length === 0) return [];
+    return clusterErrors(errRows);
+  } catch (e) {
+    // error-classify import or SQL fail. Don't block stats output.
+    if (process.env.GBRAIN_DEBUG === '1') {
+      console.error(`[jobs stats] cluster-errors skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return null;
+  }
+}
+
 export async function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
 
@@ -229,13 +290,13 @@ USAGE
                             [--idempotency-key K] [--queue Q] [--dry-run]
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
-  gbrain jobs list [--status S] [--queue Q] [--limit N]
-  gbrain jobs get <id>
+  gbrain jobs list [--status S] [--queue Q] [--limit N] [--json]
+  gbrain jobs get <id> [--json]
   gbrain jobs cancel <id>
   gbrain jobs retry <id>
   gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
-  gbrain jobs stats
+  gbrain jobs stats [--queue Q] [--cluster-errors] [--json]
   gbrain jobs smoke
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
@@ -528,6 +589,15 @@ HANDLER TYPES (built in)
         jobs = await queue.getJobs({ status, queue: queueName, limit });
       }
 
+      // #3684/#3685: --json emits the MinionJob[] verbatim. Ahead of the
+      // empty-set branch on purpose — a scripted consumer wants `[]`, not the
+      // prose "No jobs found." Both routes above materialize the same shape,
+      // so thin-client and local installs emit identical documents.
+      if (hasFlag(args, '--json')) {
+        console.log(JSON.stringify(jobs, null, 2));
+        break;
+      }
+
       if (jobs.length === 0) {
         console.log('No jobs found.');
         return;
@@ -567,6 +637,13 @@ HANDLER TYPES (built in)
         job = await queue.getJob(id);
       }
       if (!job) { console.error(`Job #${id} not found.`); process.exit(1); }
+      // #3684: error_text only ever appeared in the prose detail, so a monitor
+      // reading why a job died had to regex it. Same emitter the `submit`
+      // path already uses above.
+      if (hasFlag(args, '--json')) {
+        console.log(JSON.stringify(job, null, 2));
+        break;
+      }
       console.log(formatJobDetail(job));
       break;
     }
@@ -652,6 +729,33 @@ HANDLER TYPES (built in)
       const statsQueue = parseFlag(args, '--queue') ?? 'default';
       const stats = await queue.getStats({ queue: statsQueue });
 
+      // Read both best-effort sections up front so the human dashboard and the
+      // --json payload below are the same numbers. Render order is unchanged.
+      const leasePressure = await readLeasePressure(engine);
+      const errorClusters = hasFlag(args, '--cluster-errors')
+        ? await readErrorClusters(engine)
+        : null;
+
+      // #3685/#3684: CHANGELOG's `jobs watch` migration note points scripters
+      // at `jobs stats --json` as one of "the cleaner surfaces"; until now the
+      // flag was parsed by nobody and the human dashboard printed anyway, so
+      // `| jq` failed at line 1 with exit 0 from gbrain. --cluster-errors is
+      // carried into the payload rather than dropped — silently ignoring a
+      // requested flag is the defect being fixed, not a shape to repeat.
+      //
+      // No top-level `queue` key on purpose: by_status/by_type/queue_health are
+      // GLOBAL and only `wedge` is scoped by --queue (getStats' own contract at
+      // queue.ts:569-583), so one would read as scoping the whole document.
+      // `wedge.queue` already reports the scope.
+      if (hasFlag(args, '--json')) {
+        console.log(JSON.stringify({
+          ...stats,
+          lease_pressure_1h: leasePressure?.bounces ?? null,
+          ...(errorClusters !== null ? { error_clusters: errorClusters } : {}),
+        }, null, 2));
+        break;
+      }
+
       console.log('Job Stats (last 24h):');
       if (stats.by_type.length > 0) {
         console.log(`  ${'Type'.padEnd(14)} ${'Total'.padEnd(7)} ${'Done'.padEnd(7)} ${'Failed'.padEnd(8)} ${'Dead'.padEnd(6)} Avg Time`);
@@ -713,25 +817,13 @@ HANDLER TYPES (built in)
       }
 
       // v0.41 Bug 2 / Eng D8 — surface lease pressure to the operator.
-      // Reads minion_lease_pressure_log windowed at 1h. Best-effort: pre-v93
-      // brains (no table) silently skip; the queue_health line above is the
-      // operator's primary signal in that case.
-      try {
-        const lpRows = await engine.executeRaw<{ count: string }>(
-          `SELECT count(*)::text AS count FROM minion_lease_pressure_log
-            WHERE bounced_at > now() - interval '1 hour'`,
-        );
-        const lpCount = parseInt(lpRows[0]?.count ?? '0', 10);
+      // Read above via readLeasePressure (null = pre-v93 brain with no
+      // minion_lease_pressure_log; the queue_health line is the operator's
+      // primary signal in that case).
+      if (leasePressure !== null) {
+        const lpCount = leasePressure.bounces;
         if (lpCount > 0) {
-          // Also surface whether any of those bounces stalled forward progress.
-          // Bounces with rising completed counts = healthy backpressure; bounces
-          // with zero completes = real blocker (matches doctor's subagent_health).
-          const completedRows = await engine.executeRaw<{ count: string }>(
-            `SELECT count(*)::text AS count FROM minion_jobs
-              WHERE finished_at > now() - interval '1 hour'
-                AND status = 'completed' AND name = 'subagent'`,
-          ).catch(() => [{ count: '0' }]);
-          const completed = parseInt(completedRows[0]?.count ?? '0', 10);
+          const completed = leasePressure.subagent_completed;
           const tag = completed > 0
             ? `(${completed} subagent job${completed === 1 ? '' : 's'} completed, throughput healthy)`
             : `(no subagent jobs completed — cap may be too tight; \`export GBRAIN_ANTHROPIC_MAX_INFLIGHT=64\`)`;
@@ -739,8 +831,6 @@ HANDLER TYPES (built in)
         } else {
           console.log(`  Lease pressure (1h): 0 bounces`);
         }
-      } catch {
-        // Pre-v93 brain — no table. Silent skip.
       }
 
       // v0.41 D3 — error clustering. Optional via --cluster-errors flag so
@@ -748,32 +838,20 @@ HANDLER TYPES (built in)
       // (default stats output stays scannable). Pulls last 24h of dead +
       // failed jobs, classifies by error-classify.ts buckets, sorts by
       // count, surfaces top 5 with paste-ready retry hints.
-      if (hasFlag(args, '--cluster-errors')) {
-        try {
-          const { clusterErrors } = await import('../core/minions/error-classify.ts');
-          const errRows = await engine.executeRaw<{ id: number; last_error: string | null }>(
-            `SELECT id, error_text AS last_error FROM minion_jobs
-              WHERE status IN ('dead', 'failed')
-                AND updated_at > now() - interval '24 hours'`,
-          );
-          if (errRows.length === 0) {
-            console.log(`\n  Error clusters (24h): no dead/failed jobs`);
-          } else {
-            const clusters = clusterErrors(errRows);
-            console.log(`\n  Error clusters (24h):`);
-            for (const c of clusters.slice(0, 5)) {
-              const sample = c.sample_ids.length > 0
-                ? `  (e.g. \`gbrain jobs get ${c.sample_ids[0]}\`)` : '';
-              console.log(`    ${String(c.count).padStart(4)} × ${c.cluster.padEnd(22)}${sample}`);
-            }
-            if (clusters.length > 5) {
-              console.log(`    + ${clusters.length - 5} more cluster${clusters.length - 5 === 1 ? '' : 's'}`);
-            }
+      // Read above via readErrorClusters (null = the read failed and the
+      // section is skipped rather than blocking stats).
+      if (errorClusters !== null) {
+        if (errorClusters.length === 0) {
+          console.log(`\n  Error clusters (24h): no dead/failed jobs`);
+        } else {
+          console.log(`\n  Error clusters (24h):`);
+          for (const c of errorClusters.slice(0, 5)) {
+            const sample = c.sample_ids.length > 0
+              ? `  (e.g. \`gbrain jobs get ${c.sample_ids[0]}\`)` : '';
+            console.log(`    ${String(c.count).padStart(4)} × ${c.cluster.padEnd(22)}${sample}`);
           }
-        } catch (e) {
-          // error-classify import or SQL fail. Don't block stats output.
-          if (process.env.GBRAIN_DEBUG === '1') {
-            console.error(`[jobs stats] cluster-errors skipped: ${e instanceof Error ? e.message : String(e)}`);
+          if (errorClusters.length > 5) {
+            console.log(`    + ${errorClusters.length - 5} more cluster${errorClusters.length - 5 === 1 ? '' : 's'}`);
           }
         }
       }
