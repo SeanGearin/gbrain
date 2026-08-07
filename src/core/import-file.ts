@@ -40,6 +40,7 @@ import { isUndefinedTableError, warnOncePerProcess, validateSlug } from './utils
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
+import { INJECTION_PATTERNS } from './think/sanitize.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
 
 /**
@@ -341,6 +342,23 @@ export async function importFromContent(
       chunks: 0,
       error: `Content too large (${byteLength} bytes, max ${MAX_FILE_SIZE}). Split the content into smaller files or remove large embedded assets.`,
     };
+  }
+
+  // G1 (2026-08-06): the note-import twin of the facts-path sanitize. The
+  // extract path strips INJECTION_PATTERNS from every fact at insert
+  // (facts/extract.ts), but note bodies arriving through remote put_page
+  // were stored RAW and later surfaced verbatim (up to 24k chars via the
+  // tenant's open_note) — the one unsanitized write lane on that surface.
+  // Same single source of truth, same trust posture as the #1699 marker
+  // strip below: UNTRUSTED input only. Local trusted callers (sync, capture,
+  // dream) stay byte-faithful — rewriting a vault file's stored body would
+  // break content_hash equality with the file on disk and corrupt a user's
+  // own notes ABOUT these patterns. Runs on the raw string BEFORE
+  // parse/hash/chunk so every stored artifact (body, chunks, content_hash)
+  // carries the same sanitized text and repeat puts of identical raw
+  // content stay hash-stable.
+  if (opts.remote === true) {
+    for (const p of INJECTION_PATTERNS) content = content.replace(p.rx, p.replacement);
   }
 
   const parsed = parseMarkdown(content, slug + '.md', { activePack: opts.activePack });
