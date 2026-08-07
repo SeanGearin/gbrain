@@ -51,6 +51,30 @@ export const INJECTION_PATTERNS: Array<{ name: string; rx: RegExp; replacement: 
   { name: 'eval-shell',       rx: /\b(?:eval|exec|system|shell)\s*\(/gi, replacement: '[redacted](' },
 ];
 
+// G1 (2026-08-06): the <page>/<pages> twin of close-take/open-trajectory.
+// THINK_SYSTEM_PROMPT_BASE declares <take> contents DATA, but page excerpts
+// interpolate stored content into <page> tags with no escape — a stored body
+// containing `</page>` (or a forged opener) could terminate or fake its own
+// wrapper. Applied at RENDER time by renderPagesBlock (gather.ts), never at
+// insert: stored bodies stay byte-faithful for local vault round-trips, and
+// the escape is structural only — the denylist stays a take-side (and
+// remote-import) decision. Note `page\b` never matches `<pages>` (the `s` is
+// a word char) and `page\s*>` never matches `</pages>`, so all four patterns
+// are disjoint.
+const PAGE_FRAME_PATTERNS: Array<{ rx: RegExp; replacement: string }> = [
+  { rx: /<\s*\/\s*page\s*>/gi, replacement: '&lt;/page&gt;' },
+  { rx: /<\s*\/\s*pages\s*>/gi, replacement: '&lt;/pages&gt;' },
+  { rx: /<\s*page\b[^>]*>/gi, replacement: '&lt;page&gt;' },
+  { rx: /<\s*pages\s*>/gi, replacement: '&lt;pages&gt;' },
+];
+
+/** Escape the <page>/<pages> frame delimiters inside a rendered excerpt. */
+export function escapePageFrame(excerpt: string): string {
+  let text = excerpt;
+  for (const p of PAGE_FRAME_PATTERNS) text = text.replace(p.rx, p.replacement);
+  return text;
+}
+
 /**
  * Sanitize a single take claim before embedding into a model prompt.
  * Returns the cleaned text + a list of patterns that matched (for telemetry).

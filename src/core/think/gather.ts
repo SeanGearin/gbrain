@@ -19,6 +19,7 @@ import type { BrainEngine, TakeHit, Take } from '../engine.ts';
 import { hybridSearch } from '../search/hybrid.ts';
 import type { SearchResult } from '../types.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
+import { escapePageFrame } from './sanitize.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 
@@ -433,12 +434,16 @@ export function renderPagesBlock(
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
-    const excerpt = selectRelevantExcerpt(
+    // G1 (2026-08-06): stored content must not terminate or forge its own
+    // <page> wrapper — escape the frame delimiters at render time (the
+    // close-take treatment, extended to the pages block). Escaping runs on
+    // the SELECTED excerpt so the window arithmetic stays on raw offsets.
+    const excerpt = escapePageFrame(selectRelevantExcerpt(
       content,
       query,
       excerptLen,
       `${title} ${slugIdentity}`,
-    );
+    ));
     return `<page slug="${slug}" rank="${idx + 1}">\n${excerpt}\n</page>`;
   }).join('\n\n');
 }
