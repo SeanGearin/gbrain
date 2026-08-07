@@ -220,6 +220,63 @@ describe('scorePattern (D18 priority scoring)', () => {
     const r = parseConversation(body, { fallbackDate: '2024-03-15' });
     expect(r.matched_pattern_id).toBe('telegram-bracket');
   });
+
+  test('earliest-anchor guard still picks the dominant format from the full body', () => {
+    const body = [
+      '**Alice Example** (2024-03-15 9:00 AM): one imessage',
+      '**[18:37] Alice Example:** telegram one',
+      '**[18:38] Bob Example:** telegram two',
+      '**[18:39] Alice Example:** telegram three',
+    ].join('\n');
+
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+
+    expect(r.matched_pattern_id).toBe('telegram-bracket');
+    expect(r.messages).toHaveLength(3);
+  });
+
+  test('REGRESSION: a pasted chat inside one message cannot hijack the page format', () => {
+    const firstMessage = [
+      '**Alice Example** (2026-08-01 9:00 AM): Here is the pasted exchange:',
+      'It starts below.',
+      '**[18:37] Pasted Alice:** quoted turn one',
+      '**[18:38] Pasted Bob:** quoted turn two',
+      '**[18:39] Pasted Alice:** quoted turn three',
+      '**[18:40] Pasted Bob:** quoted turn four',
+      'That is the end of the paste.',
+      'The speaker labels are useful context.',
+      'Please review the quoted exchange.',
+      'Back to our actual conversation.',
+    ];
+    const remainingTurns = Array.from({ length: 39 }, (_, i) => {
+      const speaker = i % 2 === 0 ? 'Bob Example' : 'Alice Example';
+      return `**${speaker}** (2026-08-01 9:${String(i + 1).padStart(2, '0')} AM): real turn ${i + 2}`;
+    });
+
+    const r = parseConversation([...firstMessage, ...remainingTurns].join('\n'));
+
+    expect(r.messages).toHaveLength(40);
+    expect(r.matched_pattern_id).toBe('imessage-slack');
+    expect(r.messages[0].text).toContain('**[18:37] Pasted Alice:** quoted turn one');
+    expect(r.messages[39].text).toBe('real turn 40');
+  });
+
+  test('earliest-anchor guard preserves dominant scoring across a real format switch', () => {
+    const body = [
+      '**Alice Example** (2026-08-01 9:00 AM): first format',
+      '**[18:37] Telegram Alice:** dominant turn one',
+      '**[18:38] Telegram Bob:** dominant turn two',
+      '**[18:39] Telegram Alice:** dominant turn three',
+      '**[18:40] Telegram Bob:** dominant turn four',
+      '**Bob Example** (2026-08-01 9:01 AM): first format resumes',
+      '**Alice Example** (2026-08-01 9:02 AM): first format again',
+    ].join('\n');
+
+    const r = parseConversation(body);
+
+    expect(r.messages).toHaveLength(4);
+    expect(r.matched_pattern_id).toBe('telegram-bracket');
+  });
 });
 
 // ---------------------------------------------------------------------------

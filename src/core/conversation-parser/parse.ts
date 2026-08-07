@@ -480,7 +480,20 @@ export function parseConversation(
   // the fallback. Re-score every candidate against the full body,
   // pre-splitting ONCE to avoid 12 redundant body splits.
   let fullBodyScored = false;
-  if (scored[0].score < SCORING_HEAD_TRIGGER_THRESHOLD) {
+  // A pasted chat inside the first real message can outscore its outer
+  // format in the head window. If the winner does not own the earliest
+  // recognized anchor, let whole-page density decide before applying it.
+  const firstAnchoredLine = getNonBlankLines(body, SCORING_HEAD_LINES).find((line) =>
+    candidates.some((entry) => scoreFromLines([line], entry) > 0),
+  );
+  const headWinner = scored[0].entry;
+  const headWinnerOwnsFirstAnchor =
+    firstAnchoredLine === undefined ||
+    scoreFromLines([firstAnchoredLine], headWinner) > 0;
+  if (
+    scored[0].score < SCORING_HEAD_TRIGGER_THRESHOLD ||
+    !headWinnerOwnsFirstAnchor
+  ) {
     const allLines = getNonBlankLines(body);
     scored = candidates.map((entry) => ({
       entry,
